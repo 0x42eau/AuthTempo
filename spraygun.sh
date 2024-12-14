@@ -166,7 +166,7 @@ while [ $count -gt 0 ]; do
 ##########################################
 
 	# prints creds found to screen and to tmp-creds.txt ; then sorts uniquely and puts into creds.txt
-	cat spraygun-log.log | grep -ai '[+]' | awk -F " " '{print $12}' >> tmp-creds.txt
+	cat spraygun-log.log | grep -ai '[+]' | awk -F " " '{print $13}' >> tmp-creds.txt
 	sort -u tmp-creds.txt > creds.txt 
 	echo ''
 	echo '############################'
@@ -182,7 +182,7 @@ while [ $count -gt 0 ]; do
 ##########################################
 
 
-	cat spraygun-log.log | grep -ai 'LOCKED_OUT' | awk -F " " '{print $11}' | awk -F "\\" '{print $2}' | awk -F ":" '{print $1}' | sort -u > lockedout.users
+	cat spraygun-log.log | grep -ai 'LOCKED_OUT' | awk -F " " '{print $13}' | awk -F "\\" '{print $2}' | awk -F ":" '{print $1}' | sort -u > lockedout.users
 	# sed delete for lockedout.users cmp lockedout.users.bak
 	lockedout_count=$(wc -l < lockedout.users)
 	echo ''
