@@ -166,7 +166,7 @@ while [ $count -gt 0 ]; do
 ##########################################
 
 	# prints creds found to screen and to tmp-creds.txt ; then sorts uniquely and puts into creds.txt
-	cat spraygun-log.log | grep -ai '[+]' | awk -F " " '{print $13}' >> tmp-creds.txt
+	cat spraygun-log.log | grep -ai '\[+\]' | awk -F " " '{print $13}' >> tmp-creds.txt
 	sort -u tmp-creds.txt > creds.txt 
 	echo ''
 	echo '############################'
