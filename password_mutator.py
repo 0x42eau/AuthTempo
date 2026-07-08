@@ -19,22 +19,6 @@ from typing import List, Set
 class PasswordMutator:
     """Generate enterprise-style password mutations from domain/org names."""
 
-    # Common corporate password prefixes
-    PREFIXES = [
-        "Welcome", "Password", "Company", "Corporate", "Office",
-        "Summer", "Winter", "Spring", "Fall", "Autumn",
-        "January", "February", "March", "April", "May", "June",
-        "July", "August", "September", "October", "November", "December",
-        "Change", "ChangeMe", "Changeme", "Ilove", "ILove",
-    ]
-
-    # Common suffixes and separators
-    SUFFIXES = [
-        "!", "!@#", "!@#$", "!@#$%", "@", "#", "123", "123!", "1234", "12345",
-        "2024", "2025", "2026", "2023", "2022", "2021", "1", "2", "3", "0",
-        "Admin", "User", "Staff", "Team", "Office", "Home",
-    ]
-
     def __init__(self, domain: str = "", org: str = "", year: int = 2026):
         """
         Initialize mutator with domain and organization info.
@@ -84,117 +68,118 @@ class PasswordMutator:
             variants.append(name.capitalize())  # contoso -> Contoso
             variants.append(name.upper())  # contoso -> CONTOSO
             variants.append(name.lower())  # Contoso -> contoso
-            # Title case for multi-word
-            if " " in name or "-" in name or "_" in name:
-                variants.append(name.title().replace("_", " ").replace("-", " "))
         return list(set(variants))
 
     def generate(self, count: int = 100) -> List[str]:
         """
-        Generate password mutations.
-
-        Args:
-            count: Maximum number of passwords to generate
+        Generate password mutations ordered by probability.
 
         Returns:
             List of generated passwords (duplicates removed)
         """
-        passwords: Set[str] = set()
+        passwords: List[tuple[int, str]] = []  # (priority, password) - lower priority = higher probability
 
-        # Priority 1: Organization name + current year patterns (HIGHEST PROBABILITY)
+        # Priority 1: Org + current year patterns (HIGHEST PROBABILITY)
         for org_name in self.org_names:
             for variant in self._capitalize_variants(org_name):
-                # WelcomeOrg2026!, CompanyOrg2026!, etc.
-                for prefix in ["Welcome", "Password", "Company"]:
-                    passwords.add(f"{prefix}{variant}{self.year}!")
-                    passwords.add(f"{prefix}{variant}{self.year}")
-                    passwords.add(f"{prefix}{variant}!")
+                # WelcomeOrg2026! (most realistic enterprise pattern)
+                passwords.append((1, f"Welcome{variant}{self.year}!"))
+                passwords.append((1, f"Welcome{variant}{self.year}"))
+                passwords.append((1, f"Welcome{variant}!"))
 
-                # Org2026!, Org2026
-                passwords.add(f"{variant}{self.year}!")
-                passwords.add(f"{variant}{self.year}")
+                # Org2026!, Org2026 (clean org + year)
+                passwords.append((1, f"{variant}{self.year}!"))
+                passwords.append((1, f"{variant}{self.year}"))
+                passwords.append((1, f"{variant}!"))
 
-                # IloveOrg123!
-                passwords.add(f"Ilove{variant}123!")
-                passwords.add(f"Ilove{variant}{self.year}!")
-                passwords.add(f"ILove{variant}123!")
+                # IloveOrg123!, IloveOrg2026!
+                passwords.append((1, f"Ilove{variant}123!"))
+                passwords.append((1, f"Ilove{variant}{self.year}!"))
+                passwords.append((1, f"ILove{variant}123!"))
 
-                # Org@2026
-                passwords.add(f"{variant}@{self.year}")
-                passwords.add(f"{variant}!{self.year}")
+                # Org@2026, Org!2026
+                passwords.append((1, f"{variant}@{self.year}"))
+                passwords.append((1, f"{variant}!{self.year}"))
 
-        # Priority 2: Seasonal + current year (HIGH PROBABILITY)
-        months = ["January", "February", "March", "April", "May", "June",
-                  "July", "August", "September", "October", "November", "December"]
-        seasons = ["Summer", "Winter", "Spring", "Fall", "Autumn"]
-
-        for month in months:
-            passwords.add(f"{month}{self.year}!")
-            passwords.add(f"{month}{self.year}")
-
-        for season in seasons:
-            passwords.add(f"{season}{self.year}!")
-            passwords.add(f"{season}{self.year}")
-
-        # Priority 3: Seasonal + org name (MODERATE PROBABILITY)
+        # Priority 1: Seasonal + org name (HIGH PROBABILITY)
         for org_name in self.org_names:
             for variant in self._capitalize_variants(org_name):
-                for season in ["Summer", "Winter", "Spring"]:
-                    passwords.add(f"{season}{variant}!")
-                    passwords.add(f"{season}{variant}{self.year}!")
+                for season in ["Summer", "Winter", "Spring", "Fall", "Autumn"]:
+                    passwords.append((1, f"{season}{variant}!"))
+                    passwords.append((1, f"{season}{variant}{self.year}!"))
 
-        # Priority 4: Common corporate patterns (MODERATE PROBABILITY)
-        passwords.update([
-            "Password123!",
-            "P@ssw0rd123!",
-            "Welcome123!",
-            "Welcome123!@#",
-            "Password1!",
-            "P@ssw0rd!",
-            "Welcome1!",
-            "Welcome!",
-            "Changeme!",
-            "ChangeMe!",
-            "Corporate123!",
-            "Company123!",
-            "Office365!",
-            "letmein",
-            "letmein123!",
+        # Priority 2: Seasonal + year (HIGH - but without org, so slightly lower)
+        for season in ["Summer", "Winter", "Spring", "Fall", "Autumn"]:
+            passwords.append((2, f"{season}{self.year}!"))
+            passwords.append((2, f"{season}{self.year}"))
+
+        for month in ["January", "February", "March", "April", "May", "June",
+                      "July", "August", "September", "October", "November", "December"]:
+            passwords.append((2, f"{month}{self.year}!"))
+            passwords.append((2, f"{month}{self.year}"))
+
+        # Priority 3: Common corporate patterns (MODERATE PROBABILITY)
+        passwords.extend([
+            (3, "Password123!"),
+            (3, "P@ssw0rd123!"),
+            (3, "Welcome123!"),
+            (3, "Welcome123!@#"),
+            (3, "Password1!"),
+            (3, "P@ssw0rd!"),
+            (3, "Welcome1!"),
+            (3, "Welcome!"),
+            (3, "Changeme!"),
+            (3, "ChangeMe!"),
+            (3, "Changeme1!"),
+            (3, "Corporate123!"),
+            (3, "Company123!"),
+            (3, "Office365!"),
+            (3, "Password2024!"),
+            (3, "Password2025!"),
+            (3, "Password2026!"),
+            (3, "Welcome2024!"),
+            (3, "Welcome2025!"),
+            (3, "letmein"),
+            (3, "letmein123!"),
         ])
 
-        # Priority 5: Generic patterns (LOWER PROBABILITY - always include)
-        passwords.update([
-            "password",
-            "password1",
-            "password123!",
-            "P@ssw0rd",
-            "Welcome123",
-            "admin",
-            "administrator",
-            "123456",
+        # Priority 4: Year variations 2023-2025
+        passwords.extend([
+            (4, "Welcome2023!"),
+            (4, "Summer2023!"),
+            (4, "Winter2023!"),
+            (4, "Password2023!"),
+            (4, "Welcome2022!"),
+            (4, "Password2022!"),
+            (4, "Welcome2021!"),
+            (4, "Password2021!"),
         ])
 
-        # Convert to list and limit count
-        result = list(passwords)
-        result.sort()  # Sort for consistent output
+        # Priority 5: Generic patterns (LOWEST PROBABILITY - always include)
+        passwords.extend([
+            (5, "password"),
+            (5, "password1"),
+            (5, "password123!"),
+            (5, "P@ssw0rd"),
+            (5, "Welcome123"),
+            (5, "admin"),
+            (5, "administrator"),
+            (5, "123456"),
+        ])
 
-        # Order by probability (approximate)
-        # High-probability patterns first
-        priority_keywords = [
-            f"{self.year}!",
-            f"{self.year}",
-            "Welcome",
-            "Password",
-            "Company",
-            "Summer",
-            "Winter",
-            "Spring",
-        ]
-        result.sort(key=lambda x: (
-            sum(1 for kw in priority_keywords if kw.lower() in x.lower()),
-            len(x)  # Shorter passwords generally more common
-        ), reverse=True)
+        # Remove duplicates and sort by priority
+        seen = set()
+        unique_passwords = []
+        for priority, pwd in passwords:
+            if pwd not in seen:
+                seen.add(pwd)
+                unique_passwords.append((priority, pwd))
 
+        # Sort by priority (lower number = higher probability), then by length (shorter = more common)
+        unique_passwords.sort(key=lambda x: (x[0], len(x[1])))
+
+        # Return just the passwords (not the priorities)
+        result = [pwd for _, pwd in unique_passwords]
         return result[:count]
 
     def generate_list(self, count: int = 100) -> List[str]:
