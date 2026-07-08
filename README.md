@@ -15,6 +15,21 @@ Spraygun is a resilient password-spray orchestrator for authorized penetration t
 - **Admin user highlighting**: red ★ icons for high-privilege credentials when nxc outputs `(Pwn3d!)` or admin indicators
 - **Password mutator**: generate domain-specific password patterns (Company2026!, WelcomeOrg!)
 
+### Operator Fundamentals
+
+**Round 1 (implemented):**
+- **Credential-reuse matrix**: never re-attempt a (user, password) pair across resumes/interruptions — tracks exactly which users have been tried with which passwords
+- **Filter non-existent accounts**: pre-spray `kerbrute userenum` pass to drop users that don't exist before spraying
+- **Pattern learning (weighted scoring)**: when a password hits, automatically re-prioritize the live queue by how often each password's pattern has succeeded
+- **Spray statistics**: running + final stats dashboard (attempts, success rate, top patterns, timing)
+- **JSON/CSV export**: machine-readable results for reporting
+
+**Round 2 (new):**
+- **Spray window scheduling**: only spray during defined time windows (business-hours, off-hours, custom)
+- **Credential-reuse detection**: surface passwords shared by multiple users (shown in stats dashboard)
+- **Automatic throttling**: back off inter-round delay when DC is under stress (connection failures)
+- **Spray timeline visualization**: self-contained HTML timeline + JSON event log (`--timeline`)
+
 ## Password Mutator
 
 Use the included `password_mutator.py` to generate targeted enterprise password lists based on domain/organization names:
@@ -99,6 +114,20 @@ python3 password_mutator.py --domain contoso.local --year 2026 --count 50 -o pas
 ./spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
 ```
 
+### Filter disabled/non-existent accounts
+
+```bash
+# Pre-spray kerbrute userenum to drop non-existent users
+./spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --filter-disabled
+```
+
+### Export results
+
+```bash
+# Export results to JSON and CSV
+./spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --export all
+```
+
 ## CLI Options
 
 ### Required
@@ -133,15 +162,26 @@ python3 password_mutator.py --domain contoso.local --year 2026 --count 50 -o pas
 - `--dry-run` — emit fake tool output; no real sprays
 - `--resume` — continue from saved state
 
+### Operator fundamentals
+- `--filter-disabled` — pre-spray kerbrute userenum to filter non-existent accounts
+- `--export {none,json,csv,all}` — results export format (default: none)
+- `--schedule {preset|range}` — spray window: `business-hours`, `off-hours`, or `HH:MM-HH:MM` (default: unrestricted)
+- `--timeline` — generate `spray-timeline.html` visualization
+
 ## Output & State Files
 
 All output goes to `./spraygun-out/` (or `--log-dir`):
 
-- `spraygun.state.json` — machine-readable resume blob
+- `spraygun.state.json` — machine-readable resume blob (includes credential matrix, patterns, stats, throttle, timeline)
 - `creds.txt` — human-readable `user:password` hits
 - `locked-out.txt` — locked-out accounts
 - `used-passwords.txt` — passwords/hashes already sprayed
 - `spraygun-spray.log` — overall timed audit log (every raw line with timestamps)
+- `active-users.txt` — filtered user list after `--filter-disabled` (if enabled)
+- `results.json` — structured export: config, stats, credentials, lockouts, patterns, cred_reuse
+- `results.csv` — credential export: user, password, is_admin, captured_at
+- `timeline.json` — machine-readable event log (always generated at completion)
+- `spray-timeline.html` — self-contained HTML timeline visualization (with `--timeline`)
 
 ## Failover Chain
 

