@@ -175,8 +175,15 @@ class PasswordMutator:
                 seen.add(pwd)
                 unique_passwords.append((priority, pwd))
 
-        # Sort by priority (lower number = higher probability), then by length (shorter = more common)
-        unique_passwords.sort(key=lambda x: (x[0], len(x[1])))
+        # Sort by priority (lower number = higher probability)
+        # Within same priority, Welcome/Seasonal+Org patterns come before plain org
+        def sort_key(x):
+            priority, pwd = x
+            # Secondary sort: Welcome/Seasonal/Month prefix gets priority
+            if re.match(r"^(Welcome|Spring|Summer|Winter|Fall|Autumn|January|February|March|April|May|June|July|August|September|October|November|December)", pwd, re.IGNORECASE):
+                return (priority, 0, len(pwd))  # Prefix patterns first
+            return (priority, 1, len(pwd))  # Then by length
+        unique_passwords.sort(key=sort_key)
 
         # Return just the passwords (not the priorities)
         result = [pwd for _, pwd in unique_passwords]
