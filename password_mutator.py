@@ -41,11 +41,10 @@ class PasswordMutator:
 
         # Add explicit org name if provided
         if org:
-            # Clean org name: remove suffixes like Corp, Inc, LLC
+            # Clean org name: remove suffixes and spaces, convert to single word
             org_clean = re.sub(r'\s+(Corporation|Corp|Incorporated|Inc|LLC|Ltd)\b.*', '', org, flags=re.IGNORECASE)
+            org_clean = re.sub(r'\s+', '', org_clean)  # Remove all spaces
             names.add(org_clean)
-            names.add(org_clean.replace(" ", ""))
-            names.add(org_clean.replace(" ", "."))
 
         # Extract from domain (e.g., "contoso.local" -> "contoso")
         if domain:
@@ -92,12 +91,7 @@ class PasswordMutator:
                 passwords.append((1, f"{variant}{self.year}"))
                 passwords.append((1, f"{variant}!"))
 
-                # IloveOrg123!, IloveOrg2026!
-                passwords.append((1, f"Ilove{variant}123!"))
-                passwords.append((1, f"Ilove{variant}{self.year}!"))
-                passwords.append((1, f"ILove{variant}123!"))
-
-                # Org@2026, Org!2026
+                # Org@2026, Org!2026 (realistic separators)
                 passwords.append((1, f"{variant}@{self.year}"))
                 passwords.append((1, f"{variant}!{self.year}"))
 
@@ -118,6 +112,13 @@ class PasswordMutator:
             passwords.append((2, f"{month}{self.year}!"))
             passwords.append((2, f"{month}{self.year}"))
 
+        # Priority 2: Ilove/org patterns (moved down from Priority 1)
+        for org_name in self.org_names:
+            for variant in self._capitalize_variants(org_name):
+                passwords.append((2, f"Ilove{variant}123!"))
+                passwords.append((2, f"Ilove{variant}{self.year}!"))
+                passwords.append((2, f"ILove{variant}123!"))
+
         # Priority 3: Common corporate patterns (MODERATE PROBABILITY)
         passwords.extend([
             (3, "Password123!"),
@@ -134,13 +135,6 @@ class PasswordMutator:
             (3, "Corporate123!"),
             (3, "Company123!"),
             (3, "Office365!"),
-            (3, "Password2024!"),
-            (3, "Password2025!"),
-            (3, "Password2026!"),
-            (3, "Welcome2024!"),
-            (3, "Welcome2025!"),
-            (3, "letmein"),
-            (3, "letmein123!"),
         ])
 
         # Priority 4: Year variations 2023-2025
@@ -171,15 +165,16 @@ class PasswordMutator:
         seen = set()
         unique_passwords = []
         for priority, pwd in passwords:
-            if pwd not in seen:
-                seen.add(pwd)
+            pwd_lower = pwd.lower()
+            if pwd_lower not in seen:
+                seen.add(pwd_lower)
                 unique_passwords.append((priority, pwd))
 
         # Sort by priority (lower number = higher probability)
-        # Within same priority, Welcome/Seasonal+Org patterns come before plain org
+        # Within same priority, Welcome/Seasonal/Month prefix gets priority
         def sort_key(x):
             priority, pwd = x
-            # Secondary sort: Welcome/Seasonal/Month prefix gets priority
+            # Secondary sort: Welcome/Seasonal/Month prefix patterns get priority
             if re.match(r"^(Welcome|Spring|Summer|Winter|Fall|Autumn|January|February|March|April|May|June|July|August|September|October|November|December)", pwd, re.IGNORECASE):
                 return (priority, 0, len(pwd))  # Prefix patterns first
             return (priority, 1, len(pwd))  # Then by length
