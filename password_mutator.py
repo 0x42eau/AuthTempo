@@ -162,12 +162,12 @@ class PasswordMutator:
         ])
 
         # Remove duplicates and sort by priority
+        # Note: case-sensitive dedup to preserve capitalization variants (orgname, ORGNAME, OrgName)
         seen = set()
         unique_passwords = []
         for priority, pwd in passwords:
-            pwd_lower = pwd.lower()
-            if pwd_lower not in seen:
-                seen.add(pwd_lower)
+            if pwd not in seen:
+                seen.add(pwd)
                 unique_passwords.append((priority, pwd))
 
         # Sort by priority (lower number = higher probability)
