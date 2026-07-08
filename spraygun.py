@@ -96,6 +96,7 @@ class RoundResult:
     admin_users: List[Tuple[str, str]] = field(default_factory=list)  # (user, secret) - admin/pwn3d
     lockouts: Set[str] = field(default_factory=set)
     conn_fails: int = 0
+    errors: List[str] = field(default_factory=list)  # Tool-level errors (wrong realm, etc.)
     aborted: bool = False
     abort_reason: str = ""
     clean_finish: bool = False
@@ -110,6 +111,7 @@ class LineType(enum.Enum):
     LOCKOUT = "LOCKOUT"
     CONN_ERROR = "CONN_ERROR"
     AUTHFAIL = "AUTHFAIL"
+    ERROR = "ERROR"  # Tool-level error (wrong realm, domain mismatch, etc.)
     INFO = "INFO"
 
 # nxc / netexec patterns
@@ -150,6 +152,19 @@ NXC_AUTHFAIL_PATTERNS = [
 
 # kerbrute patterns
 KERBRUTE_SUCCESS_PATTERNS = [r"\[\+\] VALID LOGIN:"]
+
+# kerbrute error patterns (detect domain/realm issues)
+KERBRUTE_ERROR_PATTERNS = [
+    r"KDC error.*wrong realm",
+    r"wrong realm",
+    r"try adjusting domain",
+    r"realm mismatch",
+    r"cannot find KDC",
+    r"no KDC found",
+    r"cannot resolve",
+    r"unknown realm",
+]
+
 KERBRUTE_LOCKOUT_PATTERNS = [
     r"locked",
     r"KDC_ERR_CLIENT_REVOKED",
@@ -189,10 +204,12 @@ class RichUI:
         self.phase_data = {
             "engine": str(engine),
             "secret": secret,
+            "secret_display": secret[:8] + "..." if len(secret) > 8 else secret,  # Show first 8 chars
             "round": round_num,
             "successes": [],
             "admin_users": [],  # Track admin/pwn3d users separately for highlighting
             "lockouts": set(),
+            "errors": [],  # Track tool errors
             "conn_fails": 0,
         }
         self.raw_feed = []
@@ -219,6 +236,17 @@ class RichUI:
     def update_lockout(self, user: str):
         """Register a lockout."""
         self.phase_data["lockouts"].add(user)
+        self._update_display()
+
+    def update_error(self, error_msg: str):
+        """Register a tool error."""
+        self.phase_data["errors"].append(error_msg)
+        self._update_display()
+
+    def _update_display(self):
+        """Refresh the Live display."""
+        if self.live and self.current_phase == "spray":
+            self.live.update(self._render_spray())
         self._update_display()
 
     def increment_conn_fails(self):
@@ -250,10 +278,11 @@ class RichUI:
     def _build_summary(self) -> Panel:
         """Build the summary panel."""
         engine = self.phase_data.get("engine", "N/A")
-        secret_masked = "***" if self.phase_data.get("secret") else "N/A"
+        secret_display = self.phase_data.get("secret_display", "***")
         successes = self.phase_data.get("successes", [])
         admin_users = self.phase_data.get("admin_users", [])
         lockouts = self.phase_data.get("lockouts", set())
+        errors = self.phase_data.get("errors", [])
         conn_fails = self.phase_data.get("conn_fails", 0)
         abort_reason = self.phase_data.get("abort_reason", "")
 
@@ -262,9 +291,17 @@ class RichUI:
         grid.add_column(justify="right")
 
         grid.add_row("[cyan]Engine:", engine)
-        grid.add_row("[cyan]Secret (mask):", secret_masked)
+        grid.add_row("[cyan]Current password:", f"[yellow]{secret_display}[/yellow]")
 
-        # Show admin users first with prominent styling
+        # Show errors first with prominent styling
+        if errors:
+            grid.add_row("[red bold]ERRORS:", str(len(errors)))
+            for err in errors[-3:]:  # Show last 3 errors
+                # Truncate long error messages
+                err_short = err[:60] + "..." if len(err) > 60 else err
+                grid.add_row("", f"  [red]✗[white] {err_short}")
+
+        # Show admin users with prominent styling
         if admin_users:
             grid.add_row("[red bold]ADMIN USERS [pwn3d!]:", str(len(admin_users)))
             for user, _ in admin_users[-5:]:  # Show last 5
@@ -318,21 +355,22 @@ class RichUI:
         self.current_phase = "idle"
 
     def countdown(self, seconds: int):
-        """Show MM:SS countdown between rounds (summary + live timer)."""
-        self.current_phase = "countdown"
-        self.phase_data["countdown_remaining"] = seconds
+        """Show MM:SS countdown between rounds - simple line by line."""
+        mins, secs = divmod(seconds, 60)
+        self.console.print(f"[*] Time until next spray: {mins:02d}:{secs:02d}", style="cyan", end="")
 
-        with Live(self._render_countdown(), console=self.console, refresh_per_second=1) as live:
-            while seconds > 0:
-                self.phase_data["countdown_remaining"] = seconds
-                live.update(self._render_countdown())
-                time.sleep(1)
-                seconds -= 1
+        while seconds > 0:
+            mins, secs = divmod(seconds, 60)
+            # Move cursor back and update
+            print(f"\r[*] Time until next spray: {mins:02d}:{secs:02d}  ", end="", flush=True)
+            time.sleep(1)
+            seconds -= 1
 
-        self.current_phase = "idle"
+        print()  # New line after countdown
 
     def _render_countdown(self) -> Panel:
-        """Render countdown panel."""
+        """Render countdown panel (deprecated - now using simple line countdown)."""
+        # This function is no longer used but kept for compatibility
         remaining = self.phase_data.get("countdown_remaining", 0)
         mins, secs = divmod(remaining, 60)
         countdown_str = f"{mins:02d}:{secs:02d}"
@@ -340,7 +378,7 @@ class RichUI:
         layout = Layout()
         layout.split_column(
             Layout(self._build_summary()),
-            Layout(Align.center(Text(f"[bold white on blue]  Time until next spray: {countdown_str}  [/bold white on blue]")))
+            Layout(Align.center(Text(f"  Time until next spray: {countdown_str}  ")))
         )
         return Panel(layout, title="[bold]Spraygun — Waiting[/bold]", border_style="blue")
 
@@ -436,10 +474,10 @@ class State:
         masked = "***"
         self._log_line(f"=== {ts} SPRAY engine={engine} secret={masked} round={round_idx} ===")
 
-    def record_spray_end(self, successes: int, lockouts: int, conn_fails: int, aborted: bool, abort_reason: str = ""):
+    def record_spray_end(self, successes: int, lockouts: int, conn_fails: int, aborted: bool, abort_reason: str = "", errors: int = 0):
         """Log spray end trailer."""
         ts = datetime.datetime.now().isoformat()
-        self._log_line(f"=== {ts} END successes={successes} lockouts={lockouts} conn_fails={conn_fails} aborted={aborted} reason={abort_reason} ===")
+        self._log_line(f"=== {ts} END successes={successes} lockouts={lockouts} conn_fails={conn_fails} errors={errors} aborted={aborted} reason={abort_reason} ===")
         self._log_line("")
 
     def add_cred(self, user: str, secret: str):
@@ -513,6 +551,10 @@ def classify_line(engine: Engine, line: str) -> Tuple[LineType, Optional[str]]:
                 return (LineType.AUTHFAIL, None)
 
     elif engine.tool == "kerbrute":
+        # Check for realm/domain errors FIRST (highest priority)
+        for pat in KERBRUTE_ERROR_PATTERNS:
+            if re.search(pat, line, re.IGNORECASE):
+                return (LineType.ERROR, line)
         # Success
         for pat in KERBRUTE_SUCCESS_PATTERNS:
             if re.search(pat, line):
@@ -669,6 +711,24 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
                 result.lockouts.add(user_lock)
                 ui.update_lockout(user_lock)
                 state.add_lockout(user_lock)
+
+            elif line_type == LineType.ERROR:
+                # Tool-level error (wrong realm, domain mismatch, etc.)
+                error_msg = data if data else line
+                result.errors.append(error_msg)
+                ui.update_error(error_msg)
+                ui.console.print(f"[!] Tool error: {error_msg}", style="red")
+
+                # If we get critical errors, abort this engine immediately
+                if any(kw in error_msg.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"]):
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    result.aborted = True
+                    result.abort_reason = "tool-error"
+                    break
 
             elif line_type == LineType.CONN_ERROR:
                 result.conn_fails += 1
@@ -931,6 +991,7 @@ def run(cfg: Config, console: Console):
         console.print(f"\n[*] Round {round_idx + 1}: spraying {len(batch)} secret(s)", style="cyan")
 
         round_lockouts_this_round = 0
+        round_errors_this_round = []  # Track all errors in this round
 
         for secret in batch:
             # Try each engine in failover chain
@@ -945,18 +1006,24 @@ def run(cfg: Config, console: Console):
 
                 # Record stats
                 round_lockouts_this_round += len(result.lockouts)
+                round_errors_this_round.extend(result.errors)  # Track errors
                 state.record_spray_end(
                     len(result.successes),
                     len(result.lockouts),
                     result.conn_fails,
                     result.aborted,
-                    result.abort_reason
+                    result.abort_reason,
+                    len(result.errors)  # Add error count to log
                 )
 
                 ui.end_spray()
 
                 if result.aborted and "conn-fail-limit" in result.abort_reason:
                     console.print(f"[-] {engine} aborted due to connection failures; trying next in chain...", style="yellow")
+                    continue  # Try next engine
+
+                if result.aborted and "tool-error" in result.abort_reason:
+                    console.print(f"[-] {engine} aborted due to tool errors (wrong realm/domain)", style="red")
                     continue  # Try next engine
 
                 # Engine finished cleanly (or with partial results); move to next secret
@@ -972,6 +1039,15 @@ def run(cfg: Config, console: Console):
         for secret in batch:
             state.mark_used(secret)
 
+        # Show round summary including errors
+        console.print(f"[*] Round {round_idx + 1} complete:", style="cyan")
+        console.print(f"    - Lockouts: {round_lockouts_this_round}", style="yellow" if round_lockouts_this_round > 0 else "dim")
+        if round_errors_this_round:
+            console.print(f"    - Errors: {len(round_errors_this_round)}", style="red")
+            console.print("      Error messages:", style="red")
+            for err in round_errors_this_round[:5]:  # Show first 5 errors
+                console.print(f"        - {err}", style="dim")
+
         # Handle lockouts
         cumulative_lockouts = len(state.locked_users)
         should_continue = handle_lockouts(round_lockouts_this_round, cumulative_lockouts, cfg, ui, console)
@@ -979,6 +1055,20 @@ def run(cfg: Config, console: Console):
         if not should_continue:
             console.print("[*] Run stopped due to lockout threshold.", style="yellow")
             break
+
+        # Check for critical errors that should prevent countdown
+        critical_errors = [e for e in round_errors_this_round if any(kw in e.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"])]
+        if critical_errors:
+            console.print("[!] Critical tool errors detected (wrong realm/domain). Pausing before countdown.", style="red")
+            ui.alert("CRITICAL ERRORS", "Tool reported domain/realm errors. Check your -d domain parameter. Press Enter to continue or Ctrl-C to abort.", "red")
+            input()  # Pause for operator
+
+        # Countdown if more passwords remain
+        if state.remaining_queue:
+            console.print(f"[*] Sleeping {cfg.time_between_rounds} minutes until next round...", style="cyan")
+            ui.countdown(cfg.time_between_rounds * 60)
+
+        round_idx += 1
 
         # Countdown if more passwords remain
         if state.remaining_queue:
