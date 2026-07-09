@@ -1940,8 +1940,17 @@ def run(cfg: Config, console: Console):
         # Feature E: Record round start timeline event
         state.record_timeline_event("round_start", "", round_idx=round_idx + 1)
 
-        # Build batch info string to show what's being sprayed
-        passwords_to_spray = batch.copy()
+        # Fixed batch description for the whole round. The active password is
+        # shown separately on the "Current password" line, so this stays
+        # constant for the round (it does NOT shrink as passwords are consumed).
+        if len(batch) == 1:
+            round_batch_info = f"Spraying 1 password: {batch[0]}"
+        else:
+            joined = ", ".join(batch)
+            if len(joined) > 50:
+                round_batch_info = f"Spraying {len(batch)} passwords: {joined[:47]}... ({len(batch)} total)"
+            else:
+                round_batch_info = f"Spraying {len(batch)} passwords: {joined}"
         next_passwords_preview = state.remaining_queue[:cfg.passwords_per_round]
 
         round_lockouts_this_round = 0
@@ -1954,15 +1963,8 @@ def run(cfg: Config, console: Console):
             engine_success = False
 
             for engine in effective_chain:
-                # Build batch info string
-                batch_info = f"Spraying {len(passwords_to_spray)} passwords (this round)"
-                if len(passwords_to_spray) > 1:
-                    batch_info += f": {passwords_to_spray[0][:20]}... ({len(passwords_to_spray)} total)"
-                else:
-                    batch_info += f": {passwords_to_spray[0][:30]}"
-
-                # Start spray UI
-                ui.start_spray(engine, secret, round_idx + 1, batch_info)
+                # Start spray UI (round_batch_info is fixed for the round)
+                ui.start_spray(engine, secret, round_idx + 1, round_batch_info)
                 state.record_spray_start(engine, secret, round_idx + 1)
 
                 # Run spray
@@ -2006,10 +2008,6 @@ def run(cfg: Config, console: Console):
                 console.print(f"[!] All engines failed for this secret. Pausing.", style="red")
                 ui.alert("ALL ENGINES FAILED", "Could not spray this secret with any tool in the failover chain. Check network/DC. Press Enter to retry or Ctrl-C to abort.", "red")
                 input()  # Pause for operator
-
-            # Remove this password from the "to spray" list
-            if passwords_to_spray and passwords_to_spray[0] == secret:
-                passwords_to_spray.pop(0)
 
         # Mark secrets as used
         for secret in batch:
