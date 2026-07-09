@@ -76,6 +76,7 @@ class Config:
     export: str = "none"
     schedule: str = ""
     timeline: bool = False
+    feed_lines: int = 50  # Number of lines in raw feed (default 50, was 20)
     # Derived fields
     users: List[str] = field(default_factory=list)
     passwords: List[str] = field(default_factory=list)
@@ -242,11 +243,11 @@ def classify_password_pattern(pw: str) -> str:
 class RichUI:
     """Manages rich live UI: raw feed panel, summary panel, countdown."""
 
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, max_feed_lines: int = 50):
         self.console = console
         self.live: Optional[Live] = None
         self.raw_feed: List[str] = []
-        self.max_feed_lines = 20
+        self.max_feed_lines = max_feed_lines
         self.current_phase = "idle"  # idle, spray, countdown, stopped
         self.phase_data: Dict[str, Any] = {}
 
@@ -1652,7 +1653,7 @@ def setup_signal_handler(state: State, console: Console):
 
 def run(cfg: Config, console: Console):
     """Main spray loop."""
-    ui = RichUI(console)
+    ui = RichUI(console, max_feed_lines=cfg.feed_lines)
 
     # Preflight
     ok, detail = preflight(cfg, ui)
@@ -1947,6 +1948,7 @@ For authorized penetration testing only.
     parser.add_argument("--export", choices=["none", "json", "csv", "all"], default="none", help="Export results format (default: none)")
     parser.add_argument("--schedule", help="Spray window: business-hours, off-hours, or HH:MM-HH:MM (default: unrestricted)")
     parser.add_argument("--timeline", action="store_true", help="Generate spray-timeline.html visualization")
+    parser.add_argument("--feed-lines", type=int, default=50, help="Number of lines in raw feed panel (default: 50)")
 
     args = parser.parse_args()
 
@@ -2001,6 +2003,7 @@ For authorized penetration testing only.
         export=args.export,
         schedule=args.schedule or "",
         timeline=args.timeline,
+        feed_lines=args.feed_lines,
         nxc_binary=nxc_bin,
         kerbrute_binary=kerbrute_bin,
     )
