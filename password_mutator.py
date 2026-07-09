@@ -13,7 +13,7 @@ Usage:
 import argparse
 import re
 import sys
-from typing import List, Set
+from typing import List, Set, Optional
 
 
 class PasswordMutator:
@@ -61,13 +61,79 @@ class PasswordMutator:
         return names
 
     def _capitalize_variants(self, name: str) -> List[str]:
-        """Generate capitalization variants of a name."""
+        """Generate capitalization variants of a name (lower, upper, title, camelCase)."""
         variants = [name]
         if len(name) > 1:
             variants.append(name.capitalize())  # contoso -> Contoso
             variants.append(name.upper())  # contoso -> CONTOSO
             variants.append(name.lower())  # Contoso -> contoso
+
+            # Generate camelCase variant (SevenKingdoms from sevenkingdoms)
+            camel = self._to_camel_case(name)
+            if camel and camel != name.capitalize():
+                variants.append(camel)
+
         return list(set(variants))
+
+    def _to_camel_case(self, name: str) -> Optional[str]:
+        """
+        Convert compound name to camelCase (sevenkingdoms -> SevenKingdoms).
+        Uses simple word boundary detection for common enterprise naming patterns.
+        """
+        if not name:
+            return None
+
+        # Common enterprise suffixes to split on
+        suffixes = [
+            'kingdoms', 'systems', 'tech', 'technologies', 'solutions',
+            'industries', 'corporation', 'company', 'global', 'international',
+            'services', 'software', 'digital', 'networks', 'group', 'partners',
+            'labs', 'works', 'dynamics', 'soft', 'ware', 'land', 'wind'
+        ]
+
+        name_lower = name.lower()
+
+        # Try to split on common suffixes
+        for suffix in suffixes:
+            if name_lower.endswith(suffix):
+                prefix = name_lower[:-len(suffix)]
+                if prefix:  # Must have a prefix part
+                    # Capitalize both parts
+                    return prefix.capitalize() + suffix.capitalize()
+
+        # Try to split on lowercase-to-lowercase transitions (sevenkingdoms)
+        # This handles cases like "northwind" -> "Northwind" (already handled by capitalize)
+        # but also "sevenkingdoms" -> "SevenKingdoms"
+        parts = []
+        current = name_lower[0]
+        for i in range(1, len(name_lower)):
+            # If adding this char creates a common word, split here
+            for suffix in suffixes:
+                if (current + name_lower[i]).endswith(suffix) and len(current) > 1:
+                    parts.append(current.capitalize())
+                    current = name_lower[i]
+                    break
+            else:
+                current += name_lower[i]
+
+        if current:
+            parts.append(current.capitalize())
+
+        if len(parts) > 1:
+            return ''.join(parts)
+
+        # Fallback: try to detect vowel transitions (aetherical -> Aetherical)
+        # This is less reliable but helps with some made-up words
+        if len(name_lower) > 6:
+            # Look for vowel sequences that might indicate word boundaries
+            for i in range(2, len(name_lower) - 2):
+                if name_lower[i] in 'aeiou' and name_lower[i-1] not in 'aeiou' and name_lower[i+1] not in 'aeiou':
+                    # Found vowel surrounded by consonants - possible word boundary
+                    candidate = name_lower[:i].capitalize() + name_lower[i:].capitalize()
+                    if candidate != name.capitalize():
+                        return candidate
+
+        return None
 
     def generate(self, count: int = 100) -> List[str]:
         """
@@ -120,6 +186,7 @@ class PasswordMutator:
                 passwords.append((2, f"ILove{variant}123!"))
 
         # Priority 3: Common corporate patterns (MODERATE PROBABILITY)
+        # Base patterns
         passwords.extend([
             (3, "Password123!"),
             (3, "P@ssw0rd123!"),
@@ -136,6 +203,18 @@ class PasswordMutator:
             (3, "Company123!"),
             (3, "Office365!"),
         ])
+
+        # Priority 3: Org + corporate combinations (LONGER PASSWORDS)
+        for org_name in self.org_names:
+            for variant in self._capitalize_variants(org_name):
+                passwords.append((3, f"{variant}Password123!"))
+                passwords.append((3, f"{variant}Welcome2026!"))
+                passwords.append((3, f"Password{variant}2026!"))
+                passwords.append((3, f"Welcome{variant}2026!!"))
+                passwords.append((3, f"{variant}2026Password!"))
+                passwords.append((3, f"{variant}Corp2026!"))
+                passwords.append((3, f"Corporate{variant}2026!"))
+                passwords.append((3, f"Company{variant}2026!"))
 
         # Priority 4: Year variations 2023-2025
         passwords.extend([
@@ -184,9 +263,29 @@ class PasswordMutator:
         result = [pwd for _, pwd in unique_passwords]
         return result[:count]
 
-    def generate_list(self, count: int = 100) -> List[str]:
-        """Generate and return password list."""
-        return self.generate(count)
+    def generate_list(self, count: int = 100, min_length: int = 0) -> List[str]:
+        """
+        Generate and return password list.
+
+        Args:
+            count: Maximum passwords to return
+            min_length: Minimum password length (filters out shorter passwords)
+
+        Returns:
+            List of generated passwords. If min_length > 0, generates the full
+            set of patterns and filters to those meeting the minimum length.
+        """
+        if min_length == 0:
+            # No filtering, generate exactly what was requested
+            return self.generate(count)
+
+        # With minimum length filter: generate ALL patterns, filter by length, then limit
+        # Generate a large number to get all unique patterns
+        all_passwords = self.generate(5000)
+        # Filter by minimum length
+        filtered = [pwd for pwd in all_passwords if len(pwd) >= min_length]
+        # Return up to count (may be fewer if not enough patterns meet the length requirement)
+        return filtered[:count]
 
 
 def main():
@@ -206,6 +305,9 @@ Examples:
 
   # Output directly to a file
   python3 password_mutator.py --domain contoso.local -o passwords_generated.txt
+
+  # Filter by minimum length (password policy compliance)
+  python3 password_mutator.py --domain contoso.local --length 12 --count 100
         """
     )
 
@@ -213,6 +315,7 @@ Examples:
     parser.add_argument("--org", help="Organization name (e.g., 'Contoso Corporation')")
     parser.add_argument("--year", type=int, default=2026, help="Target year (default: 2026)")
     parser.add_argument("--count", type=int, default=100, help="Max passwords to generate (default: 100)")
+    parser.add_argument("-l", "--length", type=int, default=0, help="Minimum password length (default: 0, no filter)")
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
 
     args = parser.parse_args()
@@ -224,7 +327,7 @@ Examples:
 
     # Generate passwords
     mutator = PasswordMutator(domain=args.domain, org=args.org, year=args.year)
-    passwords = mutator.generate_list(count=args.count)
+    passwords = mutator.generate_list(count=args.count, min_length=args.length)
 
     # Output
     if args.output:

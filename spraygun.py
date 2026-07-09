@@ -1037,7 +1037,7 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
     """
     Run one engine invocation for one password/hash. Stream stdout line-by-line,
     classify, update UI/state, and return RoundResult.
-    Aborts early if conn_fails >= cfg.conn_fail_limit.
+    Connection errors are tracked but don't abort the engine (failover chain handles it).
 
     Feature 1 (credential-reuse matrix): Uses a filtered userlist per password.
     """
@@ -1077,7 +1077,7 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
 def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, userlist_path: str) -> RoundResult:
     """
     Internal implementation of spray_one_password after userlist filtering.
-    Aborts early if conn_fails >= cfg.conn_fail_limit.
+    Connection errors are tracked but don't abort (failover chain handles it).
     """
     result = RoundResult()
 
@@ -1104,11 +1104,7 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             elif line_type == LineType.CONN_ERROR:
                 result.conn_fails += 1
                 ui.increment_conn_fails()
-                if result.conn_fails >= cfg.conn_fail_limit:
-                    result.aborted = True
-                    result.abort_reason = "conn-fail-limit (dry-run)"
-                    ui.set_abort(result.abort_reason)
-                    break
+                # Don't abort on conn-fail-limit in dry-run either
             time.sleep(0.1)
 
         result.clean_finish = not result.aborted
@@ -1238,19 +1234,12 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
                     state.mark_attempted(secret, data)
 
             elif line_type == LineType.CONN_ERROR:
+                # Track connection errors for stats/throttling, but don't abort
+                # Individual engines may have issues (e.g., kerbrute KDC errors)
+                # As long as one engine in the failover chain works, we continue
                 result.conn_fails += 1
                 ui.increment_conn_fails()
-                if result.conn_fails >= cfg.conn_fail_limit:
-                    # Abort this engine invocation
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    result.aborted = True
-                    result.abort_reason = "conn-fail-limit"
-                    ui.set_abort(result.abort_reason)
-                    break
+                # No longer abort on conn-fail-limit - let failover chain handle it
 
         # Wait for normal completion if not aborted
         if not result.aborted:
@@ -1753,19 +1742,19 @@ def run(cfg: Config, console: Console):
 
                 ui.end_spray()
 
-                if result.aborted and "conn-fail-limit" in result.abort_reason:
-                    console.print(f"[-] {engine} aborted due to connection failures; trying next in chain...", style="yellow")
+                # If engine aborted (tool-error, timeout, exception, binary-not-found), try next
+                # Note: We no longer abort on conn-fail-limit; connection errors are tracked but don't stop the engine
+                if result.aborted:
+                    console.print(f"[-] {engine} aborted: {result.abort_reason}; trying next in chain...", style="yellow")
                     continue  # Try next engine
 
-                if result.aborted and "tool-error" in result.abort_reason:
-                    console.print(f"[-] {engine} aborted due to tool errors (wrong realm/domain)", style="red")
-                    continue  # Try next engine
-
-                # Engine finished cleanly (or with partial results); move to next secret
+                # Engine finished cleanly (or with partial results but no abort); move to next secret
                 engine_success = True
                 break  # Don't continue failover chain for this secret
 
             if not engine_success:
+                # All engines in the failover chain aborted - only pause for this condition
+                # (Connection errors during individual engine runs are tracked but don't pause)
                 console.print(f"[!] All engines failed for this secret. Pausing.", style="red")
                 ui.alert("ALL ENGINES FAILED", "Could not spray this secret with any tool in the failover chain. Check network/DC. Press Enter to retry or Ctrl-C to abort.", "red")
                 input()  # Pause for operator
@@ -1818,6 +1807,10 @@ def run(cfg: Config, console: Console):
             console.print("      Error messages:", style="red")
             for err in round_errors_this_round[:5]:  # Show first 5 errors
                 console.print(f"        - {err}", style="dim")
+
+        # Show connection errors (informational - doesn't pause unless all engines fail)
+        if round_conn_fails_this_round > 0:
+            console.print(f"    - Connection errors: {round_conn_fails_this_round} (informational - some engines may have issues but at least one succeeded)", style="cyan")
 
         # Handle lockouts
         cumulative_lockouts = len(state.locked_users)
@@ -1939,7 +1932,7 @@ For authorized penetration testing only.
 
     parser.add_argument("--lockout-threshold", type=int, default=2, help="Cumulative lockouts before interactive prompt (default: 2)")
     parser.add_argument("--lockout-burst", type=int, default=5, help="Lockouts in a single round that hard-stop the run (default: 5)")
-    parser.add_argument("--conn-fail-limit", type=int, default=10, help="Connection failures before aborting an engine (default: 10)")
+    parser.add_argument("--conn-fail-limit", type=int, default=10, help="(Deprecated) Connection failure threshold (now tracked for throttling; engines no longer abort on conn failures)")
 
     parser.add_argument("--nxc-path", help="Override path to nxc/netexec binary")
     parser.add_argument("--kerbrute-path", help="Override path to kerbrute binary")
