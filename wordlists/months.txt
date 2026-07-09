@@ -1,0 +1,14 @@
+# Month names the mutator combines with the year (standalone, no org name).
+# One per line. Lines starting with '#' are ignored. Edit freely.
+January
+February
+March
+April
+May
+June
+July
+August
+September
+October
+November
+December

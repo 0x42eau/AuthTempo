@@ -2281,12 +2281,13 @@ For authorized penetration testing only.
     # Derive realm candidates for kerbrute auto-retry
     cfg.realm_candidates = derive_realm_candidates(cfg.domain)
 
-    # Load users and passwords
-    with open(args.u, "r") as f:
-        cfg.users = [line.strip() for line in f if line.strip()]
+    # Load users and passwords (skip blank lines and '#'-comment lines)
+    def _read_lines(path: str):
+        with open(path, "r") as fh:
+            return [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
 
-    with open(args.p, "r") as f:
-        cfg.passwords = [line.strip() for line in f if line.strip()]
+    cfg.users = _read_lines(args.u)
+    cfg.passwords = _read_lines(args.p)
 
     if not cfg.users:
         console.print("[!] No users found in userfile", style="red")

@@ -1,0 +1,10 @@
+# Anchor words the mutator ATTACHES to the org/domain name to build passwords
+# (e.g. Welcome + Praeven + 2026 + !  ->  WelcomePraeven2026!).
+# One per line. Lines starting with '#' are ignored. Edit freely.
+Welcome
+Password
+P@ssw0rd
+Corporate
+Company
+Ilove
+ILove

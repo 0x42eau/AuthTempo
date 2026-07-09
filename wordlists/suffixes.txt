@@ -1,0 +1,13 @@
+# Finales & separators the mutator appends/inserts.
+# Used as: {name}{year}{finale}  (e.g. Praeven2026!), {name}{sep}{year} (Praeven@2026),
+# and {name}{finale} (Praeven!). One token per line. Lines starting with '#' are ignored.
+!
+!@#
+!!
+@
+-
+_
+.
+1!
+123!
+#

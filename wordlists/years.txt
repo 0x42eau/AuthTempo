@@ -1,0 +1,9 @@
+# Supplementary/historical years the mutator combines at lower priority.
+# The primary target year comes from --year (default 2026) and always leads;
+# the years listed here produce the "prior years" bucket (e.g. Welcome2025!,
+# Summer2024!, {Org}2025!). One per line. Lines starting with '#' are ignored.
+2025
+2024
+2023
+2022
+2021

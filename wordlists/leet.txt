@@ -1,0 +1,13 @@
+# Leetspeak substitution map applied to the org/domain base name.
+# Format:  char=replacement1,replacement2,...
+# The FIRST replacement is the "primary" used for combinatorial (power-set)
+# leeting; additional replacements are sampled in for variety.
+# Vowels + common consonants. Edit freely.
+a=4,@
+e=3
+i=1,!
+o=0
+s=5,$
+t=7
+g=9
+b=8

@@ -1,0 +1,7 @@
+# Seasonal words the mutator combines with the org/domain name and year.
+# One per line. Lines starting with '#' are ignored. Edit freely.
+Summer
+Winter
+Spring
+Fall
+Autumn
