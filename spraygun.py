@@ -301,12 +301,6 @@ class RichUI:
         self.phase_data["errors"].append(error_msg)
         self._update_display()
 
-    def _update_display(self):
-        """Refresh the Live display."""
-        if self.live and self.current_phase == "spray":
-            self.live.update(self._render_spray())
-        self._update_display()
-
     def increment_conn_fails(self):
         """Register a connection failure."""
         self.phase_data["conn_fails"] += 1
@@ -528,7 +522,22 @@ class State:
             self._init_queue()
             return
 
-        data = json.loads(self.state_file.read_text())
+        # Robustness: a corrupt/truncated state file (e.g. process killed
+        # mid-write) must not crash --resume. Back it up and start fresh.
+        try:
+            data = json.loads(self.state_file.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("state JSON is not an object")
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            corrupt_backup = self.state_file.with_suffix(self.state_file.suffix + ".corrupt")
+            try:
+                self.state_file.replace(corrupt_backup)
+                self._log_line(f"=== State file corrupt ({e}); backed up to {corrupt_backup.name}, starting fresh ===")
+            except OSError:
+                self._log_line(f"=== State file corrupt ({e}); could not back up, starting fresh ===")
+            self._init_queue()
+            return
+
         self.used_passwords = data.get("used_passwords", [])
         self.found_creds = data.get("found_creds", {})
         self.locked_users = set(data.get("locked_users", []))
@@ -1346,20 +1355,26 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             line_type, data = classify_line(engine, line)
 
             if line_type == LineType.SUCCESS and data:
-                user, secret_hit = data.split(":", 1)
-                result.successes.append((user, secret_hit))
-                ui.update_success(user, secret_hit)
-                state.add_cred(user, secret_hit, is_admin=False)
-                state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
+                if ":" not in data:
+                    ui.console.print(f"[!] Unparseable credential line (skipped): {line}", style="yellow")
+                else:
+                    user, secret_hit = data.split(":", 1)
+                    result.successes.append((user, secret_hit))
+                    ui.update_success(user, secret_hit)
+                    state.add_cred(user, secret_hit, is_admin=False)
+                    state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
 
             elif line_type == LineType.ADMIN and data:
-                user, secret_hit = data.split(":", 1)
-                result.admin_users.append((user, secret_hit))
-                # Also add to successes since it's a valid credential
-                result.successes.append((user, secret_hit))
-                ui.update_admin(user, secret_hit)
-                state.add_cred(user, secret_hit, is_admin=True)
-                state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
+                if ":" not in data:
+                    ui.console.print(f"[!] Unparseable admin line (skipped): {line}", style="yellow")
+                else:
+                    user, secret_hit = data.split(":", 1)
+                    result.admin_users.append((user, secret_hit))
+                    # Also add to successes since it's a valid credential
+                    result.successes.append((user, secret_hit))
+                    ui.update_admin(user, secret_hit)
+                    state.add_cred(user, secret_hit, is_admin=True)
+                    state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
 
             elif line_type == LineType.LOCKOUT:
                 user_lock = data if data else "(unknown)"
@@ -1870,6 +1885,21 @@ def run(cfg: Config, console: Console):
     chain = build_failover_chain(cfg)
     console.print(f"[*] Failover chain: {' -> '.join(str(e) for e in chain)}", style="cyan")
 
+    # Prune failover-memory state for engines no longer in the chain (e.g. the
+    # operator changed --tool/--protocol between runs). Keeps resume coherent.
+    valid_keys = {str(e) for e in chain}
+    stale = [k for k in state.engine_health if k not in valid_keys]
+    if stale:
+        for k in stale:
+            del state.engine_health[k]
+        console.print(f"[*] Pruned {len(stale)} stale engine-health entr(y|ies) not in chain: {', '.join(stale)}", style="dim")
+    kerbrute_in_chain = any(e.tool == "kerbrute" for e in chain)
+    if not kerbrute_in_chain:
+        if state.known_bad_realms or state.working_realm:
+            state.known_bad_realms = []
+            state.working_realm = None
+            console.print("[*] kerbrute no longer in chain; cleared realm-retry memory", style="dim")
+
     # Main loop over password queue
     round_idx = 0
     cumulative_lockouts = len(state.locked_users)
@@ -1903,7 +1933,7 @@ def run(cfg: Config, console: Console):
             if demoted:
                 cooldowns = [f"{e} ({state.engine_health.get(str(e), {}).get('cooldown_remaining', 0)}r)" for e in demoted]
                 demoted_str = " & ".join(cooldowns) + " demoted"
-                parts.append(f"({demoted_str})" if demoted else "")
+                parts.append(f"({demoted_str})")
             if parts:
                 console.print(f"[*] Effective engines: {' → '.join(parts) if len(parts) > 1 else parts[0]}", style="cyan")
 

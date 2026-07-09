@@ -13,13 +13,112 @@ Usage:
 import argparse
 import re
 import sys
-from typing import List, Set, Optional
+from itertools import combinations
+from pathlib import Path
+from typing import List, Set, Optional, Tuple, Dict
+
+# ---------------------------------------------------------------------------
+# Word lists — single source of truth for generic corporate vocabulary.
+# Used both to strip trailing suffix words (org path) and to split domain
+# labels that have no spaces (domain-only fallback). NOT used to guess word
+# boundaries when an explicit spaced org name is supplied — the spaces do that.
+# ---------------------------------------------------------------------------
+GENERIC_SUFFIX_WORDS: Set[str] = {
+    # corporate-form suffixes
+    "company", "companies", "corp", "corporation", "inc", "incorporated",
+    "llc", "ltd", "limited", "co", "group", "holdings", "partners",
+    "enterprises", "solutions", "services", "technologies", "technology",
+    "tech", "systems", "global", "international", "consulting", "advisory",
+    "foundation", "association", "authority", "bureau", "office", "department",
+    "enterprises", "trading", "imports", "exports",
+    # industry / sector words (often the generic tail of a name)
+    "security", "secure", "cyber", "digital", "defense", "defence",
+    "network", "networks", "software", "labs", "works", "dynamics",
+    "energy", "financial", "finance", "bank", "banking", "media",
+    "health", "healthcare", "motors", "foods", "airlines", "express",
+    # misc common tails seen in real org names
+    "bros", "kingdoms",
+}
+
+# Leading words to drop ("The Acme Corp" -> ["Acme", "Corp"])
+GENERIC_LEADING_WORDS: Set[str] = {"the"}
+
+# TLDs / pseudo-TLDs to drop when deriving a base name from a domain
+TLDS: Set[str] = {
+    "local", "com", "net", "org", "int", "io", "co", "dev", "internal",
+    "lan", "corp", "ad", "intra", "test", "example", "pvt",
+}
+
+# Default location of the editable building-block files.
+WORDLIST_DIR_DEFAULT: Path = Path(__file__).resolve().parent / "wordlists"
+
+# ---------------------------------------------------------------------------
+# Built-in defaults for the editable wordlists. Used when a wordlist file is
+# missing or empty, so the mutator always works out of the box. The shipped
+# wordlists/*.txt mirror these exactly.
+# ---------------------------------------------------------------------------
+DEFAULT_SEASONS: List[str] = ["Summer", "Winter", "Spring", "Fall", "Autumn"]
+DEFAULT_MONTHS: List[str] = ["January", "February", "March", "April", "May", "June",
+                             "July", "August", "September", "October", "November", "December"]
+DEFAULT_ANCHORS: List[str] = ["Welcome", "Password", "P@ssw0rd", "Corporate", "Company", "Ilove", "ILove"]
+DEFAULT_SUFFIXES: List[str] = ["!", "!@#", "!!", "@", "-", "_", ".", "1!", "123!", "#"]
+DEFAULT_COMMON: List[str] = [
+    "Password123!", "Password123!@#", "P@ssw0rd123!", "Password1!", "P@ssw0rd!",
+    "Welcome123!", "Welcome123!@#", "Welcome1!", "Welcome!", "Changeme!", "ChangeMe!",
+    "Changeme1!", "Corporate123!", "Company123!", "Office365!",
+    "password", "password1", "password123!", "P@ssw0rd", "Welcome123",
+    "admin", "administrator", "123456",
+]
+# Leet map: char -> [primary_replacement, alternates...]
+DEFAULT_LEET: Dict[str, List[str]] = {
+    "a": ["4", "@"], "e": ["3"], "i": ["1", "!"], "o": ["0"],
+    "s": ["5", "$"], "t": ["7"], "g": ["9"], "b": ["8"],
+}
+
+
+def _load_wordlist(path: Path, default: List[str]) -> List[str]:
+    """Load a newline-delimited wordlist, ignoring blanks and '#'-comments. Falls back to default."""
+    try:
+        if not path.exists():
+            return list(default)
+        items = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            items.append(line)
+        return items if items else list(default)
+    except OSError:
+        return list(default)
+
+
+def _load_leet_map(path: Path, default: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Load a 'char=repl1,repl2' leet map. Falls back to default."""
+    try:
+        if not path.exists():
+            return {k: list(v) for k, v in default.items()}
+        out: Dict[str, List[str]] = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            ch, _, repls = line.partition("=")
+            ch = ch.strip().lower()
+            vals = [r.strip() for r in repls.split(",") if r.strip()]
+            if ch and vals:
+                out[ch] = vals
+        return out if out else {k: list(v) for k, v in default.items()}
+    except OSError:
+        return {k: list(v) for k, v in default.items()}
 
 
 class PasswordMutator:
     """Generate enterprise-style password mutations from domain/org names."""
 
-    def __init__(self, domain: str = "", org: str = "", year: int = 2026):
+    def __init__(self, domain: str = "", org: str = "", year: int = 2026,
+                 wordlist_dir: Optional[str] = None,
+                 leet: bool = True, leet_variants: int = 8,
+                 keywords: Optional[List[str]] = None):
         """
         Initialize mutator with domain and organization info.
 
@@ -27,241 +126,364 @@ class PasswordMutator:
             domain: Active Directory domain (e.g., "contoso.local")
             org: Organization name (e.g., "Contoso Corporation")
             year: Target year for seasonal passwords (default: 2026)
+            wordlist_dir: directory of editable building-block files
+                          (default: ./wordlists next to this script)
+            leet: generate leetspeak variants of the org/domain name (default True)
+            leet_variants: max leet forms per base name (default 8)
+            keywords: extra operator-signified base tokens to mutate on
+                      (e.g. ["seven", "sevenkingdoms"]). Word boundaries in a
+                      keyword come from spaces, exactly like --org.
         """
-        self.domain = domain.lower()
-        self.org = org
+        self.domain = domain.strip()
+        self.org = org.strip() if org else ""
         self.year = year
+        self.leet_enabled = leet
+        self.leet_variants = leet_variants
+        self.keywords: List[str] = [k.strip() for k in (keywords or []) if k and k.strip()]
 
-        # Extract organization names from domain
-        self.org_names = self._extract_org_names(domain, org)
+        # Load editable building blocks (fall back to built-in defaults).
+        wl = Path(wordlist_dir) if wordlist_dir else WORDLIST_DIR_DEFAULT
+        self.seasons = _load_wordlist(wl / "seasons.txt", DEFAULT_SEASONS)
+        self.months = _load_wordlist(wl / "months.txt", DEFAULT_MONTHS)
+        self.anchors = _load_wordlist(wl / "anchors.txt", DEFAULT_ANCHORS)
+        self.suffixes = _load_wordlist(wl / "suffixes.txt", DEFAULT_SUFFIXES)
+        self.hist_years = _load_wordlist(wl / "years.txt",
+                                         [str(self.year - i) for i in range(1, 5)])
+        self.common_floor = _load_wordlist(wl / "common_passwords.txt", DEFAULT_COMMON)
+        self.leet_map = _load_leet_map(wl / "leet.txt", DEFAULT_LEET) if leet else {}
 
-    def _extract_org_names(self, domain: str, org: str) -> Set[str]:
-        """Extract organization name variations from domain/org."""
-        names = set()
+        # Derive base names once: ordered list of (priority, canonical_name, is_acronym).
+        # Lower priority number = emitted earlier (higher probability).
+        self.base_names: List[Tuple[int, str, bool]] = self._derive_base_names()
 
-        # Add explicit org name if provided
-        if org:
-            # Clean org name: remove suffixes and spaces, convert to single word
-            org_clean = re.sub(r'\s+(Corporation|Corp|Incorporated|Inc|LLC|Ltd)\b.*', '', org, flags=re.IGNORECASE)
-            org_clean = re.sub(r'\s+', '', org_clean)  # Remove all spaces
-            names.add(org_clean)
+    # ===================================================================
+    # Tokenization — observed variables, not keyword guessing
+    # ===================================================================
 
-        # Extract from domain (e.g., "contoso.local" -> "contoso")
-        if domain:
-            domain_base = domain.split(".")[0]  # First part before dot
-            names.add(domain_base)
+    def _tokenize_org(self, org: str) -> List[str]:
+        """Split an explicit org name on whitespace into clean words."""
+        if not org:
+            return []
+        # Collapse internal whitespace, strip leading/trailing
+        raw = [w.strip() for w in re.split(r"\s+", org.strip()) if w.strip()]
+        words = []
+        for w in raw:
+            # Strip surrounding punctuation (quotes, commas) but keep internal chars
+            w = w.strip("\"\t,;:.()[]{}").strip()
+            if w:
+                words.append(w)
+        # Drop a single leading generic word ("The Acme" -> "Acme")
+        if len(words) > 1 and words[0].lower() in GENERIC_LEADING_WORDS:
+            words = words[1:]
+        return words
 
-            # Handle multi-part domains (e.g., "sevenkingdoms.local" -> "sevenkingdoms")
-            if "." in domain:
-                parts = domain.split(".")
-                for part in parts:
-                    if part not in ["local", "com", "net", "org", "int"]:
-                        names.add(part)
+    def _strip_generic_suffix(self, words: List[str]) -> List[str]:
+        """Drop trailing generic corporate words, always keeping >= 1 word."""
+        out = list(words)
+        while len(out) > 1 and out[-1].lower() in GENERIC_SUFFIX_WORDS:
+            out.pop()
+        return out
+
+    @staticmethod
+    def _camel_from_words(words: List[str]) -> str:
+        """Build camelCase from explicit words: ['Praeven','Security'] -> 'PraevenSecurity'."""
+        return "".join(w[:1].upper() + w[1:].lower() for w in words if w)
+
+    @staticmethod
+    def _acronym(words: List[str]) -> Optional[str]:
+        """First letters of significant words. Only when >= 2 words."""
+        sig = [w for w in words if w]
+        if len(sig) < 2:
+            return None
+        return "".join(w[0].upper() for w in sig)
+
+    def _domain_labels(self, domain: str) -> List[str]:
+        """Domain labels minus TLDs and trivial tokens (no spaces expected)."""
+        if not domain:
+            return []
+        parts = [p.strip().lower() for p in domain.split(".") if p.strip()]
+        return [p for p in parts if p not in TLDS and len(p) > 2]
+
+    def _split_domain_label(self, label: str) -> List[str]:
+        """
+        Split a domain label ONLY on explicit separators (hyphen / underscore).
+        A space-less label is kept as ONE word — the operator signifies compound
+        boundaries via --org ("Seven Kingdoms") or --keywords, not by the tool
+        guessing. No suffix/vowel heuristics.
+
+        'seven-kingdoms' -> ['Seven','Kingdoms'] ; 'sevenkingdoms' -> ['Sevenkingdoms']
+        """
+        if not label:
+            return []
+        low = label.lower()
+        if re.search(r"[-_]", low):
+            return [w[:1].upper() + w[1:].lower()
+                    for w in re.split(r"[-_]+", low) if w]
+        return [label[:1].upper() + label[1:].lower()]
+
+    def _derive_base_names(self) -> List[Tuple[int, str, bool]]:
+        """
+        Produce an ordered, de-duplicated list of (priority, canonical_name, is_acronym).
+
+        Word boundaries come ONLY from what the operator signifies: spaces in
+        --org, separators (-/_) in the domain, or explicit --keywords. The tool
+        never guesses compound splits from a single token.
+
+        Priority: 1=distinctive/keyword, 2=acronym, 3=full name, 4+=domain base.
+        """
+        names: List[Tuple[int, str, bool]] = []
+        seen: Set[str] = set()
+
+        def add(prio: int, name: Optional[str], is_acronym: bool = False):
+            if not name:
+                return
+            key = name.lower()
+            if key in seen or key == "":
+                return
+            seen.add(key)
+            names.append((prio, name, is_acronym))
+
+        def add_word_group(words: List[str], base_prio: int):
+            """Full pipeline for an explicitly-signified word group."""
+            if not words:
+                return
+            # Distinctive name (trailing generic suffix stripped)
+            stripped = self._strip_generic_suffix(words)
+            add(base_prio, self._camel_from_words(stripped))
+            # Acronym (only if >= 2 significant words)
+            add(base_prio + 1, self._acronym(words), is_acronym=True)
+            # Full name (no stripping)
+            add(base_prio + 2, self._camel_from_words(words))
+
+        org_words = self._tokenize_org(self.org)
+        explicit_given = bool(org_words or self.keywords)
+
+        # 1. Explicit org name (highest priority).
+        if org_words:
+            add_word_group(org_words, 1)
+
+        # 2. Explicit keywords (operator-signified tokens, same high priority).
+        for kw in self.keywords:
+            kw_words = self._tokenize_org(kw)
+            if kw_words:
+                add_word_group(kw_words, 1)
+            elif kw:
+                # Single bare token (no spaces) -> one base name, no guessing.
+                add(1, kw[:1].upper() + kw[1:].lower())
+
+        # 3. Domain base(s). Supplementary (offset 3) when an org/keyword was
+        # given; primary (offset 0) when the domain is the only signal.
+        offset = 3 if explicit_given else 0
+        for label in self._domain_labels(self.domain):
+            words = self._split_domain_label(label)
+            if not words:
+                continue
+            if len(words) > 1:
+                # Separators signalled multiple words -> full pipeline.
+                add_word_group(words, 1 + offset)
+            else:
+                # Single label -> one base name (no compound guessing).
+                add(1 + offset, words[0])
 
         return names
 
-    def _capitalize_variants(self, name: str) -> List[str]:
-        """Generate capitalization variants of a name (lower, upper, title, camelCase)."""
+    def _casing_variants(self, name: str, acronym: bool = False) -> List[str]:
+        """
+        Casing variants of a canonical name.
+        Acronyms stay uppercase only; full names get {as-given, UPPER, lower}.
+        """
+        if acronym:
+            return [name.upper()]
         variants = [name]
         if len(name) > 1:
-            variants.append(name.capitalize())  # contoso -> Contoso
-            variants.append(name.upper())  # contoso -> CONTOSO
-            variants.append(name.lower())  # Contoso -> contoso
+            variants.append(name.upper())
+            variants.append(name.lower())
+        # Order-preserving dedupe
+        out: List[str] = []
+        for v in variants:
+            if v not in out:
+                out.append(v)
+        return out
 
-            # Generate camelCase variant (SevenKingdoms from sevenkingdoms)
-            camel = self._to_camel_case(name)
-            if camel and camel != name.capitalize():
-                variants.append(camel)
-
-        return list(set(variants))
-
-    def _to_camel_case(self, name: str) -> Optional[str]:
+    def _leet_variants(self, name: str, max_variants: int = 8) -> List[str]:
         """
-        Convert compound name to camelCase (sevenkingdoms -> SevenKingdoms).
-        Uses simple word boundary detection for common enterprise naming patterns.
+        Bounded combinatorial leetspeak of a name.
+
+        For each leetable char (per self.leet_map), choose substitute-or-not
+        across the power set of positions, preferring larger (more complete)
+        substitutions first. Uses the PRIMARY replacement per char so output is
+        deterministic. Capped at max_variants. e.g. Praeven ->
+        Pr43v3n, Pra3v3n, Pr4even, Praev3n, Pra3ven, Pr43ven, Pr4ev3n.
+
+        Does NOT mutate acronyms. Returns [] if leet disabled or no leetable char.
         """
-        if not name:
-            return None
+        if not self.leet_enabled or not self.leet_map or len(name) < 3:
+            return []
+        low = name.lower()
+        # Positions of leetable chars and their primary replacement.
+        positions = [(i, c, self.leet_map[c][0])
+                     for i, c in enumerate(low) if c in self.leet_map and self.leet_map[c]]
+        if not positions:
+            return []
 
-        # Common enterprise suffixes to split on
-        suffixes = [
-            'kingdoms', 'systems', 'tech', 'technologies', 'solutions',
-            'industries', 'corporation', 'company', 'global', 'international',
-            'services', 'software', 'digital', 'networks', 'group', 'partners',
-            'labs', 'works', 'dynamics', 'soft', 'ware', 'land', 'wind'
-        ]
-
-        name_lower = name.lower()
-
-        # Try to split on common suffixes
-        for suffix in suffixes:
-            if name_lower.endswith(suffix):
-                prefix = name_lower[:-len(suffix)]
-                if prefix:  # Must have a prefix part
-                    # Capitalize both parts
-                    return prefix.capitalize() + suffix.capitalize()
-
-        # Try to split on lowercase-to-lowercase transitions (sevenkingdoms)
-        # This handles cases like "northwind" -> "Northwind" (already handled by capitalize)
-        # but also "sevenkingdoms" -> "SevenKingdoms"
-        parts = []
-        current = name_lower[0]
-        for i in range(1, len(name_lower)):
-            # If adding this char creates a common word, split here
-            for suffix in suffixes:
-                if (current + name_lower[i]).endswith(suffix) and len(current) > 1:
-                    parts.append(current.capitalize())
-                    current = name_lower[i]
-                    break
-            else:
-                current += name_lower[i]
-
-        if current:
-            parts.append(current.capitalize())
-
-        if len(parts) > 1:
-            return ''.join(parts)
-
-        # Fallback: try to detect vowel transitions (aetherical -> Aetherical)
-        # This is less reliable but helps with some made-up words
-        if len(name_lower) > 6:
-            # Look for vowel sequences that might indicate word boundaries
-            for i in range(2, len(name_lower) - 2):
-                if name_lower[i] in 'aeiou' and name_lower[i-1] not in 'aeiou' and name_lower[i+1] not in 'aeiou':
-                    # Found vowel surrounded by consonants - possible word boundary
-                    candidate = name_lower[:i].capitalize() + name_lower[i:].capitalize()
-                    if candidate != name.capitalize():
-                        return candidate
-
-        return None
+        variants: List[str] = []
+        seen: Set[str] = set()
+        n = len(positions)
+        # Iterate subset sizes from largest (full leet) down to 1, so the most
+        # "complete" leet forms come first within the cap.
+        for size in range(n, 0, -1):
+            for combo in combinations(positions, size):
+                arr = list(name)
+                for i, _c, repl in combo:
+                    arr[i] = repl
+                candidate = "".join(arr)
+                # Preserve leading capital on the camelCase form.
+                if candidate and candidate[0].isalpha():
+                    candidate = candidate[0].upper() + candidate[1:]
+                if candidate.lower() not in seen and candidate.lower() != low:
+                    seen.add(candidate.lower())
+                    variants.append(candidate)
+                    if len(variants) >= max_variants:
+                        return variants
+        return variants
 
     def generate(self, count: int = 100) -> List[str]:
         """
         Generate password mutations ordered by probability.
 
+        Base names are derived from observed variables (spaced org words /
+        domain labels), never keyword-guessed. A floor of common enterprise
+        passwords is always included even when count is small.
+
         Returns:
             List of generated passwords (duplicates removed)
         """
-        passwords: List[tuple[int, str]] = []  # (priority, password) - lower priority = higher probability
+        # (priority, password, force_include?) - lower priority = higher probability
+        passwords: List[Tuple[int, str, bool]] = []
 
-        # Priority 1: Org + current year patterns (HIGHEST PROBABILITY)
-        for org_name in self.org_names:
-            for variant in self._capitalize_variants(org_name):
-                # WelcomeOrg2026! (most realistic enterprise pattern)
-                passwords.append((1, f"Welcome{variant}{self.year}!"))
-                passwords.append((1, f"Welcome{variant}{self.year}"))
-                passwords.append((1, f"Welcome{variant}!"))
+        # Single non-alphanumeric suffixes double as name<->year separators.
+        separators = [s for s in self.suffixes if len(s) == 1 and not s.isalnum()]
+        primary_finale = self.suffixes[0] if self.suffixes else "!"
+        top_anchors = self.anchors[:3]
 
-                # Org2026!, Org2026 (clean org + year)
-                passwords.append((1, f"{variant}{self.year}!"))
-                passwords.append((1, f"{variant}{self.year}"))
-                passwords.append((1, f"{variant}!"))
+        def add(prio: int, pwd: str, force: bool = False):
+            passwords.append((prio, pwd, force))
 
-                # Org@2026, Org!2026 (realistic separators)
-                passwords.append((1, f"{variant}@{self.year}"))
-                passwords.append((1, f"{variant}!{self.year}"))
+        # Per-base-name CORE forms guaranteed to appear regardless of --count,
+        # so EVERY observed variable is mutated (seven AND sevenkingdoms).
+        core_forced: List[str] = []
 
-        # Priority 1: Seasonal + org name (HIGH PROBABILITY)
-        for org_name in self.org_names:
-            for variant in self._capitalize_variants(org_name):
-                for season in ["Summer", "Winter", "Spring", "Fall", "Autumn"]:
-                    passwords.append((1, f"{season}{variant}!"))
-                    passwords.append((1, f"{season}{variant}{self.year}!"))
+        # ---- Org/domain-derived patterns -----------------------------------
+        # Each base name's priority comes from _derive_base_names; pattern
+        # templates add a small offset so the distinctive name leads.
+        for base_prio, name, is_acronym in self.base_names:
+            variants = self._casing_variants(name, acronym=is_acronym)
+            # Guarantee core forms for this base name (all casings).
+            for variant in variants:
+                core_forced.append(f"{variant}{self.year}{primary_finale}")
+                core_forced.append(f"{variant}{primary_finale}")
+            core_forced.append(f"Welcome{name}{self.year}{primary_finale}")
+            # Guarantee the densest leet form too (leet otherwise gets truncated
+            # at small --count by priority sorting).
+            if self.leet_enabled and not is_acronym:
+                leets = self._leet_variants(name, self.leet_variants)
+                if leets:
+                    core_forced.append(f"{leets[0]}{self.year}{primary_finale}")
+                    core_forced.append(f"{leets[0]}{primary_finale}")
+            # Full template fanout.
+            for variant in variants:
+                p = base_prio
+                # anchor + name + year (WelcomePraeven2026!)
+                for anchor in self.anchors:
+                    add(p, f"{anchor}{variant}{self.year}{primary_finale}")
+                    add(p, f"{anchor}{variant}{self.year}")
+                # name + year + finale (each finale)
+                for suf in self.suffixes:
+                    add(p, f"{variant}{self.year}{suf}")
+                add(p, f"{variant}{self.year}")
+                # name + finale
+                for suf in self.suffixes:
+                    add(p, f"{variant}{suf}")
+                # name + separator + year (Praeven@2026)
+                for sep in separators:
+                    add(p, f"{variant}{sep}{self.year}")
+                # season + name
+                for season in self.seasons:
+                    add(p, f"{season}{variant}{primary_finale}")
+                    add(p, f"{season}{variant}{self.year}{primary_finale}")
+                # name + common-password combos (longer, lower tier)
+                add(p + 2, f"{variant}Password123!")
+                add(p + 2, f"Password{variant}{self.year}!")
+                add(p + 2, f"{variant}{self.year}Password!")
 
-        # Priority 2: Seasonal + year (HIGH - but without org, so slightly lower)
-        for season in ["Summer", "Winter", "Spring", "Fall", "Autumn"]:
-            passwords.append((2, f"{season}{self.year}!"))
-            passwords.append((2, f"{season}{self.year}"))
+        # ---- Leetspeak variants of distinctive/full names -----------------
+        # Reduced template set at one tier below the plain name to bound size.
+        for base_prio, name, is_acronym in self.base_names:
+            if is_acronym:
+                continue
+            for leet in self._leet_variants(name, self.leet_variants):
+                p = base_prio + 1
+                for suf in self.suffixes:
+                    add(p, f"{leet}{self.year}{suf}")
+                add(p, f"{leet}{self.year}")
+                for suf in self.suffixes:
+                    add(p, f"{leet}{suf}")
+                for anchor in top_anchors:
+                    add(p, f"{anchor}{leet}{self.year}{primary_finale}")
 
-        for month in ["January", "February", "March", "April", "May", "June",
-                      "July", "August", "September", "October", "November", "December"]:
-            passwords.append((2, f"{month}{self.year}!"))
-            passwords.append((2, f"{month}{self.year}"))
+        # ---- Seasonal / monthly + year (no org) ----------------------------
+        for season in self.seasons:
+            add(2, f"{season}{self.year}!")
+            add(2, f"{season}{self.year}")
+        for month in self.months:
+            add(2, f"{month}{self.year}!")
+            add(2, f"{month}{self.year}")
 
-        # Priority 2: Ilove/org patterns (moved down from Priority 1)
-        for org_name in self.org_names:
-            for variant in self._capitalize_variants(org_name):
-                passwords.append((2, f"Ilove{variant}123!"))
-                passwords.append((2, f"Ilove{variant}{self.year}!"))
-                passwords.append((2, f"ILove{variant}123!"))
+        # ---- Common enterprise passwords (FORCE-INCLUDED floor) ------------
+        for pwd in self.common_floor:
+            add(3, pwd, force=True)
 
-        # Priority 3: Common corporate patterns (MODERATE PROBABILITY)
-        # Base patterns
-        passwords.extend([
-            (3, "Password123!"),
-            (3, "P@ssw0rd123!"),
-            (3, "Welcome123!"),
-            (3, "Welcome123!@#"),
-            (3, "Password1!"),
-            (3, "P@ssw0rd!"),
-            (3, "Welcome1!"),
-            (3, "Welcome!"),
-            (3, "Changeme!"),
-            (3, "ChangeMe!"),
-            (3, "Changeme1!"),
-            (3, "Corporate123!"),
-            (3, "Company123!"),
-            (3, "Office365!"),
-        ])
+        # ---- Prior years (from wordlists/years.txt) ------------------------
+        for y in self.hist_years:
+            add(4, f"Welcome{y}!")
+            add(4, f"Summer{y}!")
+            add(4, f"Winter{y}!")
+            add(4, f"Password{y}!")
+            for _prio, name, is_acronym in self.base_names:
+                if is_acronym:
+                    continue
+                add(4, f"{name}{y}!")
 
-        # Priority 3: Org + corporate combinations (LONGER PASSWORDS)
-        for org_name in self.org_names:
-            for variant in self._capitalize_variants(org_name):
-                passwords.append((3, f"{variant}Password123!"))
-                passwords.append((3, f"{variant}Welcome2026!"))
-                passwords.append((3, f"Password{variant}2026!"))
-                passwords.append((3, f"Welcome{variant}2026!!"))
-                passwords.append((3, f"{variant}2026Password!"))
-                passwords.append((3, f"{variant}Corp2026!"))
-                passwords.append((3, f"Corporate{variant}2026!"))
-                passwords.append((3, f"Company{variant}2026!"))
+        # ---- Dedupe (case-sensitive to keep casing variants) + sort -------
+        seen: Set[str] = set()
+        unique: List[Tuple[int, str, bool]] = []
+        for prio, pwd, force in passwords:
+            if pwd in seen:
+                continue
+            seen.add(pwd)
+            unique.append((prio, pwd, force))
 
-        # Priority 4: Year variations 2023-2025
-        passwords.extend([
-            (4, "Welcome2023!"),
-            (4, "Summer2023!"),
-            (4, "Winter2023!"),
-            (4, "Password2023!"),
-            (4, "Welcome2022!"),
-            (4, "Password2022!"),
-            (4, "Welcome2021!"),
-            (4, "Password2021!"),
-        ])
-
-        # Priority 5: Generic patterns (LOWEST PROBABILITY - always include)
-        passwords.extend([
-            (5, "password"),
-            (5, "password1"),
-            (5, "password123!"),
-            (5, "P@ssw0rd"),
-            (5, "Welcome123"),
-            (5, "admin"),
-            (5, "administrator"),
-            (5, "123456"),
-        ])
-
-        # Remove duplicates and sort by priority
-        # Note: case-sensitive dedup to preserve capitalization variants (orgname, ORGNAME, OrgName)
-        seen = set()
-        unique_passwords = []
-        for priority, pwd in passwords:
-            if pwd not in seen:
-                seen.add(pwd)
-                unique_passwords.append((priority, pwd))
-
-        # Sort by priority (lower number = higher probability)
-        # Within same priority, Welcome/Seasonal/Month prefix gets priority
         def sort_key(x):
-            priority, pwd = x
-            # Secondary sort: Welcome/Seasonal/Month prefix patterns get priority
-            if re.match(r"^(Welcome|Spring|Summer|Winter|Fall|Autumn|January|February|March|April|May|June|July|August|September|October|November|December)", pwd, re.IGNORECASE):
-                return (priority, 0, len(pwd))  # Prefix patterns first
-            return (priority, 1, len(pwd))  # Then by length
-        unique_passwords.sort(key=sort_key)
+            prio, pwd, _ = x
+            # Secondary sort: Welcome/Seasonal/Month prefix patterns first
+            prefix = pwd.startswith(("Welcome", "Spring", "Summer", "Winter",
+                                     "Fall", "Autumn")) or pwd[:3] in {
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}
+            return (prio, 0 if prefix else 1, len(pwd))
 
-        # Return just the passwords (not the priorities)
-        result = [pwd for _, pwd in unique_passwords]
-        return result[:count]
+        unique.sort(key=sort_key)
+
+        result = [pwd for _, pwd, _ in unique][:count]
+
+        # ---- Enforce floors: common passwords + per-base-name core forms ---
+        present = set(result)
+        for pwd in self.common_floor + core_forced:
+            if pwd not in present:
+                result.append(pwd)
+                present.add(pwd)
+
+        return result
 
     def generate_list(self, count: int = 100, min_length: int = 0) -> List[str]:
         """
@@ -308,15 +530,42 @@ Examples:
 
   # Filter by minimum length (password policy compliance)
   python3 password_mutator.py --domain contoso.local --length 12 --count 100
+
+  # Leetspeak variants (Praeven -> Pr43v3n, Praev3n, ...)
+  python3 password_mutator.py --domain praeven.org --org "Praeven" --leet-variants 12
+
+  # Use a custom set of building-block files
+  python3 password_mutator.py --domain contoso.local --wordlist-dir ./my_lists
+
+  # Disable leetspeak
+  python3 password_mutator.py --domain contoso.local --no-leet
+
+  # Explicit extra base tokens to mutate (operator signifies the words)
+  python3 password_mutator.py --domain sevenkingdoms.local --keywords seven,sevenkingdoms
+
+  # Check exactly which base names the mutator derived, without generating
+  python3 password_mutator.py --domain sevenkingdoms.local --org "Seven Kingdoms" --show-bases
         """
     )
 
-    parser.add_argument("--domain", help="Active Directory domain (e.g., contoso.local)")
+    parser.add_argument("-d", "--domain", help="Active Directory domain (e.g., contoso.local)")
     parser.add_argument("--org", help="Organization name (e.g., 'Contoso Corporation')")
     parser.add_argument("--year", type=int, default=2026, help="Target year (default: 2026)")
     parser.add_argument("--count", type=int, default=100, help="Max passwords to generate (default: 100)")
     parser.add_argument("-l", "--length", type=int, default=0, help="Minimum password length (default: 0, no filter)")
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
+    parser.add_argument("--wordlist-dir", default=None,
+                        help="Directory of editable building-block files (default: ./wordlists)")
+    parser.add_argument("--no-leet", action="store_true",
+                        help="Disable leetspeak variants of the org/domain name")
+    parser.add_argument("--leet-variants", type=int, default=8,
+                        help="Max leet forms per base name (default: 8)")
+    parser.add_argument("--keywords", default="",
+                        help="Extra base tokens to mutate on, comma-separated "
+                             "(e.g. --keywords seven,sevenkingdoms). Spaces inside "
+                             "a token split it into words, like --org.")
+    parser.add_argument("--show-bases", action="store_true",
+                        help="Print the derived base names and exit (dry check)")
 
     args = parser.parse_args()
 
@@ -325,8 +574,35 @@ Examples:
         print("\n[!] Error: --domain is required", file=sys.stderr)
         sys.exit(1)
 
+    keywords = [k for k in (args.keywords.split(",") if args.keywords else []) if k.strip()]
+
     # Generate passwords
-    mutator = PasswordMutator(domain=args.domain, org=args.org, year=args.year)
+    mutator = PasswordMutator(domain=args.domain, org=args.org, year=args.year,
+                              wordlist_dir=args.wordlist_dir,
+                              leet=not args.no_leet, leet_variants=max(0, args.leet_variants),
+                              keywords=keywords)
+
+    # Always show the operator exactly which base names were derived (to stderr,
+    # so stdout stays clean for piping). This is the guidance surface: if the
+    # parsed bases are wrong, fix --org / --keywords / domain separators.
+    has_acronym = any(a for _p, _n, a in mutator.base_names)
+    bases = [f"{n}{'*' if a else ''}" for _p, n, a in mutator.base_names]
+    if bases:
+        legend = "  (* = acronym)" if has_acronym else ""
+        print(f"[*] Base names derived ({len(bases)}): {', '.join(bases)}{legend}",
+              file=sys.stderr)
+        if keywords:
+            print(f"[*] Keywords: {', '.join(keywords)}", file=sys.stderr)
+        if not args.no_leet and any(not a for _p, n, a in mutator.base_names):
+            print("[*] Leetspeak: ON (use --no-leet to disable)", file=sys.stderr)
+        if not has_acronym and not args.org and not keywords:
+            print("[*] Tip: domain treated as one word. To split a compound "
+                  "(e.g. seven + sevenkingdoms), use --org \"Seven Kingdoms\" "
+                  "or --keywords seven,sevenkingdoms", file=sys.stderr)
+
+    if args.show_bases:
+        sys.exit(0)
+
     passwords = mutator.generate_list(count=args.count, min_length=args.length)
 
     # Output
