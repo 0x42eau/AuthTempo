@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Runtime output can contain plaintext secrets and credential findings.
+spraygun-out/
+spraygun-dry-run-out/
+authcadence-out/
+authcadence-dry-run-out/
+authtempo-out/
+authtempo-dry-run-out/

@@ -1,6 +1,7 @@
 # Finales & separators the mutator appends/inserts.
-# Used as: {name}{year}{finale}  (e.g. Praeven2026!), {name}{sep}{year} (Praeven@2026),
-# and {name}{finale} (Praeven!). One token per line. Lines starting with '#' are ignored.
+# Used as: {name}{year}{finale}  (e.g. Contoso2026!), {name}{sep}{year} (Contoso@2026),
+# and {name}{finale} (Contoso!). One token per line. Hash-prefixed lines are comments,
+# except a line containing only '#' (below), which is treated as a literal suffix.
 !
 !@#
 !!

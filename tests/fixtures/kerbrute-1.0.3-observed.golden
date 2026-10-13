@@ -1,0 +1,6 @@
+# expected-type<TAB>expected-data<TAB>sanitized output line
+AUTHFAIL	alice@LAB	2026/10/13 09:42:53 >  [!] alice@LAB:Winter2026! - KDC_ERR_PREAUTH_FAILED
+SUCCESS	alice@LAB:Winter2026!	2026/10/13 09:42:54 >  [+] VALID LOGIN: alice@LAB:Winter2026!
+SUCCESS	bob@LAB:Winter2026!	2026/10/13 09:42:55 >  [+] VALID LOGIN WITH ERROR: bob@LAB:Winter2026! (KDC_ERR_KEY_EXPIRED)
+AMBIGUOUS_LOCKOUT	carol@LAB	2026/10/13 09:42:56 >  [!] carol@LAB - KDC_ERR_CLIENT_REVOKED
+SUMMARY	4	2026/10/13 09:42:57 >  Done! Tested 4 logins (2 successes) in 0.500 seconds

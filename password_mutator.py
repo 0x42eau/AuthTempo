@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-password_mutator.py — Domain-based password mutator for spraygun
+password_mutator.py — Domain-based password mutator for AuthTempo
 
 Generates common enterprise password patterns based on domain/organization names.
-Integrates with spraygun.py or can be used standalone.
+Integrates with AuthTempo or can be used standalone.
 
 Usage:
     python3 password_mutator.py --domain contoso.local --org "Contoso Corp"
@@ -84,7 +84,11 @@ def _load_wordlist(path: Path, default: List[str]) -> List[str]:
         items = []
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line:
+                continue
+            # A line containing only "#" is a useful literal suffix. Longer
+            # hash-prefixed lines remain comments.
+            if line.startswith("#") and line != "#":
                 continue
             items.append(line)
         return items if items else list(default)
@@ -186,7 +190,7 @@ class PasswordMutator:
 
     @staticmethod
     def _camel_from_words(words: List[str]) -> str:
-        """Build camelCase from explicit words: ['Praeven','Security'] -> 'PraevenSecurity'."""
+        """Build camelCase from explicit words: ['Example','Company'] -> 'ExampleCompany'."""
         return "".join(w[:1].upper() + w[1:].lower() for w in words if w)
 
     @staticmethod
@@ -312,7 +316,7 @@ class PasswordMutator:
         For each leetable char (per self.leet_map), choose substitute-or-not
         across the power set of positions, preferring larger (more complete)
         substitutions first. Uses the PRIMARY replacement per char so output is
-        deterministic. Capped at max_variants. e.g. Praeven ->
+        deterministic. Capped at max_variants. e.g. Contoso ->
         Pr43v3n, Pra3v3n, Pr4even, Praev3n, Pra3ven, Pr43ven, Pr4ev3n.
 
         Does NOT mutate acronyms. Returns [] if leet disabled or no leetable char.
@@ -352,8 +356,8 @@ class PasswordMutator:
         Generate password mutations ordered by probability.
 
         Base names are derived from observed variables (spaced org words /
-        domain labels), never keyword-guessed. A floor of common enterprise
-        passwords is always included even when count is small.
+        domain labels), never keyword-guessed. Target-specific core forms and
+        common enterprise passwords are prioritized within the count cap.
 
         Returns:
             List of generated passwords (duplicates removed)
@@ -369,15 +373,18 @@ class PasswordMutator:
         def add(prio: int, pwd: str, force: bool = False):
             passwords.append((prio, pwd, force))
 
-        # Per-base-name CORE forms guaranteed to appear regardless of --count,
-        # so EVERY observed variable is mutated (seven AND sevenkingdoms).
+        # Core forms are prioritized inside the requested --count cap. Keep one
+        # representative per base ahead of the broader core set so a small cap
+        # still covers every observed variable when possible.
         core_forced: List[str] = []
+        primary_core: List[str] = []
 
         # ---- Org/domain-derived patterns -----------------------------------
         # Each base name's priority comes from _derive_base_names; pattern
         # templates add a small offset so the distinctive name leads.
         for base_prio, name, is_acronym in self.base_names:
             variants = self._casing_variants(name, acronym=is_acronym)
+            primary_core.append(f"{variants[0]}{self.year}{primary_finale}")
             # Guarantee core forms for this base name (all casings).
             for variant in variants:
                 core_forced.append(f"{variant}{self.year}{primary_finale}")
@@ -393,7 +400,7 @@ class PasswordMutator:
             # Full template fanout.
             for variant in variants:
                 p = base_prio
-                # anchor + name + year (WelcomePraeven2026!)
+                # anchor + name + year (WelcomeContoso2026!)
                 for anchor in self.anchors:
                     add(p, f"{anchor}{variant}{self.year}{primary_finale}")
                     add(p, f"{anchor}{variant}{self.year}")
@@ -404,7 +411,7 @@ class PasswordMutator:
                 # name + finale
                 for suf in self.suffixes:
                     add(p, f"{variant}{suf}")
-                # name + separator + year (Praeven@2026)
+                # name + separator + year (Contoso@2026)
                 for sep in separators:
                     add(p, f"{variant}{sep}{self.year}")
                 # season + name
@@ -439,7 +446,7 @@ class PasswordMutator:
             add(2, f"{month}{self.year}!")
             add(2, f"{month}{self.year}")
 
-        # ---- Common enterprise passwords (FORCE-INCLUDED floor) ------------
+        # ---- Common enterprise passwords (prioritized floor) ----------------
         for pwd in self.common_floor:
             add(3, pwd, force=True)
 
@@ -474,16 +481,38 @@ class PasswordMutator:
 
         unique.sort(key=sort_key)
 
-        result = [pwd for _, pwd, _ in unique][:count]
+        if count <= 0:
+            return []
 
-        # ---- Enforce floors: common passwords + per-base-name core forms ---
-        present = set(result)
-        for pwd in self.common_floor + core_forced:
-            if pwd not in present:
-                result.append(pwd)
-                present.add(pwd)
+        ranked = [pwd for _, pwd, _ in unique]
 
-        return result
+        # Mandatory candidates are best-effort when the cap is smaller than the
+        # full floor: first cover each observed base, then common passwords,
+        # then the remaining casing/leet core forms. They replace low-ranked
+        # candidates instead of being appended beyond --count.
+        mandatory_order: List[str] = []
+        mandatory_seen: Set[str] = set()
+        for pwd in primary_core + self.common_floor + core_forced:
+            if pwd not in mandatory_seen:
+                mandatory_seen.add(pwd)
+                mandatory_order.append(pwd)
+
+        # A custom wordlist can remove templates that normally generate a core
+        # form. Keep those explicit core candidates in the selectable pool.
+        ranked_seen = set(ranked)
+        ranked.extend(pwd for pwd in mandatory_order if pwd not in ranked_seen)
+
+        if count >= len(ranked):
+            return ranked
+
+        selected = set(mandatory_order[:count])
+        for pwd in ranked:
+            if len(selected) >= count:
+                break
+            selected.add(pwd)
+
+        # Preserve probability ordering in the final list.
+        return [pwd for pwd in ranked if pwd in selected][:count]
 
     def generate_list(self, count: int = 100, min_length: int = 0) -> List[str]:
         """
@@ -498,7 +527,7 @@ class PasswordMutator:
             set of patterns and filters to those meeting the minimum length.
         """
         if min_length == 0:
-            # No filtering, generate exactly what was requested
+            # No filtering, generate at most what was requested.
             return self.generate(count)
 
         # With minimum length filter: generate ALL patterns, filter by length, then limit
@@ -531,8 +560,8 @@ Examples:
   # Filter by minimum length (password policy compliance)
   python3 password_mutator.py --domain contoso.local --length 12 --count 100
 
-  # Leetspeak variants (Praeven -> Pr43v3n, Praev3n, ...)
-  python3 password_mutator.py --domain praeven.org --org "Praeven" --leet-variants 12
+  # Leetspeak variants (Contoso -> C0nt0s0, Cont0so, ...)
+  python3 password_mutator.py --domain contoso.org --org "Contoso" --leet-variants 12
 
   # Use a custom set of building-block files
   python3 password_mutator.py --domain contoso.local --wordlist-dir ./my_lists
@@ -574,12 +603,19 @@ Examples:
         print("\n[!] Error: --domain is required", file=sys.stderr)
         sys.exit(1)
 
+    if args.count < 0:
+        parser.error("--count must be at least 0")
+    if args.length < 0:
+        parser.error("--length must be at least 0")
+    if args.leet_variants < 0:
+        parser.error("--leet-variants must be at least 0")
+
     keywords = [k for k in (args.keywords.split(",") if args.keywords else []) if k.strip()]
 
     # Generate passwords
     mutator = PasswordMutator(domain=args.domain, org=args.org, year=args.year,
                               wordlist_dir=args.wordlist_dir,
-                              leet=not args.no_leet, leet_variants=max(0, args.leet_variants),
+                              leet=not args.no_leet, leet_variants=args.leet_variants,
                               keywords=keywords)
 
     # Always show the operator exactly which base names were derived (to stderr,

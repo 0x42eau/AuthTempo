@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authtempo"
+version = "0.1.0"
+description = "Safety-first password-spray orchestration for authorized assessments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["rich>=13"]
+
+[project.scripts]
+authtempo = "authtempo:main"
+authcadence = "authtempo:main"
+
+[tool.setuptools]
+py-modules = ["authtempo", "authcadence", "spraygun", "password_mutator"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]

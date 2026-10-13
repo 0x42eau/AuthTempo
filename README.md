@@ -1,6 +1,8 @@
-# spraygun
+# AuthTempo
 
-Spraygun is a **resilient, operator-grade password-spray orchestrator** for authorized penetration testing. It wraps `nxc` (NetExec) and `kerbrute` with preflight checks, automatic failover between tools, **failover memory** (sticky engine health with cooldowns + probes), **kerbrute realm resilience**, lockout safety, a live `rich` terminal UI, and state persistence for resumable sprays.
+**Controlled authentication testing with enforced safety limits.**
+
+AuthTempo is a safety-first operator tool for authorized authentication assessments. It wraps NetExec (`nxc`) and Kerbrute with strict per-identity dispatch, persistent attempt reconciliation, conservative lockout controls, engine failover, and resumable state.
 
 A companion **`password_mutator.py`** generates targeted enterprise password lists from the domain/org name you give it — with leetspeak, acronyms, and editable building-block wordlists.
 
@@ -10,46 +12,46 @@ A companion **`password_mutator.py`** generates targeted enterprise password lis
 
 ## Features
 
-### Spraying engine (`spraygun.py`)
-- **Multi-engine**: kerbrute (default) or nxc (SMB/LDAP), with automatic failover
-- **Failover memory**: when an engine fails it's *demoted* for N rounds (exponential backoff), the working engine leads, and the failed one is *re-probed* after its cooldown — no more wasting every password on a dead engine
-- **Kerbrute realm resilience**: auto-retries realm variants (as-given, UPPER, parent domain) and caches the working one, so a slightly-off `-d` no longer breaks kerbrute
-- **No wrong-realm hard pause**: realm/KDC errors are handled via retry + demotion instead of blocking the run (only lockouts and all-engines-failed pause)
-- **Preflight validation**: DC reachability + domain matching before spraying
-- **Lockout safety**: burst hard-stop + cumulative interactive prompt
-- **Credential-reuse matrix**: never re-attempts a (user, password) pair across resumes
-- **Pattern learning**: re-prioritizes the live queue by which password patterns are hitting
-- **Automatic throttling**: backs off inter-round delay when the DC is under stress (connection failures)
-- **Spray window scheduling**: `business-hours`, `off-hours`, or a custom `HH:MM-HH:MM` window
-- **Pass-the-hash mode**: spray NTLM hashes via `--pth` (nxc-only)
-- **Live UI**: raw tool feed + summary + countdown; full decision log (realm attempts, demotions, effective chain, probes)
-- **Timeline visualization**: self-contained HTML + JSON event log (`--timeline`)
-- **State persistence**: resume canceled runs via `--resume`; corrupt-state safe
-- **Dry-run mode**: test the full pipeline without a real target
-- **Admin highlighting**: red ★ for high-privilege credentials
+### Orchestrator (`authtempo.py`)
+
+- **Strict dispatch**: the parent authorizes one identity at a time, so a recognized stop condition is checked before the next authentication starts
+- **Exact lockout ceiling**: the default maximum is three signals in a pass; signal four is recorded and no fifth attempt is launched
+- **Identity quarantine**: confirmed lockouts, ambiguous revocation signals, valid credentials, and indeterminate attempts are excluded from later work by default
+- **Reconciled ledger**: every pair is persisted as in-flight before launch and receives a terminal or indeterminate outcome; metrics are rebuilt from this ledger
+- **Resume-safe cadence**: an interrupted batch retains only its unused pass slots, and an unfinished inter-batch delay is honored before new work
+- **Fail-closed resume**: missing, corrupt, incompatible, or incomplete state refuses to run instead of silently starting over
+- **Multi-engine failover**: Kerbrute (default) and NetExec LDAP/SMB health is persisted, with actual cooldown skips and explicit probes
+- **Process containment**: engine sessions have total/idle timeouts and process-group termination, including descendant cleanup
+- **Operator display**: credentials remain visible at the top; tmux defaults to a stable streaming view while `--live` explicitly forces the cursor dashboard
+- **Private artifacts**: the run directory is `0700`; state, findings, reports, logs, and temporary inputs are created as `0600`
+- **Pass-the-hash, schedules, exports, timelines, realm retry, throttling, and dry-run support**
 
 ### Password mutator (`password_mutator.py`)
 - **Variable-driven**: derives base names from what you actually provide — spaces in `--org`, separators (`-`/`_`) in the domain, or explicit `--keywords`. **Never guesses** word boundaries from keyword lists
 - **Base-name transparency**: prints exactly which base names it derived so you can verify before spraying (`--show-bases`)
-- **Leetspeak mutation**: bounded combinatorial leet per name (`Praeven → Pr43v3n, Praev3n, Pr4even, Pra3v3n`)
-- **Acronyms**: `Praeven Security → PS`, `Some Random Company → SRC`
+- **Leetspeak mutation**: bounded combinatorial leet per name (`Contoso → C0nt0s0, Cont0so, C0ntoso`)
+- **Acronyms**: `Example Company → EC`, `Some Random Company → SRC`
 - **Editable wordlists/**: seasons, months, anchors, years, suffixes, common passwords, and the leet map are all text files you edit — no Python changes
-- **Common-password floor**: common enterprise passwords are always included, even at small `--count`
+- **Balanced capped output**: target-specific forms and common enterprise passwords are prioritized without exceeding `--count`
 
 ---
 
 ## Quick start
 
 ```bash
-pip install rich                                   # only Python dependency
+python3 -m pip install -e .
 
 # 1) Generate a targeted password list from the target's domain/org
 python3 password_mutator.py -d sevenkingdoms.local --org "Seven Kingdoms" \
     --count 150 -o passwords.txt
 
-# 2) Spray
-python3 spraygun.py -u users.txt -p passwords.txt -d sevenkingdoms.local \
-    -dc-ip 10.10.10.10 -t 35 --limit 2
+# 2) Validate the workflow without target activity
+authtempo -u users.txt -p passwords.txt -d sevenkingdoms.local \
+    -dc-ip 10.10.10.10 --dry-run
+
+# 3) Run only after confirming the authorized lockout policy
+authtempo -u users.txt -p passwords.txt -d sevenkingdoms.local \
+    -dc-ip 10.10.10.10 -t 35 --passes-per-batch 1
 ```
 
 ---
@@ -86,7 +88,7 @@ python3 password_mutator.py -d sevenkingdoms.local --org "Seven Kingdoms" -o pas
 python3 password_mutator.py -d contoso.local --keywords contoso,contosocorp
 
 # Leetspeak, more variants
-python3 password_mutator.py -d praeven.org --org "Praeven" --leet-variants 12
+python3 password_mutator.py -d contoso.org --org "Contoso" --leet-variants 12
 
 # Password policy: enforce minimum length
 python3 password_mutator.py -d contoso.local --length 12 --count 200
@@ -109,7 +111,7 @@ D0m41n2026!  (Domain leet)  Password123!                  Welcome123!
 
 ### Editable wordlists/
 
-Every building block lives in `wordlists/` as plain text (one token per line; `#` comments ignored). Edit them to match the target — no code changes. Each falls back to a built-in default if missing, so the mutator always works:
+Every building block lives in `wordlists/` as plain text (one token per line; `#` comments ignored, except a line containing only `#`, which is a literal suffix). Edit them to match the target — no code changes. Each falls back to a built-in default if missing, so the mutator always works:
 
 | File | Purpose |
 |---|---|
@@ -141,74 +143,83 @@ Point at a different directory with `--wordlist-dir`.
 
 ---
 
-## spraygun usage
+## AuthTempo usage
 
 ```bash
-# Plaintext spray, kerbrute default
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 -t 35 --limit 2
+# Plaintext spray, Kerbrute default
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
+    -t 35 --passes-per-batch 1
 
-# nxc SMB
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
-    --tool nxc --protocol smb -t 30 --limit 1
+# NetExec SMB
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
+    --engine nxc --protocol smb -t 30
 
-# Pass-the-hash (NTLM hashes)
-python3 spraygun.py -u users.txt -p hashes.txt -d LAB -dc-ip 10.10.10.10 --pth --tool nxc --protocol smb
+# Pass-the-hash
+authtempo -u users.txt -p hashes.txt -d LAB -dc-ip 10.10.10.10 \
+    --pth --engine nxc --protocol smb
 
-# Dry-run (test UI/failover without a target)
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
+# Dry run uses ./authtempo-dry-run-out by default
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
 
-# Resume a canceled run
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
+# Resume only from compatible state, using the same inputs and safety settings
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
 
-# Filter non-existent accounts, export results, generate timeline
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
-    --filter-disabled --export all --timeline
+# Explicitly replace generated artifacts for a new run
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --start-fresh
 
-# Maximum verbosity (full masked commands, every failover hop)
-python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 -v
+# Enumerate known users, export results, and generate the HTML timeline
+authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
+    --exclude-unknown-users --export all --timeline
 ```
 
-### spraygun CLI
+### Primary CLI controls
 
 **Required:** `-u` userlist, `-p` password/hash file, `-d` domain, `-dc-ip` DC IP
 
 | Flag | Description |
 |---|---|
-| `--tool {kerbrute,nxc}` | spray engine (default kerbrute) |
+| `--engine {kerbrute,nxc}` | initial engine (default Kerbrute) |
 | `--protocol {smb,ldap}` | protocol for nxc (default ldap; ignored for kerbrute) |
-| `-t MINUTES` | minutes between rounds (default 35) |
-| `--limit N` | passwords per round (default 2) |
+| `-t MINUTES` | minutes between batches (default 35) |
+| `--passes-per-batch N` | secrets evaluated before the configured delay (default 1) |
 | `--pth` | pass-the-hash mode (forces nxc, excludes kerbrute) |
-| `--lockout-threshold N` | cumulative lockouts before interactive prompt (default 2) |
-| `--lockout-burst N` | lockouts in one round that hard-stop the run (default 5) |
-| `--conn-fail-limit N` | *(deprecated)* tracked for throttling; engines no longer abort on conn failures |
-| `--filter-disabled` | pre-spray kerbrute userenum to drop non-existent accounts |
+| `--pause-after-lockout-signals N` | cumulative signal count that requires operator review (default 2) |
+| `--max-lockout-signals-per-pass N` | permit N signals in one pass; signal N+1 hard-stops (default 3) |
+| `--exclude-unknown-users` | pre-run Kerbrute enumeration to retain identities proven to exist |
 | `--export {none,json,csv,all}` | results export format (default none) |
 | `--schedule {preset\|HH:MM-HH:MM}` | spray window: `business-hours`, `off-hours`, or range |
-| `--timeline` | generate `spray-timeline.html` |
-| `--feed-lines N` | raw-feed panel height (default 50) |
-| `--engine-cooldown N` | rounds to skip a demoted engine before re-probe (default 3) |
+| `--timeline` | generate `authtempo-timeline.html` |
+| `--no-live` / `--live` | select streaming output or force the cursor dashboard |
+| `--engine-skip-batches N` | completed batches to omit a demoted engine before its normal probe (default 3) |
 | `--engine-fail-threshold N` | consecutive transient failures before demoting (default 2) |
+| `--probe-demoted` | after troubleshooting, explicitly probe each engine once if all remain in cooldown |
+| `--engine-timeout N` | total seconds allowed for one per-identity engine process (default 300) |
+| `--engine-idle-timeout N` | seconds allowed without engine output (default 60) |
+| `--include-compromised` | **unsafe:** continue testing an identity after a valid credential |
+| `--retry-indeterminate` | **unsafe:** retry a pair whose prior dispatch could not be reconciled |
 | `--no-realm-retry` | disable kerbrute realm-variant auto-retry |
-| `-v`, `--verbose` | maximum verbosity (masked commands, every realm/failover/probe event) |
 | `--nxc-path`, `--kerbrute-path` | override binary paths |
 | `--no-preflight` | skip DC/domain preflight (discouraged) |
-| `--log-dir DIR` | output/state directory (default `./spraygun-out`) |
-| `--dry-run` | emit fake tool output; no real sprays |
-| `--resume` | continue from saved state |
+| `--log-dir DIR` | output/state directory (default `./authtempo-out`) |
+| `--resume` / `--start-fresh` | resume compatible state or explicitly replace generated artifacts |
+
+Run `authtempo --help` for the complete interface. The former flag names (`--tool`, `--limit`, `--lockout-threshold`, `--max-lockouts-per-spray`, `--filter-disabled`, `--engine-skip-passes`, and `--engine-cooldown`) remain compatibility aliases. `authcadence`, `authcadence.py`, and `spraygun.py` are warning compatibility entry points for one transition release.
+
+A fully completed run exits `0`. A conservative stop that leaves queued work—such as a lockout hard-stop, failed preflight, or enumeration safety signal—exits `2` after saving state, so automation cannot mistake the pause for completion.
 
 ---
 
-## Failover memory & engine health
+## Engine health and reconciliation
 
 Engines are tracked for health across the run. When an engine aborts:
 
-- **Permanent errors** (wrong-realm, binary-not-found) demote **immediately**
-- **Transient errors** (timeout, exception) demote after `--engine-fail-threshold` consecutive failures (default 2)
-- A demoted engine is moved to the **end** of the per-password chain and skipped for `--engine-cooldown` rounds (exponential backoff, capped), then **re-probed**
-- On a successful probe it's **restored** to the leading position
+- Permanent errors demote an engine immediately; repeated transient failures demote it at `--engine-fail-threshold`.
+- An engine in cooldown is omitted, not moved to the end as an implicit fallback.
+- Cooldowns advance only when a batch completes. When a cooldown reaches zero, one reconciled probe can restore the engine.
+- If every engine is in cooldown, AuthTempo stops. It bypasses cooldown only when the operator resumes with `--probe-demoted`.
+- A process exit is successful only when the dispatched identity has a terminal result. Kerbrute also must report a tested-login summary of exactly one.
 
-Every decision is printed (verbosity-first): each realm attempt and accept/reject, demotions with reason + cooldown, the round-by-round effective chain, per-password failover hops, and probe/restore events. `--verbose` adds full masked commands.
+Every demotion, omission, probe, failover, and restoration is logged. `--verbose` adds masked command details.
 
 **Failover chains:**
 - kerbrute start: `kerbrute → nxc:ldap → nxc:smb`
@@ -216,44 +227,63 @@ Every decision is printed (verbosity-first): each realm attempt and accept/rejec
 - nxc LDAP start: `nxc:ldap → kerbrute → nxc:smb`
 - PTH mode: `nxc:<chosen> → nxc:<other>` (kerbrute excluded)
 
-**Only two conditions pause for the operator:** lockouts hitting a threshold, and *all* engines failing for a password. Realm/KDC errors no longer pause — they're handled by retry + demotion so the run continues on the working engine.
+Realm errors that are known to occur before authentication can try a configured realm variant without consuming a pair. Output truncation, timeouts, exceptions, identity mismatches, or missing summaries leave the affected pair indeterminate rather than guessing.
 
 ---
 
 ## Output & state files
 
-All output goes to `./spraygun-out/` (or `--log-dir`):
+All output goes to `./authtempo-out/` (or `--log-dir`):
 
 | File | Contents |
 |---|---|
-| `spraygun.state.json` | resume blob (cred matrix, patterns, stats, throttle, engine health, realm memory, timeline) |
+| `authtempo.state.json` | versioned target/input fingerprints, exact remaining queue and batch boundary, pair ledger, quarantine, engine health, and counters |
 | `creds.txt` | human-readable `user:password` hits |
-| `locked-out.txt` | locked-out accounts |
-| `used-passwords.txt` | passwords/hashes already sprayed |
-| `spraygun-spray.log` | timed audit log (every raw line) |
-| `active-users.txt` | filtered user list (with `--filter-disabled`) |
+| `locked-out.txt` | identities with definitive lockout evidence; ambiguous signals remain in state/logs |
+| `used-passwords.txt` | fully reconciled secrets/hashes |
+| `authtempo.log` | timestamped audit log and raw engine output |
+| `active-users.txt` | enumerated identity set (with `--exclude-unknown-users`) |
 | `results.json` / `results.csv` | structured exports (with `--export`) |
-| `timeline.json` | machine-readable event log (always generated) |
-| `spray-timeline.html` | self-contained visualization (with `--timeline`) |
+| `timeline.json` | machine-readable event log generated when a run reaches its final reporting stage; state retains the same events earlier |
+| `authtempo-timeline.html` | self-contained visualization (with `--timeline`) |
 
-`--resume` is **corrupt-state safe**: if the state file is truncated/corrupt (e.g. process killed mid-write), it's backed up to `spraygun.state.json.corrupt` and the run starts fresh instead of crashing. Stale engine-health entries for engines no longer in the chain are pruned on resume.
+State is written atomically. `--resume` validates schema, target, source and effective identity sets, identity-filter phase, exact secrets, safety settings, queue/batch invariants, identities, statuses, and dispatch counts. The effective identity set is authoritative in state; `active-users.txt` can be recreated instead of forcing another enumeration. Unreadable JSON is preserved as a timestamped private backup, then the run refuses to continue. It never falls back to a fresh spray. AuthCadence and Spraygun state is detected but deliberately not migrated automatically.
+
+Credentials are intentionally displayed in clear text at the top of the dashboard and immediately when found in streaming mode, as requested for operator use. `creds.txt` and raw engine logs also contain sensitive material; protect or remove the run directory when the engagement permits. NetExec receives each candidate through a private one-line file, but Kerbrute requires the candidate as a process argument, so other privileged local process inspectors may be able to observe it while that child is running.
 
 ---
 
-## Safety features
+## Lockout-control semantics
 
-- **Preflight**: validates DC reachability and domain matching before spraying
-- **Burst lockout detection**: hard-stops if ≥ 5 accounts lock in a single round
-- **Cumulative lockout threshold**: pauses for confirmation when ≥ 2 accounts lock overall
-- **Credential-reuse matrix**: never re-attempts a tried (user, password) pair
-- **Automatic throttling**: backs off under DC connection stress
+- Safety signals are classified before generic authentication failures.
+- `USER_ACCOUNT_LOCKED`, `STATUS_ACCOUNT_LOCKED_OUT`, and supported variants are definitive. `KDC_ERR_CLIENT_REVOKED` is ambiguous evidence and is not labeled a confirmed lockout.
+- The default per-pass maximum is three signals: signals one through three are retained, signal four hard-stops, and attempt five is never dispatched.
+- Kerbrute runs with `--safe --threads 1`; any recognized locked/revoked signal causes an immediate safety stop.
+- Optional identity enumeration records locked/revoked evidence, quarantines the identity, and stops before password dispatch so the operator can review it.
+- The default cumulative review threshold is two signals. Acknowledging that prompt cannot override the per-pass hard ceiling.
+- Resume preserves a partially consumed batch and any unfinished inter-batch delay, preventing a restart from granting extra immediate passes.
+- Confirmed, ambiguous, compromised, and indeterminate identities are quarantined. Configured-domain aliases share one record; unrelated domains do not.
+- Ctrl-C, termination, timeout, and output-reader failure stop the entire process group and persist in-flight work conservatively.
+
+No wrapper can guarantee zero lockouts without the effective domain and fine-grained lockout policies, observation windows, replication timing, and complete third-party tool output. Keep `--passes-per-batch` and `-t` within the authorized policy. The strict controller guarantees only that it will not launch new work after it observes its configured hard-stop condition.
+
+## Input-file semantics
+
+- Identity lines are trimmed, blank/comment lines are skipped, and configured-domain aliases are de-duplicated case-insensitively while preserving the first display spelling.
+- Secret/hash lines preserve leading and trailing spaces. A line whose first character is `#` is a comment; prefix it as `\#` for a literal leading hash. A leading space before `#` is literal data.
+- Exact duplicate secrets are de-duplicated in first-seen order. Empty secrets are not supported. Unsupported control characters fail with a file and line reference.
 
 ---
 
 ## Installation
 
+Python 3.10 or newer is required.
+
 ```bash
-pip install rich        # only Python dependency
+python3 -m pip install -e .
+
+# Development/test dependencies
+python3 -m pip install -r requirements-dev.txt
 ```
 
 Install at least one spray engine (both recommended for full failover):
@@ -275,18 +305,20 @@ go install github.com/ropnop/kerbrute@latest
 ## Repository layout
 
 ```
-spraygun.py            # spraying orchestrator (stdlib + rich)
+authtempo.py           # canonical launcher
+authcadence.py         # former-name compatibility launcher
+spraygun.py            # implementation and historical compatibility launcher
 password_mutator.py    # variable-driven password list generator
 wordlists/             # editable building blocks (seasons, months, anchors, years, suffixes, common, leet)
-users.txt              # sample userlist (replace with your target's users)
-passwords.txt          # sample spray list (regenerate with password_mutator.py)
-spraygun.sh            # original v0.4 shell prototype (historical)
-spraygun-out/          # runtime output/state (gitignored)
+tests/                 # unit, golden-parser, fault-injection, permission, and tmux-mode tests
+REMEDIATION_PLAN.md    # threat findings, acceptance criteria, and implementation status
+spraygun.sh            # disabled historical prototype; exits without running engines
+authtempo-out/         # default runtime output (gitignored)
 ```
 
 ## For authorized use only
 
-Spraygun is designed for authorized penetration testing and security assessments. Use only on systems you have explicit permission to test. Unauthorized password spraying is illegal.
+AuthTempo is designed for authorized penetration testing and security assessments. Use only on systems you have explicit permission to test. Unauthorized password spraying is illegal.
 
 ## License
 

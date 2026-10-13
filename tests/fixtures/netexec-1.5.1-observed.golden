@@ -1,0 +1,11 @@
+# expected-type<TAB>expected-data<TAB>sanitized output line
+LOCKOUT	alice	LDAP 192.0.2.10 389 DC [-] LAB\alice:Winter2026! USER_ACCOUNT_LOCKED
+LOCKOUT	alice	LDAP 192.0.2.10 389 DC [-] LAB\alice:Winter2026! invalidCredentials data 775
+LOCKOUT	bob	SMB 192.0.2.10 445 DC [-] LAB\bob:Winter2026! 0xC0000234
+AMBIGUOUS_LOCKOUT	carol	LDAP 192.0.2.10 389 DC [-] LAB\carol:Winter2026! KDC_ERR_CLIENT_REVOKED
+AUTHFAIL	bob	LDAP 192.0.2.10 389 DC [-] LAB\bob:Winter2026! STATUS_LOGON_FAILURE
+SUCCESS	HOST$:Winter2026!	LDAP 192.0.2.10 389 DC [+] LAB\HOST$:Winter2026!
+SUCCESS	alice:Star*Pass!	LDAP 192.0.2.10 389 DC [+] LAB\alice:Star*Pass!
+SUCCESS	alice:Space Pass!	LDAP 192.0.2.10 389 DC [+] LAB\alice:Space Pass!
+SUCCESS	alice:Colon:Pass[1]!	LDAP 192.0.2.10 389 DC [+] LAB\alice:Colon:Pass[1]!
+ADMIN	administrator:Winter2026!	LDAP 192.0.2.10 389 DC [+] LAB\administrator:Winter2026! (Pwn3d!)

@@ -1,6 +1,6 @@
 # Sample userlist — replace with your target's usernames (one per line).
 # This file is only for dry-run demos:
-#   python3 spraygun.py --dry-run -u users.txt -p passwords.txt -d LAB -dc-ip 127.0.0.1
+#   python3 authtempo.py --dry-run -u users.txt -p passwords.txt -d LAB -dc-ip 127.0.0.1
 admin
 administrator
 jsmith

