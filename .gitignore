@@ -9,3 +9,6 @@ authcadence-out/
 authcadence-dry-run-out/
 authtempo-out/
 authtempo-dry-run-out/
+
+# Local authentication material must never be committed.
+token.txt
