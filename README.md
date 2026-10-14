@@ -2,7 +2,7 @@
 
 **Safe defaults for controlled password auditing.**
 
-AuthTempo runs Kerbrute and NetExec with pacing, lockout stops, automatic tool failover, resumable state, and accurate attempt accounting. It is meant to feel simple during an assessment: provide users, passwords, a domain, and a domain controller; tune only when the engagement requires it.
+AuthTempo runs Kerbrute and NetExec with pacing, lockout protection, automatic tool failover, resumable state, and accurate attempt accounting. It is meant to feel simple during an assessment: provide users, passwords, a domain, and a domain controller; tune only when the engagement requires it.
 
 ![AuthTempo live dashboard](docs/images/authtempo-dashboard.png)
 
@@ -30,8 +30,10 @@ The default run:
 
 - tries Kerbrute first and fails over when a tool is genuinely unhealthy;
 - tests one password across the user list, then waits 35 minutes;
-- enforces a maximum of three lockout signals for one password and hard-stops on signal four (Kerbrute safe mode can stop earlier);
-- stops testing users that are locked, compromised, or left in an uncertain state;
+- quarantines an isolated locked account and continues with the remaining users;
+- pauses immediately when five different users are reported locked back-to-back;
+- pauses when a target's cross-run lockout population grows by more than 50% with at least five new affected users;
+- stops testing users that are currently locked, compromised, or left in an uncertain state;
 - highlights expired and forced-change passwords as valid, actionable findings;
 - saves state after every meaningful change so `--resume` can continue safely;
 - shows found credentials at the top of the dashboard and writes them immediately to `creds.txt`.
@@ -48,7 +50,7 @@ The basic command is enough for most runs. These are the options worth rememberi
 | `--protocol ldap\|smb` | NetExec protocol; ignored by Kerbrute |
 | `-t`, `--wait MINUTES` | Time to wait between password groups; default `35` |
 | `--limit N` | Passwords tested across the user list before each wait; default `1` |
-| `--max-lockouts N` | Hard-stop when one password produces more than `N` signals; default `3` |
+| `--max-lockouts N` | Pause after more than `N` different users are locked back-to-back; default `4` |
 | `--validate-users` | Check which usernames exist before testing passwords |
 | `--pth` | Treat the password file as NTLM hashes and use NetExec |
 | `--dry-run` | Exercise the workflow without target activity |
@@ -87,7 +89,9 @@ authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
 
 ## Terminal and tmux behavior
 
-AuthTempo uses a compact, content-sized dashboard in a normal interactive terminal. It keeps credentials and safety counters at the top and shows only the 10 most recent raw-output lines by default; the complete feed remains in `authtempo.log`. Use `--raw-lines N` to change that window. Inside tmux it automatically switches to stable line-by-line output, avoiding cursor redraw problems while keeping raw tool output visible. `--dashboard` forces the live view and `--stream` forces line-by-line output; all three are listed under `--advanced-help`.
+AuthTempo uses a compact, content-sized dashboard in a normal interactive terminal. It keeps credentials, progress, and safety counters at the top and shows up to 10 structured findings or alerts instead of noisy tool banners. Complete raw output always remains in `authtempo.log`; use `--verbose` when you also want it on screen. `--display-lines N` changes the compact activity window.
+
+Inside tmux AuthTempo automatically switches to stable structured line-by-line output, avoiding cursor redraw problems and distorted Kerbrute banners. `--dashboard` forces the live view and `--stream` forces line-by-line output.
 
 ![AuthTempo tmux-safe streaming output](docs/images/authtempo-tmux-stream.png)
 
@@ -101,7 +105,8 @@ The default output directory is `./authtempo-out` (`./authtempo-dry-run-out` for
 |---|---|
 | `creds.txt` | Valid credentials, written as soon as they are found |
 | `password-change-required.txt` | Expired/forced-change credentials and ready-to-run Impacket commands |
-| `locked-out.txt` | Identities with definitive lockout evidence |
+| `locked-out.txt` | Historical identities ever observed with definitive lockout evidence |
+| `active-lockouts.txt` | Identities still quarantined as currently locked |
 | `authtempo.state.json` | Resume state and reconciled attempt ledger |
 | `authtempo.log` | Audit log and raw tool output |
 | `used-passwords.txt` | Passwords that completed across the eligible user set |
@@ -110,6 +115,8 @@ The default output directory is `./authtempo-out` (`./authtempo-dry-run-out` for
 | `authtempo-timeline.html` | Optional run summary, per-pass activity, findings, and event timeline |
 
 The output directory and sensitive artifacts are created with private permissions. They can contain plaintext credentials and should be handled as engagement evidence.
+
+When a known valid directory credential is available, AuthTempo rechecks active lockouts at password-group boundaries with a read-only LDAP query. It clears only the active quarantine after AD's computed lockout bit is zero; the original finding remains in `locked-out.txt` and the audit trail. Target-specific lockout history is also retained outside individual output directories under the user's state directory so a new output folder cannot hide campaign growth.
 
 When Active Directory reports an expired password or requires a change, AuthTempo highlights the credential separately and prepares a prompt-safe command such as:
 

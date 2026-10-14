@@ -6,14 +6,27 @@ This is the detailed reference. The main [README](../README.md) intentionally st
 
 AuthTempo dispatches one identity at a time. It writes the pair to its ledger before launch, observes the tool result, then records a terminal or uncertain outcome before moving on. That boundary lets it stop before starting another identity once a recognized safety condition is reached.
 
-- `--max-lockouts 3` sets the controller’s absolute ceiling at three lockout signals for one password. Signal four is recorded, the active tool process is stopped, and a fifth identity is not dispatched. A tool’s own safety behavior may stop sooner; Kerbrute safe mode stops on its first recognized locked/revoked signal.
-- The default cumulative review point is two lockout signals. Change it with `--review-after-lockouts N` only when the engagement requires a different operator checkpoint.
+- One isolated definitive lockout is recorded, shown with its exact attempted pair, and quarantined. It does not stop the run.
+- `--max-lockouts 4` permits four consecutive distinct locked identities. The fifth pauses the run before a sixth identity is dispatched.
+- A definitive non-lockout authentication result resets the consecutive streak. A nonexistent username, skipped/quarantined identity, uncertain result, or tool error is neutral and does not hide a developing streak.
+- Scattered lockouts in separate runs remain warnings. A target-specific campaign guard pauses when the historical affected population grows by **more than 50%** during one invocation and at least five new unique identities were added. For example, a baseline of 15 pauses at 23, not 22.
 - Confirmed lockouts, ambiguous revocation signals, found credentials, and uncertain attempts quarantine the affected identity by default.
-- Kerbrute always runs with its safe mode and one worker.
-- Acknowledging a review prompt cannot override the per-password lockout maximum.
+- Kerbrute always runs with safe mode and one worker. Its child process may stop on one locked user; AuthTempo reconciles that pair, quarantines it, and starts a fresh one-user child for the next eligible identity.
+- Ambiguous lockout/revocation evidence still causes an immediate resumable safety pause because it cannot be safely labeled as a routine failure.
 - Resume retains a partially consumed group and any unfinished inter-group wait. Restarting does not grant extra immediate passwords.
 
 Recognized definitive evidence includes `USER_ACCOUNT_LOCKED`, `STATUS_ACCOUNT_LOCKED_OUT`, and supported variants. `KDC_ERR_CLIENT_REVOKED` is treated as an ambiguous safety signal rather than proof of a lockout.
+
+### Active quarantine and safe rechecks
+
+Historical observations and current quarantine are separate:
+
+- `locked-out.txt` is immutable historical evidence.
+- `active-lockouts.txt` contains identities currently excluded from authentication attempts.
+
+When AuthTempo has a previously confirmed valid directory credential, it issues one read-only NetExec LDAP query at group boundaries for all active lockouts. It checks the `UF_LOCKOUT` (`0x10`) bit in `msDS-User-Account-Control-Computed`; `lockoutTime` alone is not used because it can remain nonzero after automatic unlock. A zero computed bit removes only the `confirmed_lockout` quarantine reason and resets the live consecutive streak. If no valid credential is available, the query fails, or the computed attribute is absent, the identity remains quarantined. No candidate password is retried for this check.
+
+The campaign history stores hashed identity keys in the user's private state directory (`$XDG_STATE_HOME/authtempo/lockout-history.json`, or `~/.local/state/authtempo/lockout-history.json`). `AUTHTEMPO_HISTORY_PATH` can select a different private location. It is keyed by target and source user set, so separate output directories share safety history without storing plaintext usernames there.
 
 ## Password-change findings
 
@@ -60,7 +73,7 @@ Run `authtempo --advanced-help` for the authoritative list.
 
 | Option | Purpose |
 |---|---|
-| `--review-after-lockouts N` | Pause for review after `N` total lockout signals |
+| `--max-lockouts N` | Pause after more than `N` consecutive distinct locked identities; default `4` |
 | `--tool-retry-after GROUPS` | Completed password groups before retrying a paused tool |
 | `--tool-error-limit N` | Consecutive temporary errors allowed before pausing a tool |
 | `--retry-paused-tools` | Explicitly try all tools once when each is currently paused |
@@ -79,11 +92,11 @@ Run `authtempo --advanced-help` for the authoritative list.
 | `--schedule HH:MM-HH:MM` | Use a custom local-time window, including overnight windows |
 | `--stream` | Always use line-by-line output |
 | `--dashboard` | Force the cursor-based dashboard, including inside tmux |
-| `--raw-lines N` | Recent raw-output lines shown in the compact dashboard; default `10` |
+| `--display-lines N` | Structured activity lines retained in the compact dashboard; default `10` |
 | `--nxc-path PATH` | Use a specific NetExec executable |
 | `--kerbrute-path PATH` | Use a specific Kerbrute executable |
 | `--skip-target-check` | Skip the DC/domain preflight check; not recommended |
-| `-v`, `--verbose` | Show masked commands, domain retries, and failover hops |
+| `-v`, `--verbose` | Show raw tool output, masked commands, domain retries, and failover hops |
 
 ## Compatibility names
 
@@ -93,7 +106,7 @@ Existing automation does not need an immediate rewrite. These older spellings re
 |---|---|
 | `--engine` | `--tool` |
 | `--passes-per-batch` | `--limit` |
-| `--pause-after-lockout-signals`, `--lockout-threshold` | `--review-after-lockouts` |
+| `--review-after-lockouts`, `--pause-after-lockout-signals`, `--lockout-threshold` | Retired cumulative prompt; accepted only for saved-script compatibility |
 | `--max-lockout-signals-per-pass`, `--max-lockouts-per-spray`, `--lockout-burst` | `--max-lockouts` |
 | `--exclude-unknown-users`, `--filter-disabled` | `--validate-users` |
 | `--export` | `--report` |
@@ -104,6 +117,7 @@ Existing automation does not need an immediate rewrite. These older spellings re
 | `--engine-timeout` | `--tool-timeout` |
 | `--engine-idle-timeout` | `--tool-silence-timeout` |
 | `--no-live` / `--live` | `--stream` / `--dashboard` |
+| `--raw-lines`, `--feed-lines` | `--display-lines` |
 
 The `authcadence`, `authcadence.py`, and `spraygun.py` launchers also remain as warning compatibility entry points.
 
@@ -115,7 +129,7 @@ Statistics separate authentication attempts sent from unique identity/password p
 
 `results.csv` contains one row for every recorded identity/password pair rather than only successful credentials. Its `password_pass` and `batch` columns make the execution order explicit, while `status`, `dispatches`, and timestamps expose failures and retries. The HTML report summarizes the same ledger by password pass and retains a compact event timeline.
 
-A fully completed run exits `0`. A conservative stop with queued work exits `2`, including a lockout hard-stop, failed target check, or enumeration safety signal. Configuration and fatal runtime errors exit `1`.
+A fully completed run exits `0`. A conservative stop with queued work exits `2`, including a lockout safety pause, failed target check, or enumeration safety signal. Configuration and fatal runtime errors exit `1`.
 
 ## Input files
 
@@ -125,4 +139,4 @@ Password whitespace is significant. A password line beginning with `#` is a comm
 
 ## Sensitive output
 
-Credentials stay visible at the top of the dashboard and are printed immediately in streaming mode. `creds.txt`, `password-change-required.txt`, the reports, and the audit log contain sensitive material. NetExec receives each candidate through a private one-line file. Kerbrute requires the candidate in its process arguments, so privileged local process inspection may observe it while the child is running.
+Credentials stay visible at the top of the dashboard and are printed immediately in streaming mode. Routine failures and tool banners are summarized by default; raw lines remain in `authtempo.log` and can be displayed with `--verbose`. `creds.txt`, `password-change-required.txt`, the reports, and the audit log contain sensitive material. NetExec receives each candidate through a private one-line file. Kerbrute requires the candidate in its process arguments, so privileged local process inspection may observe it while the child is running.

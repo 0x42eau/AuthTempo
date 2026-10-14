@@ -66,6 +66,9 @@ STATE_FILE_NAME = f"{PRODUCT_SLUG}.state.json"
 AUDIT_LOG_NAME = f"{PRODUCT_SLUG}.log"
 TIMELINE_HTML_NAME = f"{PRODUCT_SLUG}-timeline.html"
 PASSWORD_CHANGES_FILE_NAME = "password-change-required.txt"
+ACTIVE_LOCKOUTS_FILE_NAME = "active-lockouts.txt"
+CAMPAIGN_HISTORY_FILE_NAME = ".authtempo-lockout-history.json"
+CAMPAIGN_HISTORY_SCHEMA_VERSION = 1
 
 # =============================================================================
 # Dataclasses
@@ -83,10 +86,14 @@ class Config:
     time_between_rounds: int = 35
     passwords_per_round: int = 1
     pth_mode: bool = False
+    # Retained for compatibility with older saved runs and command lines. The
+    # cumulative prompt it once controlled is no longer used: isolated
+    # lockouts are quarantined and the run continues.
     lockout_threshold: int = 2
-    # Maximum lockout signals allowed in one secret/pass. The next signal is
-    # an unconditional hard stop. The legacy CLI name is --lockout-burst.
-    lockout_burst: int = 3
+    # Number of consecutive, distinct locked identities allowed before a
+    # resumable safety pause. With the default, the fifth consecutive lockout
+    # pauses the run.
+    lockout_burst: int = 4
     conn_fail_limit: int = 10
     nxc_path: Optional[str] = None
     kerbrute_path: Optional[str] = None
@@ -111,6 +118,7 @@ class Config:
     engine_timeout_seconds: int = 300
     engine_idle_timeout_seconds: int = 60
     probe_demoted: bool = False
+    history_path: Optional[str] = None
     # Derived fields
     users: List[str] = field(default_factory=list)
     source_users: List[str] = field(default_factory=list)
@@ -173,6 +181,7 @@ class LineType(enum.Enum):
     LOCKOUT = "LOCKOUT"
     AMBIGUOUS_LOCKOUT = "AMBIGUOUS_LOCKOUT"
     CONN_ERROR = "CONN_ERROR"
+    NONEXISTENT = "NONEXISTENT"
     AUTHFAIL = "AUTHFAIL"
     ERROR = "ERROR"  # Tool-level error (wrong realm, domain mismatch, etc.)
     SUMMARY = "SUMMARY"
@@ -213,10 +222,10 @@ NXC_CONN_ERROR_PATTERNS = [
 ]
 NXC_AUTHFAIL_PATTERNS = [
     r"STATUS_LOGON_FAILURE",
-    r"STATUS_NO_SUCH_USER",
     r"\[-\].*Status:",
     r"\[-\].*\\[^:\s]+:\S+",
 ]
+NXC_NONEXISTENT_PATTERNS = [r"STATUS_NO_SUCH_USER"]
 
 # kerbrute patterns
 KERBRUTE_SUCCESS_PATTERNS = [r"\[\+\] VALID LOGIN(?: WITH ERROR)?:"]
@@ -252,6 +261,9 @@ KERBRUTE_AUTHFAIL_PATTERNS = [
     r"KDC_ERR_PREAUTH_FAILED",
     r"KDC_ERR_PREAUTH_REQUIRED",
     r"KRB_AP_ERR_SKEW",
+]
+KERBRUTE_NONEXISTENT_PATTERNS = [
+    r"User does not exist",
     r"KDC_ERR_C_PRINCIPAL_UNKNOWN",
 ]
 
@@ -289,6 +301,7 @@ SUCCESS_PAIR_STATUSES = {
 CREDENTIAL_STATES = {"valid", *PASSWORD_CHANGE_PAIR_STATUSES}
 TERMINAL_PAIR_STATUSES = {
     "auth_failure",
+    "nonexistent",
     *SUCCESS_PAIR_STATUSES,
     "lockout",
     "ambiguous_lockout",
@@ -306,6 +319,10 @@ NO_AUTH_ABORT_REASONS = {
 }
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+class CampaignHistoryUnavailable(RuntimeError):
+    """Raised after local lockout evidence is saved but shared history fails."""
 
 
 def canonical_identity(user: str, domain: str = "") -> str:
@@ -412,6 +429,20 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def default_campaign_history_path() -> Path:
+    """Return the user-private history shared by every AuthTempo output dir."""
+    explicit = os.environ.get("AUTHTEMPO_HISTORY_PATH")
+    if explicit:
+        return Path(explicit).expanduser()
+    state_home = os.environ.get("XDG_STATE_HOME")
+    root = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    )
+    return root / PRODUCT_SLUG / "lockout-history.json"
+
+
 def _reject_duplicate_json_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
     """Build a JSON object while rejecting ambiguous duplicate keys."""
     result: Dict[str, Any] = {}
@@ -479,7 +510,7 @@ def classify_password_pattern(pw: str) -> str:
 # =============================================================================
 
 class RichUI:
-    """Manages rich live UI: raw feed panel, summary panel, countdown."""
+    """Manages the compact findings dashboard, summary, and countdown."""
 
     def __init__(
         self,
@@ -487,11 +518,14 @@ class RichUI:
         max_feed_lines: int = 10,
         live_ui: bool = True,
         force_live: bool = False,
+        show_raw: bool = False,
     ):
         self.console = console
         self.live: Optional[Live] = None
         self.raw_feed: List[str] = []
+        self.activity_feed: List[str] = []
         self.max_feed_lines = max_feed_lines
+        self.show_raw = show_raw
         self.current_phase = "idle"  # idle, spray, countdown, stopped
         self.phase_data: Dict[str, Any] = {}
         self.current_round: Optional[int] = None
@@ -585,8 +619,14 @@ class RichUI:
             "unknown_lockouts": 0,
             "errors": [],  # Track tool errors
             "conn_fails": 0,
+            "checked": 0,
+            "eligible": 0,
+            "current_user": "",
+            "auth_failures": 0,
+            "nonexistent": 0,
         }
         self.raw_feed = []
+        self.activity_feed = []
         if not self.live_enabled:
             if self._tmux_auto_fallback and not self._live_warning_shown:
                 self._live_warning_shown = True
@@ -617,7 +657,7 @@ class RichUI:
                 self._live_warning_shown = True
                 self.console.print(
                     "[!] Terminal pane is too small for the Live dashboard; "
-                    "streaming raw output instead (minimum 60x12).",
+                    "using the stable streaming display instead (minimum 60x12).",
                     style="yellow",
                 )
             return
@@ -639,7 +679,9 @@ class RichUI:
             self._disable_live(exc)
 
     def feed_line(self, line: str):
-        """Append a raw line to the feed (scrolling)."""
+        """Append raw tool output when the operator explicitly requested it."""
+        if not self.show_raw:
+            return
         if len(self.raw_feed) >= self.max_feed_lines:
             self.raw_feed.pop(0)
         self.raw_feed.append(line)
@@ -647,6 +689,32 @@ class RichUI:
             self._update_display()
         elif self._stream_fallback:
             self.console.print(Text(line))
+
+    def _add_activity(self, message: str, style: str = "") -> None:
+        """Record one operator-relevant event without exposing tool noise."""
+        rendered = f"[{style}]{escape(message)}[/{style}]" if style else escape(message)
+        if len(self.activity_feed) >= self.max_feed_lines:
+            self.activity_feed.pop(0)
+        self.activity_feed.append(rendered)
+        if self.live:
+            self._update_display()
+        elif self._stream_fallback:
+            # Structured events can contain operator-controlled identities or
+            # secrets. Escape Rich markup in streaming mode just as the live
+            # dashboard does so brackets cannot hide or restyle evidence.
+            self.console.print(escape(message), style=style or None)
+
+    def set_progress(self, user: str, checked: int, eligible: int) -> None:
+        """Update compact pair progress without printing each routine failure."""
+        self.phase_data["current_user"] = user
+        self.phase_data["checked"] = checked
+        self.phase_data["eligible"] = eligible
+        self._update_display()
+
+    def update_auth_failure(self, nonexistent: bool = False) -> None:
+        key = "nonexistent" if nonexistent else "auth_failures"
+        self.phase_data[key] = int(self.phase_data.get(key, 0)) + 1
+        self._update_display()
 
     def update_success(self, user: str, secret: str):
         """Register a credential hit."""
@@ -657,6 +725,8 @@ class RichUI:
                 f"[+] CREDENTIAL: {escape(str(user))}:{escape(str(secret))}",
                 style="green bold",
             )
+        elif is_new:
+            self._add_activity(f"✓ CREDENTIAL  {user}:{secret}", "green bold")
         self._update_display()
 
     def update_admin(self, user: str, secret: str):
@@ -668,6 +738,8 @@ class RichUI:
                 f"[+] ADMIN CREDENTIAL: {escape(str(user))}:{escape(str(secret))}",
                 style="red bold",
             )
+        elif is_new:
+            self._add_activity(f"★ ADMIN  {user}:{secret}", "red bold")
         self._update_display()
 
     def update_password_change(
@@ -696,6 +768,11 @@ class RichUI:
                 f"    Change it: {escape(command)}",
                 style="magenta",
             )
+        elif is_new:
+            self._add_activity(
+                f"↻ CHANGE REQUIRED  {user}:{secret} — {credential_state_label(credential_state)}",
+                "magenta bold",
+            )
         self._update_display()
 
     def _record_success(self, user: str, secret: str, is_admin: bool) -> None:
@@ -714,7 +791,13 @@ class RichUI:
             self.round_admins.add(pair)
             self.run_admins.add(pair)
 
-    def update_lockout(self, user: Optional[str]):
+    def update_lockout(
+        self,
+        user: Optional[str],
+        secret: Optional[str] = None,
+        engine: str = "",
+        streak: int = 0,
+    ):
         """Register a lockout."""
         self.round_signal_events += 1
         self.run_signal_events += 1
@@ -726,11 +809,19 @@ class RichUI:
             self.phase_data["unknown_lockouts"] += 1
             self.round_unknown_lockouts += 1
             self.run_unknown_lockouts += 1
+        pair = f"{user}:{secret}" if user and secret is not None else (user or "unknown user")
+        detail = f"! LOCKOUT  {pair}"
+        if engine:
+            detail += f" via {engine}"
+        if streak:
+            detail += f" — consecutive {streak}"
+        self._add_activity(detail, "yellow bold")
         self._update_display()
 
     def update_error(self, error_msg: str):
         """Register a tool error."""
         self.phase_data["errors"].append(error_msg)
+        self._add_activity(f"✗ TOOL ERROR  {error_msg}", "red")
         self._update_display()
 
     def increment_conn_fails(self):
@@ -766,7 +857,7 @@ class RichUI:
             self._live_warning_shown = True
             self.console.print(
                 f"[!] Live display unavailable ({escape(type(exc).__name__)}); "
-                "streaming raw output instead. Use --stream to select this mode explicitly.",
+                "using stable streaming output instead. Use --stream to select it explicitly.",
                 style="yellow",
             )
 
@@ -779,7 +870,7 @@ class RichUI:
         return max(5, min(desired, terminal_height - 5))
 
     def _feed_row_limit(self) -> int:
-        """Return the number of recent raw lines that fit without taking the screen."""
+        """Return the number of recent activity lines that fit without taking the screen."""
         terminal_height = max(int(getattr(self.console, "height", 24) or 24), 8)
         available = max(1, terminal_height - self._summary_height() - 6)
         return min(self.max_feed_lines, available)
@@ -791,12 +882,14 @@ class RichUI:
         recent_output = Panel(
             feed,
             title=(
-                "Recent tool output — newest first "
-                f"(up to {self._feed_row_limit()} lines)"
+                f"Recent raw tool output (up to {self._feed_row_limit()} lines)"
+                if self.show_raw
+                else f"Findings & alerts (up to {self._feed_row_limit()} lines)"
             ),
             border_style="dim",
             box=box.SQUARE,
         )
+        dashboard_width = min(120, max(60, int(getattr(self.console, "width", 120) or 120)))
         return Panel(
             Group(summary, recent_output),
             title=(
@@ -804,6 +897,7 @@ class RichUI:
                 f"{self.phase_data.get('batch', '?')}[/bold]"
             ),
             border_style="blue",
+            width=dashboard_width,
         )
 
     def _build_summary(self) -> Panel:
@@ -813,6 +907,9 @@ class RichUI:
         errors = self.phase_data.get("errors", [])
         conn_fails = self.phase_data.get("conn_fails", 0)
         abort_reason = self.phase_data.get("abort_reason", "")
+        checked = int(self.phase_data.get("checked", 0))
+        eligible = int(self.phase_data.get("eligible", 0))
+        current_user = str(self.phase_data.get("current_user", ""))
 
         grid = Table.grid(expand=True)
         grid.add_column()
@@ -850,6 +947,18 @@ class RichUI:
             grid.add_row("", f"[yellow]! {self.round_unknown_lockouts} unknown user(s)[/yellow]")
 
         grid.add_row("[cyan]Engine / current password:", f"{escape(str(engine))} / [yellow]{escape(str(secret))}[/yellow]")
+        if eligible:
+            progress = f"{checked}/{eligible}"
+            if current_user:
+                progress += f" · {escape(current_user)}"
+            grid.add_row("[cyan]Checked / current user:", progress)
+        failure_count = int(self.phase_data.get("auth_failures", 0))
+        nonexistent_count = int(self.phase_data.get("nonexistent", 0))
+        if failure_count or nonexistent_count:
+            grid.add_row(
+                "[dim]Failed / nonexistent:",
+                f"{failure_count} / {nonexistent_count}",
+            )
 
         # Show errors
         if errors:
@@ -866,15 +975,18 @@ class RichUI:
         return Panel(grid, title="Summary", border_style="cyan")
 
     def _build_feed(self) -> str:
-        """Build the raw feed text."""
+        """Build either the structured activity feed or opt-in raw feed."""
+        if not self.show_raw:
+            if not self.activity_feed:
+                return "[dim]No findings yet; routine failures are summarized above.[/dim]"
+            return "\n".join(self.activity_feed[-self._feed_row_limit():])
         if not self.raw_feed:
             return "[dim]Waiting for tool output...[/dim]"
-        # Keep recent lines at the top and cap the visible panel independently
-        # of terminal height. The complete unabridged output remains in the log.
-        lines_rev = self.raw_feed[-self._feed_row_limit():][::-1]
+        # Preserve chronological order so multi-line banners are not distorted.
+        visible_lines = self.raw_feed[-self._feed_row_limit():]
         # Colorize: red/bold for pwn3d/admin, green for [+] success, yellow for lockout keywords, red for error keywords
         colored = []
-        for line in lines_rev:
+        for line in visible_lines:
             safe_line = escape(line)
             # Check for admin/pwn3d indicators first (highest priority)
             if any(kw in line for kw in ["(Pwn3d!)", "[ADMIN]", "Domain Admin", "Administrator"]):
@@ -996,7 +1108,14 @@ class State:
         self.creds_file = self.log_dir / "creds.txt"
         self.password_changes_file = self.log_dir / PASSWORD_CHANGES_FILE_NAME
         self.lockouts_file = self.log_dir / "locked-out.txt"
+        self.active_lockouts_file = self.log_dir / ACTIVE_LOCKOUTS_FILE_NAME
         self.used_file = self.log_dir / "used-passwords.txt"
+        self.campaign_history_path = Path(
+            cfg.history_path or (self.log_dir / CAMPAIGN_HISTORY_FILE_NAME)
+        )
+        self.campaign_history_lock_path = self.campaign_history_path.with_name(
+            f"{self.campaign_history_path.name}.lock"
+        )
 
         # Runtime state
         self.used_passwords: List[str] = []
@@ -1007,7 +1126,11 @@ class State:
         self.found_creds: Dict[str, str] = {}
         self.credentials: List[Dict[str, Any]] = []
         self._credential_index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # locked_users is immutable historical evidence. active_lockouts is the
+        # current operational quarantine and may be cleared by a read-only LDAP
+        # status check without erasing history.
         self.locked_users: Set[str] = set()
+        self.active_lockouts: Set[str] = set()
         self.quarantined_users: Dict[str, Dict[str, Any]] = {}
         self.lockout_signals: List[Dict[str, Any]] = []
         self.unknown_lockout_events: int = 0
@@ -1016,6 +1139,12 @@ class State:
         self.last_batch_completed_at: Optional[str] = None
         self.current_round: int = 0
         self.current_pass: int = 0
+        self.consecutive_lockout_users: List[str] = []
+        self._consecutive_lockout_keys: Set[str] = set()
+        self.max_consecutive_lockouts: int = 0
+        self.campaign_growth_stop: bool = False
+        self.campaign_total_lockouts: int = 0
+        self.campaign_baseline_count: int = 0
 
         # Feature 1: Credential-reuse matrix (password -> set of users attempted)
         self.attempted_matrix: Dict[str, Set[str]] = {}
@@ -1059,6 +1188,9 @@ class State:
         self._configured_by_key: Dict[str, str] = {}
         self._configured_by_alias: Dict[str, str] = {}
         self._rebuild_configured_identity_maps()
+        campaign_identities = self._read_campaign_lockouts()
+        self.campaign_total_lockouts = len(campaign_identities)
+        self.campaign_baseline_count = self.campaign_total_lockouts
 
         try:
             if cfg.resume:
@@ -1079,6 +1211,155 @@ class State:
             self._configured_by_key.setdefault(key, configured_user)
             for alias in _identity_aliases(configured_user, self.cfg.domain):
                 self._configured_by_alias.setdefault(alias, configured_user)
+
+    def _campaign_target_key(self) -> str:
+        """Return a privacy-preserving key for one target and source user set."""
+        source_keys = sorted(
+            canonical_identity(user, self.cfg.domain)
+            for user in (self.cfg.source_users or self.cfg.users)
+        )
+        return _sha256_json({
+            "domain": self.cfg.domain.casefold().rstrip("."),
+            "dc_ip": self.cfg.dc_ip,
+            "source_users_sha256": _sha256_json(source_keys),
+        })
+
+    def _read_campaign_document(self) -> Dict[str, Any]:
+        if not self.campaign_history_path.exists():
+            return {
+                "schema_version": CAMPAIGN_HISTORY_SCHEMA_VERSION,
+                "targets": {},
+            }
+        try:
+            document = json.loads(
+                self.campaign_history_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"campaign lockout history is unreadable: {self.campaign_history_path} ({exc})"
+            ) from exc
+        if (
+            not isinstance(document, dict)
+            or document.get("schema_version") != CAMPAIGN_HISTORY_SCHEMA_VERSION
+            or not isinstance(document.get("targets"), dict)
+        ):
+            raise RuntimeError(
+                f"campaign lockout history has an unsupported format: {self.campaign_history_path}"
+            )
+        return document
+
+    def _with_campaign_lock(self, exclusive: bool):
+        """Open and lock the campaign-history lock file; caller closes it."""
+        self.campaign_history_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.campaign_history_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "a+", encoding="utf-8")
+        if fcntl is None:
+            handle.close()
+            raise RuntimeError("campaign history requires Unix file locking")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        return handle
+
+    def _read_campaign_lockouts(self) -> Set[str]:
+        handle = self._with_campaign_lock(exclusive=False)
+        try:
+            document = self._read_campaign_document()
+            target = document["targets"].get(self._campaign_target_key(), {})
+            values = target.get("locked_identity_hashes", [])
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise RuntimeError("campaign lockout history contains malformed identities")
+            return set(values)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+    def _register_campaign_lockout(self, user: str) -> bool:
+        """Persist a unique historical lockout across sibling output folders."""
+        identity_hash = hashlib.sha256(
+            canonical_identity(user, self.cfg.domain).encode("utf-8")
+        ).hexdigest()
+        handle = self._with_campaign_lock(exclusive=True)
+        try:
+            document = self._read_campaign_document()
+            target_key = self._campaign_target_key()
+            target = document["targets"].setdefault(
+                target_key,
+                {"locked_identity_hashes": [], "updated_at": datetime.datetime.now().isoformat()},
+            )
+            values = target.get("locked_identity_hashes", [])
+            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+                raise RuntimeError("campaign lockout history contains malformed identities")
+            identities = set(values)
+            is_new = identity_hash not in identities
+            identities.add(identity_hash)
+            target["locked_identity_hashes"] = sorted(identities)
+            target["updated_at"] = datetime.datetime.now().isoformat()
+            self._atomic_write_text(
+                self.campaign_history_path,
+                json.dumps(document, indent=2) + "\n",
+            )
+            self.campaign_total_lockouts = len(identities)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+        new_since_baseline = max(
+            0, self.campaign_total_lockouts - self.campaign_baseline_count
+        )
+        growth_limit = max(5, (self.campaign_baseline_count // 2) + 1)
+        if self.campaign_baseline_count > 0 and new_since_baseline >= growth_limit:
+            self.campaign_growth_stop = True
+        return is_new
+
+    def observe_pair_outcome(self, user: str, status: Optional[str]) -> Optional[str]:
+        """Advance the runtime lockout streak and return a pause reason, if any."""
+        if status == "lockout":
+            key = canonical_identity(user, self.cfg.domain)
+            if key not in self._consecutive_lockout_keys:
+                self._consecutive_lockout_keys.add(key)
+                self.consecutive_lockout_users.append(self._display_user(user))
+                self.max_consecutive_lockouts = max(
+                    self.max_consecutive_lockouts,
+                    len(self.consecutive_lockout_users),
+                )
+            if len(self.consecutive_lockout_users) > self.cfg.lockout_burst:
+                return "consecutive-lockouts"
+        elif status in {"auth_failure", *SUCCESS_PAIR_STATUSES}:
+            self.reset_lockout_streak()
+        # nonexistent, quarantined/skipped, uncertain, and tool errors are
+        # intentionally neutral: none proves the account is currently usable.
+        if self.campaign_growth_stop:
+            return "lockout-growth"
+        return None
+
+    def reset_lockout_streak(self) -> None:
+        self.consecutive_lockout_users = []
+        self._consecutive_lockout_keys = set()
+
+    @property
+    def consecutive_lockout_count(self) -> int:
+        return len(self.consecutive_lockout_users)
+
+    def clear_active_lockout(self, user: str) -> bool:
+        """Clear only current lockout quarantine; retain historical evidence."""
+        key = canonical_identity(user, self.cfg.domain)
+        matched = next(
+            (
+                locked
+                for locked in self.active_lockouts
+                if canonical_identity(locked, self.cfg.domain) == key
+            ),
+            None,
+        )
+        if matched is None:
+            return False
+        self.active_lockouts.remove(matched)
+        self._remove_quarantine_reason(user, "confirmed_lockout")
+        self.record_timeline_event("lockout_cleared", f"{self._display_user(user)} confirmed unlocked")
+        self._log_line(
+            f"{datetime.datetime.now().isoformat()} LOCKOUT-CLEARED {self._display_user(user)}"
+        )
+        return True
 
     def set_effective_users(self, users: List[str]) -> None:
         """Replace a fresh run's source list with its enumerated identity set."""
@@ -1148,6 +1429,7 @@ class State:
             "creds.txt",
             PASSWORD_CHANGES_FILE_NAME,
             "locked-out.txt",
+            ACTIVE_LOCKOUTS_FILE_NAME,
             "used-passwords.txt",
             "active-users.txt",
             "results.json",
@@ -1388,10 +1670,25 @@ class State:
         self._rebuild_configured_identity_maps()
 
         current_inputs = self._input_identity()
-        if saved_inputs != current_inputs:
+        legacy_default_inputs = (
+            self._input_identity(lockout_burst_override=3)
+            if self.cfg.lockout_burst == 4
+            else None
+        )
+        if saved_inputs != current_inputs and saved_inputs != legacy_default_inputs:
             raise RuntimeError(
                 "resume state does not match the current users, secrets, engine, "
                 "or safety settings; refusing to risk repeated attempts"
+            )
+        if saved_inputs == legacy_default_inputs and saved_inputs != current_inputs:
+            # The old state stores only a safety fingerprint, so an explicit
+            # legacy value cannot be distinguished from its former default.
+            # Preserve the stricter saved ceiling rather than silently
+            # loosening it during resume.
+            self.cfg.lockout_burst = 3
+            self._log_line(
+                f"{datetime.datetime.now().isoformat()} retained saved legacy "
+                "lockout limit 3 for this resumed run"
             )
 
         self.used_passwords = list(data["used_passwords"])
@@ -1407,6 +1704,64 @@ class State:
         if len(saved_locked_keys) != len(self.locked_users):
             raise RuntimeError(
                 "resume state locked_users contains canonical duplicates"
+            )
+        raw_active_lockouts = data.get("active_lockouts", data["locked_users"])
+        if not isinstance(raw_active_lockouts, list) or not all(
+            isinstance(item, str) for item in raw_active_lockouts
+        ):
+            raise RuntimeError("resume state active_lockouts contains an invalid identity")
+        self.active_lockouts = set(raw_active_lockouts)
+        active_keys = {
+            canonical_identity(user, self.cfg.domain)
+            for user in self.active_lockouts
+        }
+        if (
+            len(active_keys) != len(self.active_lockouts)
+            or not active_keys.issubset(saved_locked_keys)
+        ):
+            raise RuntimeError(
+                "resume state active lockouts are inconsistent with historical evidence"
+            )
+        raw_max_streak = data.get("max_consecutive_lockouts", 0)
+        if (
+            isinstance(raw_max_streak, bool)
+            or not isinstance(raw_max_streak, int)
+            or raw_max_streak < 0
+        ):
+            raise RuntimeError("resume state maximum lockout streak is invalid")
+        self.max_consecutive_lockouts = raw_max_streak
+        raw_campaign_baseline = data.get(
+            "campaign_baseline_count", self.campaign_baseline_count
+        )
+        if (
+            isinstance(raw_campaign_baseline, bool)
+            or not isinstance(raw_campaign_baseline, int)
+            or raw_campaign_baseline < 0
+        ):
+            raise RuntimeError("resume state campaign lockout baseline is invalid")
+        self.campaign_baseline_count = raw_campaign_baseline
+        saved_campaign_pause = data.get("campaign_growth_paused", False)
+        if not isinstance(saved_campaign_pause, bool):
+            raise RuntimeError("resume state campaign pause marker is invalid")
+        if saved_campaign_pause:
+            # An explicit --resume is the operator acknowledgement for this
+            # resumable pause. Future growth is measured from the new total.
+            self.campaign_baseline_count = self.campaign_total_lockouts
+            self.campaign_growth_stop = False
+            self._log_line(
+                f"{datetime.datetime.now().isoformat()} campaign lockout-growth "
+                f"pause acknowledged at {self.campaign_total_lockouts} identities"
+            )
+        else:
+            campaign_delta = max(
+                0, self.campaign_total_lockouts - self.campaign_baseline_count
+            )
+            campaign_growth_limit = max(
+                5, (self.campaign_baseline_count // 2) + 1
+            )
+            self.campaign_growth_stop = bool(
+                self.campaign_baseline_count > 0
+                and campaign_delta >= campaign_growth_limit
             )
         configured_user_keys = {
             canonical_identity(user, self.cfg.domain) for user in self.cfg.users
@@ -1635,7 +1990,7 @@ class State:
                 "resume state found_creds does not match credential findings"
             )
 
-        seen_signal_identities: Set[Tuple[str, str]] = set()
+        seen_signal_events: Set[Tuple[str, str, str, str, Any, Any]] = set()
         calculated_unknown_signals = 0
         for event in self.lockout_signals:
             certainty = event.get("certainty")
@@ -1691,13 +2046,21 @@ class State:
                     raise RuntimeError(
                         "resume state safety signal conflicts with the pair ledger"
                     )
-            dedupe_key = (event_key, str(certainty))
-            if dedupe_key in seen_signal_identities:
-                raise RuntimeError("resume state contains duplicate known safety signals")
-            seen_signal_identities.add(dedupe_key)
+            dedupe_key = (
+                event_key,
+                str(certainty),
+                str(stage),
+                str(event_secret),
+                event.get("source_pass"),
+                event.get("source_batch"),
+            )
+            if dedupe_key in seen_signal_events:
+                raise RuntimeError("resume state contains duplicate safety-signal events")
+            seen_signal_events.add(dedupe_key)
             if certainty == "definitive":
                 self.locked_users.add(self._display_user(event_user))
-                self._quarantine(event_user, "confirmed_lockout")
+                if event_key in active_keys:
+                    self._quarantine(event_user, "confirmed_lockout")
             else:
                 self._quarantine(event_user, "ambiguous_lockout_signal")
 
@@ -1743,6 +2106,10 @@ class State:
                         source_pass=record.get("source_pass"),
                         source_batch=record.get("source_batch"),
                         persist=False,
+                        activate=(
+                            canonical_identity(user, self.cfg.domain) in active_keys
+                        ),
+                        observe_campaign=False,
                     )
                 elif status == "ambiguous_lockout":
                     self.add_lockout(
@@ -1755,6 +2122,7 @@ class State:
                         source_pass=record.get("source_pass"),
                         source_batch=record.get("source_batch"),
                         persist=False,
+                        observe_campaign=False,
                     )
                 elif status == "indeterminate":
                     self._quarantine(user, "indeterminate")
@@ -1776,9 +2144,9 @@ class State:
             pattern = classify_password_pattern(str(finding["secret"]))
             self.success_by_pattern[pattern] = self.success_by_pattern.get(pattern, 0) + 1
 
-        for user in self.locked_users:
+        for user in self.active_lockouts:
             if canonical_identity(user, self.cfg.domain) not in configured_user_keys:
-                raise RuntimeError("resume state contains an unknown locked identity")
+                raise RuntimeError("resume state contains an unknown active lockout")
             self._quarantine(user, "confirmed_lockout")
 
         self.start_time = validate_iso_timestamp(data["start_time"], "start_time")
@@ -1953,6 +2321,7 @@ class State:
             "found_creds": self.found_creds,
             "credentials": self.credentials,
             "locked_users": list(self.locked_users),
+            "active_lockouts": list(self.active_lockouts),
             "quarantined_users": self.quarantined_users,
             "lockout_signals": self.lockout_signals,
             "unknown_lockout_events": self.unknown_lockout_events,
@@ -1978,6 +2347,9 @@ class State:
             "known_bad_realms": self.known_bad_realms,
             "working_realm": self.working_realm,
             "identity_filter_complete": self.identity_filter_complete,
+            "max_consecutive_lockouts": self.max_consecutive_lockouts,
+            "campaign_baseline_count": self.campaign_baseline_count,
+            "campaign_growth_paused": self.campaign_growth_stop,
         }
         self._atomic_write_text(self.state_file, json.dumps(data, indent=2) + "\n")
 
@@ -2000,6 +2372,11 @@ class State:
 
         locked_lines = sorted(self.locked_users)
         self._atomic_write_text(self.lockouts_file, "\n".join(locked_lines) + ("\n" if locked_lines else ""))
+        active_lines = sorted(self.active_lockouts)
+        self._atomic_write_text(
+            self.active_lockouts_file,
+            "\n".join(active_lines) + ("\n" if active_lines else ""),
+        )
 
         self._atomic_write_text(self.used_file, "\n".join(self.used_passwords) + ("\n" if self.used_passwords else ""))
 
@@ -2017,7 +2394,10 @@ class State:
             "pth_mode": self.cfg.pth_mode,
         }
 
-    def _input_identity(self) -> Dict[str, Any]:
+    def _input_identity(
+        self,
+        lockout_burst_override: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Fingerprints and safety settings that must match on resume."""
         canonical_users = [canonical_identity(user, self.cfg.domain) for user in self.cfg.users]
         canonical_source_users = [
@@ -2031,7 +2411,11 @@ class State:
             "minutes_between_batches": self.cfg.time_between_rounds,
             "passes_per_batch": self.cfg.passwords_per_round,
             "lockout_threshold": self.cfg.lockout_threshold,
-            "lockout_burst": self.cfg.lockout_burst,
+            "lockout_burst": (
+                self.cfg.lockout_burst
+                if lockout_burst_override is None
+                else lockout_burst_override
+            ),
             "schedule": self.cfg.schedule,
             "filter_disabled": self.cfg.filter_disabled,
             "dry_run": self.cfg.dry_run,
@@ -2283,6 +2667,8 @@ class State:
         source_pass: Optional[int] = None,
         source_batch: Optional[int] = None,
         persist: bool = True,
+        activate: bool = True,
+        observe_campaign: bool = True,
     ) -> bool:
         """Record one definitive or ambiguous safety signal."""
         if certainty not in {"definitive", "ambiguous"}:
@@ -2323,22 +2709,31 @@ class State:
 
         user = self._display_user(user)
         key = canonical_identity(user, self.cfg.domain)
+        resolved_pass = source_pass or self.current_pass or None
+        resolved_batch = source_batch or self.current_round or None
         if any(
             canonical_identity(str(event.get("user", "")), self.cfg.domain) == key
             and event.get("certainty") == certainty
+            and event.get("stage") == stage
+            and event.get("secret") == secret
+            and event.get("source_pass") == resolved_pass
+            and event.get("source_batch") == resolved_batch
             for event in self.lockout_signals
             if event.get("user")
         ):
-            if definitive:
-                self.locked_users.add(user)
+            if definitive and activate:
+                self.active_lockouts.add(user)
                 self._quarantine(user, "confirmed_lockout")
             else:
-                self._quarantine(user, "ambiguous_lockout_signal")
+                if not definitive:
+                    self._quarantine(user, "ambiguous_lockout_signal")
             return False
 
         if definitive:
             self.locked_users.add(user)
-            self._quarantine(user, "confirmed_lockout")
+            if activate:
+                self.active_lockouts.add(user)
+                self._quarantine(user, "confirmed_lockout")
         else:
             self._quarantine(user, "ambiguous_lockout_signal")
 
@@ -2351,8 +2746,8 @@ class State:
             "stage": stage,
             "secret": secret,
             "raw": raw_line,
-            "source_pass": source_pass or self.current_pass or None,
-            "source_batch": source_batch or self.current_round or None,
+            "source_pass": resolved_pass,
+            "source_batch": resolved_batch,
         })
 
         # Feature E: Record timeline event before save
@@ -2361,6 +2756,18 @@ class State:
         self._log_line(
             f"{ts} LOCKOUT-SIGNAL {user} certainty={certainty} stage={stage}"
         )
+        if definitive and observe_campaign:
+            try:
+                self._register_campaign_lockout(user)
+            except Exception as exc:
+                # Never lose or bypass the local quarantine merely because the
+                # cross-run guard could not be updated.
+                self._log_line(
+                    f"{datetime.datetime.now().isoformat()} CAMPAIGN-HISTORY-ERROR "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                self.save()
+                raise CampaignHistoryUnavailable(str(exc)) from exc
         if persist:
             self.save()
         return True
@@ -2624,6 +3031,11 @@ class State:
             for status in PASSWORD_CHANGE_PAIR_STATUSES
         )
 
+    def failed_pair_count(self) -> int:
+        """Return rejected pairs, including identities confirmed nonexistent."""
+        counts = self.pair_status_counts()
+        return counts.get("auth_failure", 0) + counts.get("nonexistent", 0)
+
     def real_pair_outcome_count(self) -> int:
         """Return non-simulated pair outcomes used as the success-rate base."""
         counts = self.pair_status_counts()
@@ -2773,7 +3185,8 @@ class State:
         table.add_row("Unique credential pairs", str(pair_count))
         table.add_row("Valid credentials", str(successful_pairs))
         table.add_row("Need password change", str(password_changes))
-        table.add_row("Authentication failures", str(status_counts.get("auth_failure", 0)))
+        table.add_row("Rejected pairs", str(self.failed_pair_count()))
+        table.add_row("Nonexistent identities", str(status_counts.get("nonexistent", 0)))
         table.add_row(
             "Safety-result pairs",
             str(
@@ -2793,7 +3206,10 @@ class State:
             lockout_value += f" ({self.unknown_lockout_events} unknown-user signal(s))"
         table.add_row("Safety-signal events", lockout_value)
         table.add_row("Affected identities", str(self.signal_identity_count()))
-        table.add_row("Confirmed locked identities", str(len(self.locked_users)))
+        table.add_row("Historically locked identities", str(len(self.locked_users)))
+        table.add_row("Active locked identities", str(len(self.active_lockouts)))
+        table.add_row("Peak consecutive lockouts", str(self.max_consecutive_lockouts))
+        table.add_row("Campaign locked identities", str(self.campaign_total_lockouts))
         table.add_row(
             "Ambiguous-signal identities",
             str(self.signal_identity_count("ambiguous")),
@@ -2844,7 +3260,7 @@ class State:
         if password_changes:
             parts.append(f"Change needed: {password_changes}")
         parts.extend([
-            f"Failed: {status_counts.get('auth_failure', 0)}",
+            f"Failed: {self.failed_pair_count()}",
             "Safety: "
             f"{status_counts.get('lockout', 0) + status_counts.get('ambiguous_lockout', 0)}",
             f"Uncertain: {status_counts.get('indeterminate', 0)}",
@@ -2998,6 +3414,7 @@ class State:
                 "successful_pairs": self.successful_pair_count(),
                 "password_change_required": self.password_change_pair_count(),
                 "authentication_failures": status_counts.get("auth_failure", 0),
+                "nonexistent_pairs": status_counts.get("nonexistent", 0),
                 "indeterminate_pairs": status_counts.get("indeterminate", 0),
                 "simulated_pairs": status_counts.get("dry_run", 0),
                 "skipped_pairs": self.skipped_pair_count(),
@@ -3006,6 +3423,10 @@ class State:
                 "lockout_signals": self.lockout_count,
                 "affected_signal_identities": self.signal_identity_count(),
                 "confirmed_locked_identities": len(self.locked_users),
+                "historically_locked_identities": len(self.locked_users),
+                "active_locked_identities": len(self.active_lockouts),
+                "peak_consecutive_lockouts": self.max_consecutive_lockouts,
+                "campaign_locked_identities": self.campaign_total_lockouts,
                 "ambiguous_signal_identities": self.signal_identity_count("ambiguous"),
                 "unknown_lockout_signals": self.unknown_lockout_events,
                 "batches_completed": self.completed_rounds,
@@ -3017,6 +3438,7 @@ class State:
             "cred_reuse": [{"password": pw, "users": users} for pw, users in self.detect_cred_reuse()],
             "admin_users": self.admin_users,
             "locked_users": list(self.locked_users),
+            "active_lockouts": list(self.active_lockouts),
             "attempted_pairs": self.credential_pair_count(),
         }
 
@@ -3248,6 +3670,7 @@ class State:
             "credential": "#27ae60",
             "password_change_required": "#d16ee0",
             "lockout": "#e67e22",
+            "lockout_cleared": "#55d68b",
             "reprioritize": "#f39c12",
             "throttle": "#e74c3c",
             "schedule_wait": "#1abc9c",
@@ -3337,7 +3760,10 @@ class State:
                     pass_statuses.get(status, 0)
                     for status in SUCCESS_PAIR_STATUSES
                 ),
-                "failed": pass_statuses.get("auth_failure", 0),
+                "failed": (
+                    pass_statuses.get("auth_failure", 0)
+                    + pass_statuses.get("nonexistent", 0)
+                ),
                 "safety": (
                     pass_statuses.get("lockout", 0)
                     + pass_statuses.get("ambiguous_lockout", 0)
@@ -3406,8 +3832,10 @@ class State:
             ("Attempts sent", self.total_dispatches, "accent"),
             ("Unique pairs", self.credential_pair_count(), ""),
             ("Valid", self.successful_pair_count(), "good"),
-            ("Failed", status_counts.get("auth_failure", 0), ""),
+            ("Failed", self.failed_pair_count(), ""),
             ("Safety signals", self.lockout_count, "warn" if self.lockout_count else ""),
+            ("Active lockouts", len(self.active_lockouts), "warn" if self.active_lockouts else ""),
+            ("Peak lockout streak", self.max_consecutive_lockouts, "warn" if self.max_consecutive_lockouts else ""),
             ("Uncertain", uncertain_pairs, "bad" if uncertain_pairs else ""),
             ("Skipped", self.skipped_pair_count(), ""),
             ("Batches", self.completed_rounds, ""),
@@ -3599,6 +4027,10 @@ def classify_line(
                         return (LineType.ADMIN, f"{user}:{reported_secret}")
                 return (LineType.SUCCESS, f"{user}:{reported_secret}")
 
+        for pat in NXC_NONEXISTENT_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.NONEXISTENT, reported_user)
+
         for pat in NXC_AUTHFAIL_PATTERNS:
             if re.search(pat, status_text, re.IGNORECASE):
                 return (LineType.AUTHFAIL, reported_user)
@@ -3632,6 +4064,10 @@ def classify_line(
         for pat in KERBRUTE_CONN_ERROR_PATTERNS:
             if re.search(pat, status_text, re.IGNORECASE):
                 return (LineType.CONN_ERROR, reported_principal)
+
+        for pat in KERBRUTE_NONEXISTENT_PATTERNS:
+            if re.search(pat, status_text, re.IGNORECASE):
+                return (LineType.NONEXISTENT, reported_principal)
 
         for pat in KERBRUTE_SUCCESS_PATTERNS:
             if re.search(pat, parsed_line, re.IGNORECASE):
@@ -3687,10 +4123,6 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
         realm: Override domain for kerbrute (realm retry). If None, uses cfg.domain.
     """
     aggregate = RoundResult()
-    if state.signal_count_for_secret(secret) > cfg.lockout_burst:
-        aggregate.aborted = True
-        aggregate.abort_reason = "lockout-burst"
-        return aggregate
     eligible_users = state.eligible_users_for(secret)
     if not eligible_users:
         ui.console.print(
@@ -3708,11 +4140,13 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
         style="dim",
     )
 
-    for user in eligible_users:
+    for user_index, user in enumerate(eligible_users, start=1):
         # Recheck because a prior result in this pass may have quarantined an
         # equivalent spelling of this identity.
         if user not in state.eligible_users_for(secret):
             continue
+        if hasattr(ui, "set_progress"):
+            ui.set_progress(user, user_index - 1, len(eligible_users))
         if not state.begin_attempt(secret, user, engine):
             continue
         aggregate.dispatches += 1
@@ -3749,13 +4183,17 @@ def spray_one_password(engine: Engine, cfg: Config, secret: str, ui: RichUI, sta
                 child.indeterminate_users.add(state._display_user(user))
 
         _merge_round_result(aggregate, child)
+        if hasattr(ui, "set_progress"):
+            ui.set_progress(user, user_index, len(eligible_users))
 
-        if state.signal_count_for_secret(secret) > cfg.lockout_burst:
+        pause_reason = state.observe_pair_outcome(user, state.pair_status(secret, user))
+        if pause_reason:
             aggregate.aborted = True
-            aggregate.abort_reason = "lockout-burst"
+            aggregate.abort_reason = pause_reason
             aggregate.clean_finish = False
             aggregate.reconciled_complete = False
-            ui.set_abort(aggregate.abort_reason)
+            ui.set_abort(pause_reason)
+            state.save()
             return aggregate
 
         if child.aborted:
@@ -4342,32 +4780,39 @@ def _spray_one_password_impl(
                     )
                 else:
                     result.unknown_lockouts += 1
-                signal_added = state.add_lockout(
-                    user_lock,
-                    certainty="definitive",
-                    engine=engine.tool,
-                    protocol=engine.protocol or "",
-                    secret=secret,
-                    raw_line=line,
-                    persist=False,
-                )
+                try:
+                    signal_added = state.add_lockout(
+                        user_lock,
+                        certainty="definitive",
+                        engine=engine.tool,
+                        protocol=engine.protocol or "",
+                        secret=secret,
+                        raw_line=line,
+                        persist=False,
+                    )
+                except CampaignHistoryUnavailable:
+                    ui.update_lockout(
+                        user_lock,
+                        secret,
+                        str(engine),
+                        state.consecutive_lockout_count + (1 if user_lock else 0),
+                    )
+                    raise
                 state.save()
                 if signal_added:
-                    ui.update_lockout(user_lock)
-
-                lockout_abort_reason = ""
-                if engine.tool == "kerbrute":
-                    lockout_abort_reason = "lockout-safety-stop"
-                elif (state.lockout_count >= cfg.lockout_threshold and
-                      state.lockout_count > state.acknowledged_lockouts):
-                    lockout_abort_reason = "lockout-threshold"
-
-                if lockout_abort_reason:
-                    _stop_process(proc)
-                    result.aborted = True
-                    result.abort_reason = lockout_abort_reason
-                    ui.set_abort(result.abort_reason)
-                    break
+                    prospective_streak = (
+                        state.consecutive_lockout_count
+                        if user_lock
+                        and canonical_identity(user_lock, cfg.domain)
+                        in state._consecutive_lockout_keys
+                        else state.consecutive_lockout_count + (1 if user_lock else 0)
+                    )
+                    ui.update_lockout(
+                        user_lock,
+                        secret,
+                        str(engine),
+                        prospective_streak,
+                    )
 
             elif line_type == LineType.AMBIGUOUS_LOCKOUT:
                 saw_auth_result = True
@@ -4405,7 +4850,7 @@ def _spray_one_password_impl(
                 )
                 state.save()
                 if signal_added:
-                    ui.update_lockout(user_signal)
+                    ui.update_lockout(user_signal, secret, str(engine), 0)
                 _stop_process(proc)
                 result.aborted = True
                 result.abort_reason = "lockout-safety-stop"
@@ -4443,6 +4888,24 @@ def _spray_one_password_impl(
                         break
                     result.terminal_users.add(user)
                     state.finish_attempt(secret, user, "auth_failure")
+                    if hasattr(ui, "update_auth_failure"):
+                        ui.update_auth_failure()
+
+            elif line_type == LineType.NONEXISTENT:
+                saw_auth_result = True
+                reported = data or expected_user
+                if reported:
+                    user = _normalize_reported_user(reported, cfg.users, cfg.domain)
+                    if expected_key and canonical_identity(user, cfg.domain) != expected_key:
+                        result.aborted = True
+                        result.abort_reason = "identity-mismatch"
+                        result.errors.append(f"expected {expected_user}, parsed {user}")
+                        _stop_process(proc)
+                        break
+                    result.terminal_users.add(user)
+                    state.finish_attempt(secret, user, "nonexistent")
+                    if hasattr(ui, "update_auth_failure"):
+                        ui.update_auth_failure(nonexistent=True)
 
             elif line_type == LineType.CONN_ERROR:
                 # Track connection errors for stats/throttling. The completed
@@ -4459,7 +4922,23 @@ def _spray_one_password_impl(
         # Wait for normal completion if not aborted
         if not result.aborted:
             return_code = proc.wait(timeout=10)
-            if result.conn_fails:
+            accepted_safe_lockout = bool(
+                engine.tool == "kerbrute"
+                and result.lockouts
+                and expected_key
+                and any(
+                    canonical_identity(user, cfg.domain) == expected_key
+                    for user in result.terminal_users
+                )
+            )
+            if accepted_safe_lockout:
+                # Kerbrute --safe intentionally exits early and may omit its
+                # normal summary after reporting this one user's lockout. The
+                # pair is fully reconciled, so the controller can quarantine
+                # it and continue with the next identity.
+                result.clean_finish = True
+                result.reconciled_complete = True
+            elif result.conn_fails:
                 result.aborted = True
                 result.abort_reason = "connection-errors"
             elif return_code != 0:
@@ -4500,6 +4979,15 @@ def _spray_one_password_impl(
         ui.console.print(f"[!] Engine stopped after {exc.reason}", style="red")
         result.aborted = True
         result.abort_reason = exc.reason
+
+    except CampaignHistoryUnavailable as exc:
+        _stop_process(proc)
+        ui.console.print(
+            f"[!] Shared lockout history could not be updated: {exc}",
+            style="red",
+        )
+        result.aborted = True
+        result.abort_reason = "campaign-history-unavailable"
 
     except Exception as e:
         _stop_process(proc)
@@ -5051,6 +5539,189 @@ def build_failover_chain(cfg: Config) -> List[Engine]:
 # Lockout handling
 # =============================================================================
 
+def _escape_ldap_filter_value(value: str) -> str:
+    """Escape an AD identity for use as an RFC 4515 filter value."""
+    replacements = {
+        "\\": r"\5c",
+        "*": r"\2a",
+        "(": r"\28",
+        ")": r"\29",
+        "\x00": r"\00",
+    }
+    return "".join(replacements.get(char, char) for char in value)
+
+
+def recheck_active_lockouts(
+    cfg: Config,
+    state: State,
+    console: Console,
+    ui: Optional[RichUI] = None,
+) -> Tuple[int, int]:
+    """Safely recheck active lockouts with LDAP and a known valid credential.
+
+    No candidate password is retried. Only the computed AD lockout bit is
+    authoritative; lockoutTime may remain nonzero after automatic unlock.
+    Returns (cleared, still_locked).
+    """
+    if not state.active_lockouts or cfg.dry_run or not cfg.nxc_binary:
+        return (0, len(state.active_lockouts))
+
+    active_keys = {
+        canonical_identity(user, cfg.domain) for user in state.active_lockouts
+    }
+    credential = next(
+        (
+            finding
+            for finding in reversed(state.credentials)
+            if finding.get("credential_state") == "valid"
+            and canonical_identity(str(finding.get("user", "")), cfg.domain)
+            not in active_keys
+        ),
+        None,
+    )
+    if credential is None:
+        console.print(
+            "[*] Active lockouts remain quarantined; no known valid directory "
+            "credential is available for a read-only LDAP status check.",
+            style="yellow",
+        )
+        return (0, len(state.active_lockouts))
+
+    secret_fd, secret_path = tempfile.mkstemp(
+        prefix=".lockout-check-",
+        suffix=".txt",
+        dir=state.log_dir,
+    )
+    try:
+        os.fchmod(secret_fd, 0o600)
+        with os.fdopen(secret_fd, "w", encoding="utf-8") as handle:
+            secret_fd = -1
+            handle.write(str(credential["secret"]) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        locked_by_key = {
+            canonical_identity(user, cfg.domain): user
+            for user in state.active_lockouts
+        }
+        filters = "".join(
+            f"(sAMAccountName={_escape_ldap_filter_value(unqualified_identity(user, cfg.domain))})"
+            for user in sorted(state.active_lockouts)
+        )
+        query_filter = filters if len(locked_by_key) == 1 else f"(|{filters})"
+        cmd = [
+            cfg.nxc_binary,
+            "ldap",
+            cfg.dc_ip,
+            "-d",
+            cfg.domain,
+            "-u",
+            str(credential["user"]),
+            "-H" if cfg.pth_mode else "-p",
+            secret_path,
+            "--query",
+            query_filter,
+            "sAMAccountName msDS-User-Account-Control-Computed lockoutTime",
+        ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=min(cfg.engine_timeout_seconds, 60),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            state._log_line(
+                f"{datetime.datetime.now().isoformat()} LOCKOUT-RECHECK "
+                f"unavailable={type(exc).__name__}"
+            )
+            return (0, len(state.active_lockouts))
+
+        output = ANSI_ESCAPE_RE.sub("", completed.stdout or "")
+        state._log_line(
+            f"{datetime.datetime.now().isoformat()} LOCKOUT-RECHECK "
+            f"identities={len(locked_by_key)} exit={completed.returncode}"
+        )
+        if completed.returncode != 0:
+            # A failed bind/query cannot provide authoritative evidence that an
+            # account is currently unlocked, even if its partial output happens
+            # to contain something that resembles an LDAP attribute block.
+            return (0, len(state.active_lockouts))
+        observed_flags: Dict[str, int] = {}
+        blocks = re.split(
+            r"(?=^.*\bsAMAccountName\s+)",
+            output,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        for block in blocks:
+            account_match = re.search(
+                r"\bsAMAccountName\s+([^\s]+)",
+                block,
+                re.IGNORECASE,
+            )
+            computed_match = re.search(
+                r"msDS-User-Account-Control-Computed\s+:?\s*(\d+)",
+                block,
+                re.IGNORECASE,
+            )
+            if account_match and computed_match:
+                observed_flags[
+                    canonical_identity(account_match.group(1), cfg.domain)
+                ] = int(computed_match.group(1))
+
+        # Some NetExec versions omit the account label when exactly one LDAP
+        # object is returned. Accept that form only when the query itself was
+        # unambiguous.
+        if len(locked_by_key) == 1 and not observed_flags:
+            computed_match = re.search(
+                r"msDS-User-Account-Control-Computed\s+:?\s*(\d+)",
+                output,
+                re.IGNORECASE,
+            )
+            if computed_match:
+                only_key = next(iter(locked_by_key))
+                observed_flags[only_key] = int(computed_match.group(1))
+
+        cleared = 0
+        still_locked = 0
+        checked = 0
+        for key, computed_flags in observed_flags.items():
+            locked_user = locked_by_key.get(key)
+            if locked_user is None:
+                continue
+            checked += 1
+            if computed_flags & 0x10:
+                still_locked += 1
+                continue
+            if state.clear_active_lockout(locked_user):
+                cleared += 1
+                message = f"✓ UNLOCKED  {locked_user} — removed from active quarantine"
+                console.print(f"[+] {message}", style="green")
+                if ui is not None and ui.live:
+                    ui._add_activity(message, "green")
+
+        if cleared:
+            # A computed zero lockout bit is positive evidence of a currently
+            # usable account state, so it safely breaks a consecutive streak.
+            state.reset_lockout_streak()
+            state.save()
+        if checked:
+            console.print(
+                f"[*] LDAP lockout recheck: {cleared} cleared, "
+                f"{still_locked} still locked, {len(state.active_lockouts)} active.",
+                style="cyan",
+            )
+        return (cleared, still_locked)
+    finally:
+        if secret_fd >= 0:
+            os.close(secret_fd)
+        try:
+            Path(secret_path).unlink()
+        except FileNotFoundError:
+            pass
+
 def handle_lockouts(
     pass_lockouts: int,
     cumulative_lockouts: int,
@@ -5059,29 +5730,15 @@ def handle_lockouts(
     console: Console,
     acknowledged_lockouts: int = 0,
 ) -> bool:
-    """
-    Apply lockout rules. Returns True if run should continue, False if hard-stop.
-    - Per-pass rule: > cfg.lockout_burst for one secret → hard-stop.
-    - Threshold rule: >= cfg.lockout_threshold cumulative → interactive prompt.
-    """
+    """Compatibility wrapper for the consecutive-lockout pause rule."""
     if pass_lockouts > cfg.lockout_burst:
         msg = (
-            f"[!] Hard-stop: {pass_lockouts} lockout signals in this spray pass "
-            f"exceeded the maximum of {cfg.lockout_burst}. Stopping the run to "
-            "avoid further lockouts."
+            f"[!] Safety pause: {pass_lockouts} users were locked back-to-back, "
+            f"exceeding the configured maximum of {cfg.lockout_burst}."
         )
         console.print(msg, style="red")
-        ui.alert("LOCKOUT LIMIT - STOPPED", msg, "red")
-        return False  # Do not continue
-
-    if (cumulative_lockouts >= cfg.lockout_threshold and
-            cumulative_lockouts > acknowledged_lockouts):
-        msg = (
-            f"[*] Cumulative safety signals: {cumulative_lockouts} "
-            f"(review threshold {cfg.lockout_threshold})."
-        )
-        console.print(msg, style="yellow")
-        return prompt_continue(ui, console)
+        ui.alert("CONSECUTIVE LOCKOUTS - PAUSED", msg, "red")
+        return False
 
     return True
 
@@ -5141,11 +5798,12 @@ def run(cfg: Config, console: Console) -> bool:
         max_feed_lines=cfg.feed_lines,
         live_ui=cfg.live_ui,
         force_live=cfg.force_live_ui,
+        show_raw=cfg.verbose,
     )
 
     console.print(
-        f"[*] Lockout guard: at most {cfg.lockout_burst} signal(s) per "
-        f"secret/pass; signal {cfg.lockout_burst + 1} hard-stops the run.",
+        f"[*] Lockout guard: isolated accounts are quarantined; "
+        f"{cfg.lockout_burst + 1} consecutive locked identities pause the run.",
         style="cyan",
     )
 
@@ -5231,10 +5889,12 @@ def run(cfg: Config, console: Console) -> bool:
         active_users_file = state.log_dir / "active-users.txt"
         state._atomic_write_text(active_users_file, "\n".join(cfg.users) + "\n")
         console.print(f"[*] Active users saved to: {active_users_file}", style="cyan")
+
+    recheck_active_lockouts(cfg, state, console, ui)
     ui.load_totals(
         state.credential_pairs(),
         state.admin_credential_pairs(),
-        state.known_signal_users(),
+        state.active_lockouts,
         state.unknown_lockout_events,
         state.lockout_count,
         {
@@ -5280,19 +5940,14 @@ def run(cfg: Config, console: Console) -> bool:
     # Main loop over password queue
     window = SprayWindow(cfg.schedule) if cfg.schedule else None
     stop_reason = ""
-
-    # A resumed run may already contain unacknowledged lockouts. Do not spray
-    # another password until the operator explicitly accepts that state.
-    existing_lockouts = state.lockout_count
-    if (existing_lockouts >= cfg.lockout_threshold and
-            existing_lockouts > state.acknowledged_lockouts):
-        if handle_lockouts(
-            0, existing_lockouts, cfg, ui, console, state.acknowledged_lockouts
-        ):
-            state.acknowledged_lockouts = existing_lockouts
-            state.save()
-        else:
-            stop_reason = "operator stopped at lockout threshold"
+    if state.campaign_growth_stop:
+        stop_reason = "campaign lockout population grew by more than 50%"
+        message = (
+            "Campaign lockout growth already crossed the safety threshold; "
+            "no additional authentication attempts were sent."
+        )
+        console.print(f"[!] {message}", style="red")
+        ui.alert("LOCKOUT GROWTH - PAUSED", message, "red")
 
     # Preserve batch boundaries across interruption. A resume may finish only
     # the unused slots from the interrupted batch; it cannot silently gain a
@@ -5336,8 +5991,16 @@ def run(cfg: Config, console: Console) -> bool:
                 ui.countdown(delay_remaining)
 
     round_idx = state.completed_rounds
+    first_batch_this_invocation = True
 
     while state.remaining_queue and not stop_reason:
+        # At batch boundaries, recheck quarantined identities with LDAP when a
+        # known valid directory credential is available. This never retries a
+        # candidate password.
+        if not first_batch_this_invocation:
+            recheck_active_lockouts(cfg, state, console, ui)
+        first_batch_this_invocation = False
+
         # Enforce the spray window before the first round and every later round.
         if window:
             wait_for_window(window, ui, console, state)
@@ -5443,7 +6106,6 @@ def run(cfg: Config, console: Console) -> bool:
             # Enter retries the same secret. It is never marked used until one
             # engine actually finishes cleanly.
             while not engine_success and not safety_stop and not operator_stop:
-                threshold_retry = False
                 # Recompute per secret/retry so a just-demoted engine becomes
                 # sticky at the back of the chain immediately.
                 effective_chain = state.compute_effective_chain(chain)
@@ -5520,12 +6182,15 @@ def run(cfg: Config, console: Console) -> bool:
                         len(result.errors),
                     )
                     if result.aborted and result.abort_reason in {
-                        "lockout-burst", "lockout-safety-stop"
+                        "consecutive-lockouts",
+                        "lockout-growth",
+                        "campaign-history-unavailable",
+                        "lockout-safety-stop",
                     }:
                         # This is an operator-safety stop, not a reason to try a
                         # second engine. Requeue the partially attempted secret.
                         safety_stop = True
-                        stopped_pass_signal_count = state.signal_count_for_secret(secret)
+                        stopped_pass_signal_count = state.consecutive_lockout_count
                         ambiguous_signal = bool(
                             result.ambiguous_lockouts
                             or result.unknown_ambiguous_lockouts
@@ -5536,39 +6201,13 @@ def run(cfg: Config, console: Console) -> bool:
                             else result.abort_reason
                         )
                         if result.abort_reason == "lockout-safety-stop":
-                            stop_reason = (
-                                "ambiguous lockout/revocation safety signal"
-                                if ambiguous_signal
-                                else "Kerbrute safe mode detected a locked account"
-                            )
+                            stop_reason = "ambiguous lockout/revocation safety signal"
+                        elif result.abort_reason == "lockout-growth":
+                            stop_reason = "campaign lockout population grew by more than 50%"
+                        elif result.abort_reason == "campaign-history-unavailable":
+                            stop_reason = "shared campaign lockout history is unavailable"
                         else:
-                            stop_reason = "per-pass safety-signal maximum exceeded"
-                        break
-
-                    if result.aborted and result.abort_reason == "lockout-threshold":
-                        cumulative_lockouts = state.lockout_count
-                        pass_lockout_count = state.signal_count_for_secret(secret)
-                        if pass_lockout_count > cfg.lockout_burst:
-                            safety_stop = True
-                            safety_stop_kind = "lockout-burst"
-                            stopped_pass_signal_count = pass_lockout_count
-                            stop_reason = "per-pass safety-signal maximum exceeded"
-                        else:
-                            should_continue = handle_lockouts(
-                                pass_lockout_count,
-                                cumulative_lockouts,
-                                cfg,
-                                ui,
-                                console,
-                                state.acknowledged_lockouts,
-                            )
-                            if should_continue:
-                                state.acknowledged_lockouts = cumulative_lockouts
-                                state.save()
-                                threshold_retry = True
-                            else:
-                                operator_stop = True
-                                stop_reason = "operator stopped at lockout threshold"
+                            stop_reason = "consecutive lockout limit exceeded"
                         break
 
                     if result.aborted:
@@ -5598,11 +6237,6 @@ def run(cfg: Config, console: Console) -> bool:
                 if safety_stop or operator_stop:
                     break
 
-                if threshold_retry:
-                    # Resume this password only for users not already attempted;
-                    # do not demote or fail over merely because safety paused it.
-                    continue
-
                 if not engine_success:
                     state.save()
                     console.print("[!] All engines failed for this secret. Pausing.", style="red")
@@ -5630,7 +6264,10 @@ def run(cfg: Config, console: Console) -> bool:
                 pass_statuses.get(status, 0)
                 for status in SUCCESS_PAIR_STATUSES
             )
-            pass_failed = pass_statuses.get("auth_failure", 0)
+            pass_failed = (
+                pass_statuses.get("auth_failure", 0)
+                + pass_statuses.get("nonexistent", 0)
+            )
             pass_safety = (
                 pass_statuses.get("lockout", 0)
                 + pass_statuses.get("ambiguous_lockout", 0)
@@ -5651,55 +6288,40 @@ def run(cfg: Config, console: Console) -> bool:
             state.mark_used(secret)
             processed_secrets.append(secret)
 
-            # Stop before the next secret if this pass exceeded its ceiling.
-            pass_lockout_count = state.signal_count_for_secret(secret)
-            if pass_lockout_count > cfg.lockout_burst:
-                safety_stop = True
-                safety_stop_kind = "lockout-burst"
-                stopped_pass_signal_count = pass_lockout_count
-                stop_reason = "per-pass safety-signal maximum exceeded"
-                break
-
-            cumulative_lockouts = state.lockout_count
-            if (cumulative_lockouts >= cfg.lockout_threshold and
-                    cumulative_lockouts > state.acknowledged_lockouts):
-                should_continue = handle_lockouts(
-                    pass_lockout_count,
-                    cumulative_lockouts,
-                    cfg,
-                    ui,
-                    console,
-                    state.acknowledged_lockouts,
-                )
-                if should_continue:
-                    state.acknowledged_lockouts = cumulative_lockouts
-                    state.save()
-                else:
-                    operator_stop = True
-                    stop_reason = "operator stopped at lockout threshold"
-                    break
-
         round_lockouts_this_round = round_signal_events_this_round
 
         if safety_stop:
-            if safety_stop_kind == "lockout-safety-stop":
+            if safety_stop_kind == "ambiguous-lockout-safety-stop":
                 msg = (
-                    "[!] Hard-stop: Kerbrute safe mode detected a locked-out "
-                    "account and stopped before attempting the remaining users."
-                )
-                alert_title = "LOCKOUT DETECTED - STOPPED"
-            elif safety_stop_kind == "ambiguous-lockout-safety-stop":
-                msg = (
-                    "[!] Hard-stop: the engine reported an ambiguous lockout/revocation "
+                    "[!] Safety pause: the engine reported an ambiguous lockout/revocation "
                     "signal. The identity was quarantined without labeling it confirmed."
                 )
-                alert_title = "AMBIGUOUS SAFETY SIGNAL - STOPPED"
+                alert_title = "AMBIGUOUS SAFETY SIGNAL - PAUSED"
+            elif safety_stop_kind == "lockout-growth":
+                new_count = max(
+                    0,
+                    state.campaign_total_lockouts - state.campaign_baseline_count,
+                )
+                msg = (
+                    "[!] Safety pause: this target's historical lockout population "
+                    f"grew from {state.campaign_baseline_count} to "
+                    f"{state.campaign_total_lockouts} (+{new_count}) during this run."
+                )
+                alert_title = "LOCKOUT GROWTH - PAUSED"
+            elif safety_stop_kind == "campaign-history-unavailable":
+                msg = (
+                    "[!] Safety pause: local lockout evidence was saved, but the "
+                    "shared campaign history could not be updated. Fix its path or "
+                    "permissions before resuming."
+                )
+                alert_title = "LOCKOUT HISTORY - PAUSED"
             else:
                 msg = (
-                    f"[!] Hard-stop: {stopped_pass_signal_count} lockout signals in this "
-                    f"spray pass exceeded the maximum of {cfg.lockout_burst}."
+                    f"[!] Safety pause: {stopped_pass_signal_count} distinct users were "
+                    "reported locked back-to-back. Healthy authentication results reset "
+                    "this streak; nonexistent and skipped users do not."
                 )
-                alert_title = "LOCKOUT LIMIT - STOPPED"
+                alert_title = "CONSECUTIVE LOCKOUTS - PAUSED"
             console.print(msg, style="red")
             ui.alert(alert_title, msg, "red")
 
@@ -5878,6 +6500,10 @@ def run(cfg: Config, console: Console) -> bool:
                 style="magenta",
             )
     console.print(f"[+] Total safety signals: {state.lockout_count}", style="yellow")
+    console.print(
+        f"[+] Active lockout quarantines: {len(state.active_lockouts)}",
+        style="yellow" if state.active_lockouts else "green",
+    )
     state.save()
 
     # Feature 4: Show full stats dashboard
@@ -5912,7 +6538,8 @@ def run(cfg: Config, console: Console) -> bool:
             f"[+] Password-change commands saved to: {state.password_changes_file}",
             style="magenta",
         )
-    console.print(f"[+] Lockouts saved to: {state.lockouts_file}", style="cyan")
+    console.print(f"[+] Historical lockouts saved to: {state.lockouts_file}", style="cyan")
+    console.print(f"[+] Active lockouts saved to: {state.active_lockouts_file}", style="cyan")
     console.print(f"[+] Overall log: {state.overall_log}", style="cyan")
     completed = not state.remaining_queue and not stop_reason
     state.close()
@@ -6020,8 +6647,11 @@ For authorized penetration testing only.
         dest="lockout_burst",
         metavar="N",
         type=int,
-        default=3,
-        help="Hard-stop when one password produces more than N lockout signals (default: 3)",
+        default=4,
+        help=(
+            "Pause after more than N different users are locked back-to-back; "
+            "a healthy login result resets the streak (default: 4)"
+        ),
     )
     everyday.add_argument("--validate-users", dest="filter_disabled", action="store_true", help="Check which usernames exist before testing passwords")
     everyday.add_argument("--pth", action="store_true", help="Treat the password file as NTLM hashes (uses NetExec)")
@@ -6046,7 +6676,7 @@ For authorized penetration testing only.
         dest="lockout_threshold",
         type=int,
         default=2,
-        help=advanced_help or "Pause for operator review after N total lockout signals (default: 2)",
+        help=argparse.SUPPRESS,
     )
     safety.add_argument(
         "--tool-retry-after",
@@ -6127,12 +6757,12 @@ For authorized penetration testing only.
         help=advanced_help or "Force the cursor-based dashboard, including inside tmux",
     )
     advanced_run.add_argument(
-        "--raw-lines",
+        "--display-lines",
         metavar="N",
         dest="feed_lines",
         type=int,
         default=10,
-        help=advanced_help or "Recent raw-output lines shown in the compact dashboard (default: 10)",
+        help=advanced_help or "Activity lines kept in the compact dashboard (default: 10)",
     )
     advanced_run.add_argument("--nxc-path", help=advanced_help or "Use this nxc/netexec executable")
     advanced_run.add_argument("--kerbrute-path", help=advanced_help or "Use this Kerbrute executable")
@@ -6146,7 +6776,7 @@ For authorized penetration testing only.
         "-v",
         "--verbose",
         action="store_true",
-        help=advanced_help or "Show masked commands, every domain retry, and every failover hop",
+        help=advanced_help or "Show raw tool output plus detailed commands, retries, and failover",
     )
 
     # Compatibility spellings stay parseable without crowding either help view.
@@ -6160,6 +6790,7 @@ For authorized penetration testing only.
     aliases.add_argument("--exclude-unknown-users", "--filter-disabled", dest="filter_disabled", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     aliases.add_argument("--export", choices=["none", "json", "csv", "all"], dest="export", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     aliases.add_argument("--feed-lines", dest="feed_lines", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--raw-lines", dest="feed_lines", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     display_mode.add_argument("--no-live", dest="no_live", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     display_mode.add_argument("--live", dest="live", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     aliases.add_argument("--engine-skip-batches", "--engine-skip-passes", "--engine-cooldown", metavar="N", dest="engine_cooldown", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -6208,7 +6839,7 @@ def main():
             "--max-lockouts must be at least 0",
         ),
         (args.conn_fail_limit >= 1, "--conn-fail-limit must be at least 1"),
-        (args.feed_lines >= 1, "--raw-lines must be at least 1"),
+        (args.feed_lines >= 1, "--display-lines must be at least 1"),
         (args.engine_cooldown >= 1, "--tool-retry-after must be at least 1"),
         (args.engine_fail_threshold >= 1, "--tool-error-limit must be at least 1"),
         (args.engine_timeout >= 1, "--tool-timeout must be at least 1"),
@@ -6293,6 +6924,7 @@ def main():
         engine_timeout_seconds=args.engine_timeout,
         engine_idle_timeout_seconds=args.engine_idle_timeout,
         probe_demoted=args.probe_demoted,
+        history_path=str(default_campaign_history_path()),
         nxc_binary=nxc_bin,
         kerbrute_binary=kerbrute_bin,
     )

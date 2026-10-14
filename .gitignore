@@ -9,6 +9,10 @@ authcadence-out/
 authcadence-dry-run-out/
 authtempo-out/
 authtempo-dry-run-out/
+.authtempo-lockout-history.json
+.authtempo-lockout-history.json.lock
+lockout-history.json
+lockout-history.json.lock
 
 # Local authentication material must never be committed.
 token.txt

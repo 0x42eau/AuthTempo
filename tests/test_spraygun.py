@@ -80,6 +80,20 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(line_type, spraygun.LineType.SUCCESS)
         self.assertEqual(data, "alice@LAB:Password1!")
 
+    def test_nonexistent_accounts_are_distinct_from_bad_passwords(self):
+        nxc_type, nxc_user = spraygun.classify_line(
+            spraygun.Engine("nxc", "smb"),
+            "SMB 127.0.0.1 445 DC [-] LAB\\missing:Bad! STATUS_NO_SUCH_USER",
+            expected_secret="Bad!",
+        )
+        kerb_type, kerb_user = spraygun.classify_line(
+            spraygun.Engine("kerbrute"),
+            "2026/10/13 > [!] missing@LAB:Bad! - User does not exist",
+            expected_secret="Bad!",
+        )
+        self.assertEqual((nxc_type, nxc_user), (spraygun.LineType.NONEXISTENT, "missing"))
+        self.assertEqual((kerb_type, kerb_user), (spraygun.LineType.NONEXISTENT, "missing@LAB"))
+
     def test_secret_text_cannot_forge_a_safety_or_admin_marker(self):
         lockout_words = "locked out data 775"
         failure = (
@@ -179,7 +193,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(command[command.index("--threads") + 1], "1")
             self.assertLess(command.index("--"), len(command) - 2)
 
-    def test_kerbrute_locked_user_is_an_immediate_safety_stop(self):
+    def test_kerbrute_quarantines_one_locked_user_and_continues(self):
         lockout_line = (
             "2026/10/13 09:42:53 >  [!] alice@LAB - USER LOCKED OUT\n"
         )
@@ -190,23 +204,30 @@ class EngineTests(unittest.TestCase):
                 log_dir=tmp, kerbrute_binary="/fake/kerbrute",
             )
             state = spraygun.State(tmp, cfg)
-            proc = Mock()
-            proc.stdout = iter([lockout_line])
-            proc.poll.return_value = None
-            proc.wait.return_value = 0
+            locked_proc = fake_process([lockout_line], return_code=1)
+            healthy_proc = fake_process([
+                "2026/10/13 09:42:54 >  [!] bob@LAB:Password1! - KDC_ERR_PREAUTH_FAILED\n",
+                "2026/10/13 09:42:54 >  Done! Tested 1 logins (0 successes) in 0.002 seconds\n",
+            ])
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
+            with patch.object(
+                spraygun.subprocess,
+                "Popen",
+                side_effect=[locked_proc, healthy_proc],
+            ) as popen:
                 result = spraygun.spray_one_password(
                     spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
 
-            self.assertTrue(result.aborted)
-            self.assertEqual(result.abort_reason, "lockout-safety-stop")
+            self.assertFalse(result.aborted)
+            self.assertTrue(result.clean_finish)
             self.assertEqual(result.lockouts, {"alice"})
             self.assertEqual(state.locked_users, {"alice"})
-            proc.terminate.assert_called_once()
+            self.assertEqual(state.active_lockouts, {"alice"})
+            self.assertEqual(popen.call_count, 2)
+            locked_proc.terminate.assert_not_called()
 
-    def test_nxc_stops_child_as_soon_as_cumulative_threshold_is_seen(self):
+    def test_nxc_ignores_retired_cumulative_threshold_for_isolated_lockout(self):
         lockout_line = (
             "SMB 127.0.0.1 445 DC [-] LAB\\alice:Password1! "
             "STATUS_ACCOUNT_LOCKED_OUT\n"
@@ -218,12 +239,16 @@ class EngineTests(unittest.TestCase):
                 log_dir=tmp, nxc_binary="/fake/nxc", lockout_threshold=1,
             )
             state = spraygun.State(tmp, cfg)
-            proc = Mock()
-            proc.stdout = iter([lockout_line])
-            proc.poll.return_value = None
-            proc.wait.return_value = 0
+            locked_proc = fake_process([lockout_line])
+            healthy_proc = fake_process([
+                "SMB 127.0.0.1 445 DC [-] LAB\\bob:Password1! STATUS_LOGON_FAILURE\n"
+            ])
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
+            with patch.object(
+                spraygun.subprocess,
+                "Popen",
+                side_effect=[locked_proc, healthy_proc],
+            ) as popen:
                 result = spraygun.spray_one_password(
                     spraygun.Engine("nxc", "smb"),
                     cfg,
@@ -232,10 +257,11 @@ class EngineTests(unittest.TestCase):
                     state,
                 )
 
-            self.assertTrue(result.aborted)
-            self.assertEqual(result.abort_reason, "lockout-threshold")
+            self.assertFalse(result.aborted)
+            self.assertTrue(result.clean_finish)
             self.assertEqual(state.lockout_count, 1)
-            proc.terminate.assert_called_once()
+            self.assertEqual(popen.call_count, 2)
+            locked_proc.terminate.assert_not_called()
 
     def test_nxc_allows_exactly_three_lockouts_in_one_spray(self):
         users = ["alice", "bob", "carol"]
@@ -262,7 +288,7 @@ class EngineTests(unittest.TestCase):
                     state,
                 )
 
-            self.assertEqual(cfg.lockout_burst, 3)
+            self.assertEqual(cfg.lockout_burst, 4)
             self.assertFalse(result.aborted)
             self.assertTrue(result.clean_finish)
             self.assertEqual(result.lockout_count, 3)
@@ -270,12 +296,12 @@ class EngineTests(unittest.TestCase):
             for proc in processes:
                 proc.terminate.assert_not_called()
 
-    def test_nxc_hard_stops_on_fourth_lockout_in_one_spray(self):
-        users = ["alice", "bob", "carol", "dave"]
+    def test_nxc_pauses_on_fifth_consecutive_lockout(self):
+        users = ["alice", "bob", "carol", "dave", "erin", "frank"]
         lockout_lines = [
             f"SMB 127.0.0.1 445 DC [-] LAB\\{user}:Password1! "
             "STATUS_ACCOUNT_LOCKED_OUT\n"
-            for user in users
+            for user in users[:5]
         ]
         with tempfile.TemporaryDirectory() as tmp:
             cfg = spraygun.Config(
@@ -296,10 +322,11 @@ class EngineTests(unittest.TestCase):
                 )
 
             self.assertTrue(result.aborted)
-            self.assertEqual(result.abort_reason, "lockout-burst")
-            self.assertEqual(result.lockout_count, 4)
-            self.assertEqual(state.lockout_count, 4)
-            self.assertEqual(popen.call_count, 4)
+            self.assertEqual(result.abort_reason, "consecutive-lockouts")
+            self.assertEqual(result.lockout_count, 5)
+            self.assertEqual(state.lockout_count, 5)
+            self.assertEqual(state.max_consecutive_lockouts, 5)
+            self.assertEqual(popen.call_count, 5)
 
     def test_nonzero_engine_exit_triggers_failover_result(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -518,6 +545,281 @@ class EngineTests(unittest.TestCase):
                 state.lockout_signals[0]["stage"],
                 "identity_enumeration",
             )
+
+
+class LockoutPolicyTests(unittest.TestCase):
+    def make_config(self, output, users, history=None, **overrides):
+        values = {
+            "users": users,
+            "passwords": ["Bad!", "Good!"],
+            "log_dir": str(output),
+            "nxc_binary": "/fake/nxc",
+            "lockout_burst": 99,
+            "history_path": str(history) if history else None,
+        }
+        values.update(overrides)
+        return spraygun.Config(
+            "users",
+            "passwords",
+            "LAB",
+            "127.0.0.1",
+            **values,
+        )
+
+    def test_nonexistent_is_neutral_but_healthy_auth_result_resets_streak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            users = ["alice", "bob", "missing", "carol"]
+            state = spraygun.State(tmp, self.make_config(tmp, users))
+
+            state.observe_pair_outcome("alice", "lockout")
+            state.observe_pair_outcome("bob", "lockout")
+            state.observe_pair_outcome("missing", "nonexistent")
+            self.assertEqual(state.consecutive_lockout_count, 2)
+
+            state.observe_pair_outcome("carol", "auth_failure")
+            self.assertEqual(state.consecutive_lockout_count, 0)
+            self.assertEqual(state.max_consecutive_lockouts, 2)
+
+    def test_campaign_growth_requires_more_than_half_and_at_least_five_new_users(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "shared-history.json"
+            users = [f"user{i:02d}" for i in range(30)]
+            first = spraygun.State(
+                str(root / "run-one"),
+                self.make_config(root / "run-one", users, history),
+            )
+            for user in users[:15]:
+                first.add_lockout(user, secret="Bad!")
+            first.close()
+
+            second = spraygun.State(
+                str(root / "run-two"),
+                self.make_config(root / "run-two", users, history),
+            )
+            self.assertEqual(second.campaign_baseline_count, 15)
+            for user in users[15:22]:
+                second.add_lockout(user, secret="Bad!")
+                self.assertFalse(second.campaign_growth_stop)
+            second.add_lockout(users[22], secret="Bad!")
+            self.assertTrue(second.campaign_growth_stop)
+            self.assertEqual(second.campaign_total_lockouts, 23)
+
+    def test_scattered_lockouts_across_runs_only_warn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            history = root / "shared-history.json"
+            users = [f"user{i}" for i in range(10)]
+            for index in range(4):
+                output = root / f"run-{index}"
+                state = spraygun.State(
+                    str(output),
+                    self.make_config(output, users, history),
+                )
+                state.add_lockout(users[index], secret="Bad!")
+                self.assertFalse(state.campaign_growth_stop)
+                state.close()
+
+    def test_ldap_recheck_uses_computed_bit_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["reader", "alice"])
+            state = spraygun.State(tmp, cfg)
+            state.add_cred("reader", "Good!", engine="nxc:ldap")
+            state.add_lockout("alice", secret="Bad!", engine="kerbrute")
+            state.observe_pair_outcome("alice", "lockout")
+
+            output = """
+            sAMAccountName alice
+            lockoutTime 134364191687395468
+            msDS-User-Account-Control-Computed 0
+            """
+            completed = subprocess.CompletedProcess([], 0, stdout=output)
+            console = Console(file=io.StringIO(), force_terminal=False)
+            with patch.object(spraygun.subprocess, "run", return_value=completed) as run:
+                cleared, still_locked = spraygun.recheck_active_lockouts(
+                    cfg, state, console
+                )
+
+            self.assertEqual((cleared, still_locked), (1, 0))
+            self.assertEqual(state.active_lockouts, set())
+            self.assertEqual(state.locked_users, {"alice"})
+            self.assertNotIn("confirmed_lockout", state.quarantine_reasons("alice"))
+            self.assertEqual(state.consecutive_lockout_count, 0)
+            command = run.call_args.args[0]
+            self.assertIn("--query", command)
+            self.assertEqual(
+                command[-1],
+                "sAMAccountName msDS-User-Account-Control-Computed lockoutTime",
+            )
+            state.save()
+            self.assertEqual(
+                (Path(tmp) / "locked-out.txt").read_text(encoding="utf-8"),
+                "alice\n",
+            )
+            self.assertEqual(
+                (Path(tmp) / spraygun.ACTIVE_LOCKOUTS_FILE_NAME).read_text(
+                    encoding="utf-8"
+                ),
+                "",
+            )
+
+    def test_ldap_recheck_retains_account_when_computed_lockout_bit_is_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["reader", "alice"])
+            state = spraygun.State(tmp, cfg)
+            state.add_cred("reader", "Good!", engine="nxc:ldap")
+            state.add_lockout("alice", secret="Bad!")
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout="msDS-User-Account-Control-Computed 16\n",
+            )
+            with patch.object(spraygun.subprocess, "run", return_value=completed):
+                result = spraygun.recheck_active_lockouts(
+                    cfg,
+                    state,
+                    Console(file=io.StringIO(), force_terminal=False),
+                )
+            self.assertEqual(result, (0, 1))
+            self.assertEqual(state.active_lockouts, {"alice"})
+            self.assertIn("confirmed_lockout", state.quarantine_reasons("alice"))
+
+    def test_ldap_recheck_uses_one_bind_for_multiple_quarantined_users(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["reader", "alice", "bob"])
+            state = spraygun.State(tmp, cfg)
+            state.add_cred("reader", "Good!", engine="nxc:ldap")
+            state.add_lockout("alice", secret="Bad!")
+            state.add_lockout("bob", secret="Bad!")
+            completed = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=(
+                    "sAMAccountName alice\n"
+                    "msDS-User-Account-Control-Computed 0\n"
+                    "lockoutTime 123\n"
+                    "sAMAccountName bob\n"
+                    "msDS-User-Account-Control-Computed 16\n"
+                    "lockoutTime 456\n"
+                ),
+            )
+            with patch.object(
+                spraygun.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                result = spraygun.recheck_active_lockouts(
+                    cfg,
+                    state,
+                    Console(file=io.StringIO(), force_terminal=False),
+                )
+            self.assertEqual(result, (1, 1))
+            self.assertEqual(state.active_lockouts, {"bob"})
+            run.assert_called_once()
+            query = run.call_args.args[0][run.call_args.args[0].index("--query") + 1]
+            self.assertTrue(query.startswith("(|"))
+            self.assertIn("sAMAccountName=alice", query)
+            self.assertIn("sAMAccountName=bob", query)
+
+    def test_ldap_recheck_without_known_credential_never_dispatches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["alice"])
+            state = spraygun.State(tmp, cfg)
+            state.add_lockout("alice", secret="Bad!")
+
+            with patch.object(spraygun.subprocess, "run") as run:
+                result = spraygun.recheck_active_lockouts(
+                    cfg,
+                    state,
+                    Console(file=io.StringIO(), force_terminal=False),
+                )
+
+            self.assertEqual(result, (0, 1))
+            self.assertEqual(state.active_lockouts, {"alice"})
+            run.assert_not_called()
+
+    def test_failed_ldap_recheck_cannot_clear_quarantine_from_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["reader", "alice"])
+            state = spraygun.State(tmp, cfg)
+            state.add_cred("reader", "Good!", engine="nxc:ldap")
+            state.add_lockout("alice", secret="Bad!")
+            completed = subprocess.CompletedProcess(
+                [],
+                1,
+                stdout=(
+                    "sAMAccountName alice\n"
+                    "msDS-User-Account-Control-Computed 0\n"
+                ),
+            )
+
+            with patch.object(spraygun.subprocess, "run", return_value=completed):
+                result = spraygun.recheck_active_lockouts(
+                    cfg,
+                    state,
+                    Console(file=io.StringIO(), force_terminal=False),
+                )
+
+            self.assertEqual(result, (0, 1))
+            self.assertEqual(state.active_lockouts, {"alice"})
+            self.assertIn("confirmed_lockout", state.quarantine_reasons("alice"))
+
+    def test_campaign_history_failure_saves_local_quarantine_before_pausing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(tmp, ["alice"])
+            state = spraygun.State(tmp, cfg)
+            with patch.object(
+                state,
+                "_register_campaign_lockout",
+                side_effect=OSError("disk unavailable"),
+            ):
+                with self.assertRaises(spraygun.CampaignHistoryUnavailable):
+                    state.add_lockout("alice", secret="Bad!", persist=False)
+
+            saved = json.loads(
+                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(saved["active_lockouts"]), {"alice"})
+            self.assertEqual(set(saved["locked_users"]), {"alice"})
+            self.assertEqual(len(saved["lockout_signals"]), 1)
+
+    def test_resume_preserves_stricter_legacy_lockout_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_cfg = self.make_config(tmp, ["alice"], lockout_burst=3)
+            first = spraygun.State(tmp, legacy_cfg)
+            first.close()
+
+            resumed_cfg = self.make_config(
+                tmp,
+                ["alice"],
+                lockout_burst=4,
+                resume=True,
+            )
+            resumed = spraygun.State(tmp, resumed_cfg)
+            self.assertEqual(resumed.cfg.lockout_burst, 3)
+
+    def test_default_display_filters_banner_noise_and_shows_exact_lockout_pair(self):
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        ui = spraygun.RichUI(console, live_ui=False, show_raw=False)
+        ui.start_spray(spraygun.Engine("kerbrute"), "Bad!", 1)
+        ui.feed_line("kerbrute giant ASCII banner")
+        ui.update_lockout("alice", "Bad!", "kerbrute", 1)
+
+        rendered = output.getvalue()
+        self.assertNotIn("ASCII banner", rendered)
+        self.assertIn("alice:Bad!", rendered)
+        self.assertIn("consecutive 1", rendered)
+
+    def test_streaming_lockout_pair_preserves_rich_markup_characters(self):
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        ui = spraygun.RichUI(console, live_ui=False, show_raw=False)
+        ui.start_spray(spraygun.Engine("kerbrute"), "Bad[red]!", 1)
+        ui.update_lockout("user[blue]", "Bad[red]!", "kerbrute", 1)
+
+        rendered = output.getvalue()
+        self.assertIn("user[blue]:Bad[red]!", rendered)
 
 
 class StateAndRunTests(unittest.TestCase):
@@ -843,7 +1145,12 @@ class StateAndRunTests(unittest.TestCase):
             height=40,
             color_system=None,
         )
-        ui = spraygun.RichUI(console, max_feed_lines=10, live_ui=False)
+        ui = spraygun.RichUI(
+            console,
+            max_feed_lines=10,
+            live_ui=False,
+            show_raw=True,
+        )
         ui.start_spray(spraygun.Engine("nxc", "smb"), "First!", 1)
         ui.raw_feed = [f"raw line {index}" for index in range(15)]
 
@@ -971,7 +1278,7 @@ class StateAndRunTests(unittest.TestCase):
             self.assertNotIn("DEMOTED", rendered)
             self.assertNotIn("cooldown 3r", rendered)
 
-    def test_cumulative_lockout_prompt_stops_before_next_secret(self):
+    def test_isolated_lockout_does_not_prompt_or_stop_next_secret(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = spraygun.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
@@ -993,15 +1300,16 @@ class StateAndRunTests(unittest.TestCase):
             console = Console(file=io.StringIO(), force_terminal=False)
             with patch.object(spraygun, "spray_one_password", side_effect=lock_first) as spray, \
                     patch.object(spraygun, "setup_signal_handler"), \
-                    patch.object(spraygun, "prompt_continue", return_value=False):
+                    patch.object(spraygun, "prompt_continue", return_value=False) as prompt:
                 spraygun.run(cfg, console)
 
-            self.assertEqual(spray.call_count, 1)
+            self.assertEqual(spray.call_count, 2)
+            prompt.assert_not_called()
             data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
-            self.assertEqual(data["used_passwords"], ["First!"])
-            self.assertEqual(data["completed_batches"], 0)
+            self.assertEqual(data["used_passwords"], ["First!", "Second!"])
+            self.assertEqual(data["completed_batches"], 1)
 
-    def test_immediate_lockout_pause_retries_same_secret_without_failover(self):
+    def test_isolated_lockout_result_completes_without_prompt_or_failover(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = spraygun.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
@@ -1012,36 +1320,32 @@ class StateAndRunTests(unittest.TestCase):
                 lockout_threshold=1, lockout_burst=5,
             )
 
-            def pause_then_finish(_engine, _cfg, _secret, _ui, state, _realm=None):
-                if state.lockout_count == 0:
-                    state.add_lockout("alice", secret=_secret)
-                    return spraygun.RoundResult(
-                        lockouts={"alice"},
-                        aborted=True,
-                        abort_reason="lockout-threshold",
-                    )
+            def quarantine_then_finish(_engine, _cfg, _secret, _ui, state, _realm=None):
+                state.add_lockout("alice", secret=_secret)
                 state.mark_attempted(_secret, "bob", status="dry_run")
                 return spraygun.RoundResult(
+                    lockouts={"alice"},
                     clean_finish=True,
                     reconciled_complete=True,
                 )
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "spray_one_password", side_effect=pause_then_finish) as spray, \
+            with patch.object(spraygun, "spray_one_password", side_effect=quarantine_then_finish) as spray, \
                     patch.object(spraygun, "setup_signal_handler"), \
-                    patch.object(spraygun, "prompt_continue", return_value=True):
+                    patch.object(spraygun, "prompt_continue", return_value=True) as prompt:
                 spraygun.run(cfg, console)
 
-            self.assertEqual(spray.call_count, 2)
+            self.assertEqual(spray.call_count, 1)
             self.assertEqual(
                 [str(call.args[0]) for call in spray.call_args_list],
-                ["nxc:smb", "nxc:smb"],
+                ["nxc:smb"],
             )
+            prompt.assert_not_called()
             data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(data["used_passwords"], ["First!"])
-            self.assertEqual(data["acknowledged_lockouts"], 1)
+            self.assertEqual(set(data["active_lockouts"]), {"alice"})
 
-    def test_acknowledging_prompts_cannot_bypass_per_spray_maximum(self):
+    def test_consecutive_lockout_pause_never_uses_an_operator_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             users = ["alice", "bob", "carol", "dave"]
             cfg = spraygun.Config(
@@ -1052,28 +1356,25 @@ class StateAndRunTests(unittest.TestCase):
                 passwords_per_round=1, realm_retry=False,
                 lockout_threshold=1, lockout_burst=3,
             )
-            next_user = iter(users)
-
-            def report_lockout(_engine, _cfg, _secret, _ui, state, _realm=None):
-                user = next(next_user)
-                state.add_lockout(user, secret=_secret)
+            def report_streak(_engine, _cfg, _secret, _ui, state, _realm=None):
+                for user in users:
+                    state.add_lockout(user, secret=_secret)
                 return spraygun.RoundResult(
-                    lockouts={user},
+                    lockouts=set(users),
                     aborted=True,
-                    abort_reason="lockout-threshold",
+                    abort_reason="consecutive-lockouts",
                 )
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "spray_one_password", side_effect=report_lockout) as spray, \
+            with patch.object(spraygun, "spray_one_password", side_effect=report_streak) as spray, \
                     patch.object(spraygun, "setup_signal_handler"), \
                     patch.object(spraygun, "prompt_continue", return_value=True) as prompt:
                 spraygun.run(cfg, console)
 
-            self.assertEqual(spray.call_count, 4)
-            self.assertEqual(prompt.call_count, 3)
+            self.assertEqual(spray.call_count, 1)
+            prompt.assert_not_called()
             data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(set(data["locked_users"]), set(users))
-            self.assertEqual(data["acknowledged_lockouts"], 3)
             self.assertEqual(data["used_passwords"], [])
 
     def test_per_pass_ceiling_does_not_combine_signals_across_a_batch(self):
@@ -1389,12 +1690,12 @@ class AdversarialSafetyTests(unittest.TestCase):
                 )
 
             self.assertTrue(result.aborted)
-            self.assertEqual(result.abort_reason, "lockout-burst")
+            self.assertEqual(result.abort_reason, "consecutive-lockouts")
             self.assertEqual(popen.call_count, 4)
             self.assertEqual(state.lockout_count, 4)
             self.assertEqual(state.eligible_users_for("One!"), ["erin"])
 
-    def test_resume_cannot_bypass_a_secret_hard_stop(self):
+    def test_resume_skips_quarantined_users_and_can_continue(self):
         users = ["alice", "bob", "carol", "dave", "erin"]
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, users=users, passwords=["One!"], lockout_burst=3)
@@ -1411,7 +1712,14 @@ class AdversarialSafetyTests(unittest.TestCase):
                 resume=True,
             )
             resumed = spraygun.State(tmp, resumed_cfg)
-            with patch.object(spraygun.subprocess, "Popen") as popen:
+            erin_failure = fake_process([
+                "LDAP 127.0.0.1 389 DC [-] LAB\\erin:One! STATUS_LOGON_FAILURE\n"
+            ])
+            with patch.object(
+                spraygun.subprocess,
+                "Popen",
+                return_value=erin_failure,
+            ) as popen:
                 result = spraygun.spray_one_password(
                     spraygun.Engine("nxc", "ldap"),
                     resumed_cfg,
@@ -1419,8 +1727,10 @@ class AdversarialSafetyTests(unittest.TestCase):
                     QuietUI(),
                     resumed,
                 )
-            self.assertEqual(result.abort_reason, "lockout-burst")
-            popen.assert_not_called()
+            self.assertFalse(result.aborted)
+            self.assertTrue(result.clean_finish)
+            popen.assert_called_once()
+            self.assertEqual(resumed.pair_status("One!", "erin"), "auth_failure")
 
     def test_resume_preserves_the_interrupted_batch_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
