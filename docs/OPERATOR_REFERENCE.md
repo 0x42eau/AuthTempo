@@ -79,7 +79,7 @@ Run `authtempo --advanced-help` for the authoritative list.
 | `--schedule HH:MM-HH:MM` | Use a custom local-time window, including overnight windows |
 | `--stream` | Always use line-by-line output |
 | `--dashboard` | Force the cursor-based dashboard, including inside tmux |
-| `--raw-lines N` | Raw-output lines retained by the dashboard; default `50` |
+| `--raw-lines N` | Recent raw-output lines shown in the compact dashboard; default `10` |
 | `--nxc-path PATH` | Use a specific NetExec executable |
 | `--kerbrute-path PATH` | Use a specific Kerbrute executable |
 | `--skip-target-check` | Skip the DC/domain preflight check; not recommended |
@@ -113,6 +113,8 @@ State is written atomically. `--resume` checks the schema, target, input fingerp
 
 Statistics separate authentication attempts sent from unique identity/password pairs. Pair outcomes are reported as valid, failed, safety-related, uncertain, or simulated, so a retry cannot make the outcome totals appear inconsistent.
 
+`results.csv` contains one row for every recorded identity/password pair rather than only successful credentials. Its `password_pass` and `batch` columns make the execution order explicit, while `status`, `dispatches`, and timestamps expose failures and retries. The HTML report summarizes the same ledger by password pass and retains a compact event timeline.
+
 A fully completed run exits `0`. A conservative stop with queued work exits `2`, including a lockout hard-stop, failed target check, or enumeration safety signal. Configuration and fatal runtime errors exit `1`.
 
 ## Input files
@@ -123,4 +125,4 @@ Password whitespace is significant. A password line beginning with `#` is a comm
 
 ## Sensitive output
 
-Credentials stay visible at the top of the dashboard and are printed immediately in streaming mode. `creds.txt`, `password-change-required.txt`, and the audit log contain sensitive material. NetExec receives each candidate through a private one-line file. Kerbrute requires the candidate in its process arguments, so privileged local process inspection may observe it while the child is running.
+Credentials stay visible at the top of the dashboard and are printed immediately in streaming mode. `creds.txt`, `password-change-required.txt`, the reports, and the audit log contain sensitive material. NetExec receives each candidate through a private one-line file. Kerbrute requires the candidate in its process arguments, so privileged local process inspection may observe it while the child is running.

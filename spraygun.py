@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover - AuthTempo currently targets Unix-like 
 
 # Rich library for live terminal UI
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
     from rich.table import Table
@@ -99,7 +99,7 @@ class Config:
     export: str = "none"
     schedule: str = ""
     timeline: bool = False
-    feed_lines: int = 50  # Number of lines in raw feed (default 50, was 20)
+    feed_lines: int = 10  # Recent raw-output lines shown in the compact dashboard.
     engine_cooldown_rounds: int = 3
     engine_transient_threshold: int = 2
     realm_retry: bool = True
@@ -484,7 +484,7 @@ class RichUI:
     def __init__(
         self,
         console: Console,
-        max_feed_lines: int = 50,
+        max_feed_lines: int = 10,
         live_ui: bool = True,
         force_live: bool = False,
     ):
@@ -771,30 +771,45 @@ class RichUI:
             )
 
     def _summary_height(self) -> int:
-        """Reserve enough pane space for both the summary and raw feed."""
+        """Estimate compact summary height when limiting the raw feed."""
         terminal_height = max(int(getattr(self.console, "height", 24) or 24), 8)
-        detail_rows = min(3, len(self.run_successes)) + min(2, len(self.round_lockouts))
-        desired = 8 + detail_rows
-        # Fixed size=12 consumed the whole content area in a short tmux pane.
-        # Always leave at least seven terminal rows for the raw-feed panel.
-        return max(5, min(desired, terminal_height - 7))
+        detail_rows = min(2, len(self.run_successes)) + min(1, len(self.round_lockouts))
+        error_rows = min(2, len(self.phase_data.get("errors", [])))
+        desired = 5 + detail_rows + error_rows
+        return max(5, min(desired, terminal_height - 5))
+
+    def _feed_row_limit(self) -> int:
+        """Return the number of recent raw lines that fit without taking the screen."""
+        terminal_height = max(int(getattr(self.console, "height", 24) or 24), 8)
+        available = max(1, terminal_height - self._summary_height() - 6)
+        return min(self.max_feed_lines, available)
 
     def _render_spray(self) -> Panel:
-        """Render spray-phase panel."""
+        """Render a content-sized spray dashboard instead of a full-screen layout."""
         summary = self._build_summary()
         feed = self._build_feed()
-        layout = Layout()
-        layout.split_column(
-            Layout(summary, size=self._summary_height()),
-            Layout(Panel(feed, title="Raw Feed", border_style="dim", box=box.SQUARE)),
+        recent_output = Panel(
+            feed,
+            title=(
+                "Recent tool output — newest first "
+                f"(up to {self._feed_row_limit()} lines)"
+            ),
+            border_style="dim",
+            box=box.SQUARE,
         )
-        return Panel(layout, title=f"[bold]{PRODUCT_NAME} — Batch {self.phase_data.get('batch', '?')}[/bold]", border_style="blue")
+        return Panel(
+            Group(summary, recent_output),
+            title=(
+                f"[bold]{PRODUCT_NAME} — Batch "
+                f"{self.phase_data.get('batch', '?')}[/bold]"
+            ),
+            border_style="blue",
+        )
 
     def _build_summary(self) -> Panel:
         """Build the summary panel."""
         engine = self.phase_data.get("engine", "N/A")
         secret = self.phase_data.get("secret", "***")
-        batch_info = self.phase_data.get("batch_info", "")
         errors = self.phase_data.get("errors", [])
         conn_fails = self.phase_data.get("conn_fails", 0)
         abort_reason = self.phase_data.get("abort_reason", "")
@@ -809,7 +824,7 @@ class RichUI:
             "[green bold]Credentials (batch / total):",
             f"[green bold]{len(self.round_successes)} / {len(self.run_successes)}[/green bold]",
         )
-        for user, found_secret in self.run_successes[-3:]:
+        for user, found_secret in self.run_successes[-2:]:
             pair = (user, found_secret)
             if pair in self.run_admins:
                 marker = "[red bold]★ ADMIN[/red bold]"
@@ -823,33 +838,28 @@ class RichUI:
             )
 
         grid.add_row(
-            "[yellow]Safety signals (batch / total):",
-            f"{self.round_signal_events} / {self.run_signal_events}",
+            "[yellow]Safety / affected (batch · total):",
+            (
+                f"{self.round_signal_events} · {self.run_signal_events} / "
+                f"{len(self.round_lockouts)} · {len(self.run_lockouts)}"
+            ),
         )
-        grid.add_row(
-            "[yellow]Affected identities (batch / total):",
-            f"{len(self.round_lockouts)} / {len(self.run_lockouts)}",
-        )
-        for user in sorted(self.round_lockouts)[-2:]:
-            grid.add_row("", f"[yellow]![white] {escape(str(user))}")
+        for user in sorted(self.round_lockouts)[-1:]:
+            grid.add_row("", f"[yellow]! latest: [white]{escape(str(user))}")
         if self.round_unknown_lockouts:
             grid.add_row("", f"[yellow]! {self.round_unknown_lockouts} unknown user(s)[/yellow]")
 
         grid.add_row("[cyan]Engine / current password:", f"{escape(str(engine))} / [yellow]{escape(str(secret))}[/yellow]")
 
-        # Batch detail is useful in normal terminals but deliberately comes
-        # after credentials and safety counters so short tmux panes crop it first.
-        if batch_info:
-            grid.add_row("[cyan]Batch:", escape(str(batch_info)))
-
         # Show errors
         if errors:
             grid.add_row("[red bold]ERRORS:", str(len(errors)))
-            for err in errors[-3:]:  # Show last 3 errors
+            for err in errors[-2:]:
                 err_short = err[:60] + "..." if len(err) > 60 else err
                 grid.add_row("", f"  [red]✗[white] {escape(str(err_short))}")
 
-        grid.add_row("[red]Connection failures:", str(conn_fails))
+        if conn_fails:
+            grid.add_row("[red]Connection failures:", str(conn_fails))
         if abort_reason:
             grid.add_row("[red]Aborted:", escape(str(abort_reason)))
 
@@ -859,10 +869,9 @@ class RichUI:
         """Build the raw feed text."""
         if not self.raw_feed:
             return "[dim]Waiting for tool output...[/dim]"
-        # Keep recent lines at the top. Limit content to the actual pane height
-        # so Rich doesn't spend time rendering lines that tmux will crop.
-        available_rows = max(1, int(getattr(self.console, "height", 24)) - self._summary_height() - 5)
-        lines_rev = self.raw_feed[-min(self.max_feed_lines, available_rows):][::-1]
+        # Keep recent lines at the top and cap the visible panel independently
+        # of terminal height. The complete unabridged output remains in the log.
+        lines_rev = self.raw_feed[-self._feed_row_limit():][::-1]
         # Colorize: red/bold for pwn3d/admin, green for [+] success, yellow for lockout keywords, red for error keywords
         colored = []
         for line in lines_rev:
@@ -2857,6 +2866,108 @@ class State:
         elif fmt == "csv":
             self._export_csv()
 
+    def pair_results(self) -> List[Dict[str, Any]]:
+        """Return one deterministic report row for every recorded credential pair."""
+        findings = {
+            (canonical_identity(str(item["user"]), self.cfg.domain), str(item["secret"])): item
+            for item in self.credentials
+        }
+        rows: List[Dict[str, Any]] = []
+        emitted: Set[Tuple[str, str]] = set()
+
+        for secret in self.cfg.passwords:
+            ledger = self.pair_ledger.get(secret, {})
+            for configured_user in self.cfg.users:
+                key = canonical_identity(configured_user, self.cfg.domain)
+                record = ledger.get(key)
+                if record is None:
+                    continue
+                finding = findings.get((key, secret))
+                status = str(record.get("status", "indeterminate"))
+                credential_state = ""
+                if finding is not None:
+                    credential_state = str(
+                        finding.get("credential_state", "valid")
+                    )
+                elif status in PASSWORD_CHANGE_PAIR_STATUSES:
+                    credential_state = status
+                elif status in SUCCESS_PAIR_STATUSES:
+                    credential_state = "valid"
+                is_admin = bool(
+                    (finding and finding.get("is_admin"))
+                    or status == "admin_success"
+                )
+                rows.append({
+                    "user": str(record.get("user") or configured_user),
+                    "secret": secret,
+                    "status": status,
+                    "is_admin": is_admin,
+                    "credential_state": credential_state,
+                    "source_pass": record.get("source_pass") or "",
+                    "source_batch": record.get("source_batch") or "",
+                    "engine": str(record.get("engine", "")),
+                    "protocol": str(record.get("protocol", "")),
+                    "dispatch_count": int(record.get("dispatch_count", 0)),
+                    "started_at": str(record.get("started_at", "")),
+                    "completed_at": str(record.get("updated_at", "")),
+                    "detail": str(record.get("detail", "")),
+                    "password_change_command": (
+                        self.password_change_command(finding)
+                        if finding is not None
+                        and credential_state in PASSWORD_CHANGE_PAIR_STATUSES
+                        else ""
+                    ),
+                })
+                emitted.add((key, secret))
+
+        # Direct API consumers can add a finding without constructing a ledger
+        # entry. Preserve that finding in reports while clearly leaving its
+        # dispatch-specific fields empty.
+        for finding in self.credentials:
+            user = str(finding["user"])
+            secret = str(finding["secret"])
+            key = canonical_identity(user, self.cfg.domain)
+            if (key, secret) in emitted:
+                continue
+            credential_state = str(finding.get("credential_state", "valid"))
+            is_admin = bool(finding.get("is_admin"))
+            engine = str(finding.get("engine", ""))
+            protocol = engine.split(":", 1)[1] if ":" in engine else ""
+            rows.append({
+                "user": user,
+                "secret": secret,
+                "status": (
+                    credential_state
+                    if credential_state in PASSWORD_CHANGE_PAIR_STATUSES
+                    else "admin_success" if is_admin else "success"
+                ),
+                "is_admin": is_admin,
+                "credential_state": credential_state,
+                "source_pass": (
+                    finding.get("source_pass")
+                    or finding.get("source_round")
+                    or ""
+                ),
+                "source_batch": (
+                    finding.get("source_batch")
+                    or finding.get("source_round")
+                    or ""
+                ),
+                "engine": engine,
+                "protocol": protocol,
+                "dispatch_count": "",
+                "started_at": "",
+                "completed_at": str(finding.get("captured_at", "")),
+                "detail": "finding recorded without a pair-ledger entry",
+                "password_change_command": (
+                    self.password_change_command(finding)
+                    if credential_state in PASSWORD_CHANGE_PAIR_STATUSES
+                    else ""
+                ),
+            })
+
+        return rows
+
     def _export_json(self):
         """Export results to results.json."""
         self.reconcile_ledger_metrics()
@@ -2902,6 +3013,7 @@ class State:
             },
             "found_creds": self.found_creds,
             "credentials": exported_credentials,
+            "pair_results": self.pair_results(),
             "cred_reuse": [{"password": pw, "users": users} for pw, users in self.detect_cred_reuse()],
             "admin_users": self.admin_users,
             "locked_users": list(self.locked_users),
@@ -2912,7 +3024,7 @@ class State:
         self._atomic_write_text(json_path, json.dumps(results, indent=2) + "\n")
 
     def _export_csv(self):
-        """Export credentials to results.csv."""
+        """Export every final pair outcome to results.csv."""
         def safe_cell(value: Any) -> Any:
             if not isinstance(value, str):
                 return value
@@ -2929,31 +3041,37 @@ class State:
         writer.writerow([
             "user",
             "password",
+            "status",
             "is_admin",
-            "source_pass",
-            "source_batch",
-            "engine",
-            "captured_at",
             "credential_state",
+            "password_pass",
+            "batch",
+            "engine",
+            "protocol",
+            "dispatches",
+            "started_at",
+            "completed_at",
+            "detail",
             "password_change_command",
         ])
 
-        for item in self.credentials:
+        for item in self.pair_results():
             is_admin = "Y" if item.get("is_admin") else "N"
             writer.writerow([
                 safe_cell(item["user"]),
                 safe_cell(item["secret"]),
+                safe_cell(item.get("status", "")),
                 is_admin,
-                item.get("source_pass") or item.get("source_round") or "",
-                item.get("source_batch") or item.get("source_round") or "",
+                safe_cell(item.get("credential_state", "")),
+                item.get("source_pass", ""),
+                item.get("source_batch", ""),
                 safe_cell(item.get("engine", "")),
-                item.get("captured_at", ""),
-                item.get("credential_state", "valid"),
-                safe_cell(
-                    self.password_change_command(item)
-                    if item.get("credential_state") in PASSWORD_CHANGE_PAIR_STATUSES
-                    else ""
-                ),
+                safe_cell(item.get("protocol", "")),
+                item.get("dispatch_count", ""),
+                item.get("started_at", ""),
+                item.get("completed_at", ""),
+                safe_cell(item.get("detail", "")),
+                safe_cell(item.get("password_change_command", "")),
             ])
 
         csv_path = self.log_dir / "results.csv"
@@ -3117,68 +3235,267 @@ class State:
         return None
 
     def render_timeline_html(self) -> str:
-        """Generate self-contained HTML timeline visualization."""
+        """Generate a compact self-contained run report and event timeline."""
+        self.reconcile_ledger_metrics()
         events = self.timeline_events
+        status_counts = self.pair_status_counts()
+        pair_rows = self.pair_results()
 
-        # Color scheme for event types
         colors = {
-            "batch_start": "#3498db",      # blue
-            "spray": "#9b59b6",            # purple
-            "credential": "#27ae60",       # green
-            "password_change_required": "#d16ee0",  # magenta
-            "lockout": "#e67e22",          # orange
-            "reprioritize": "#f39c12",     # yellow
-            "throttle": "#e74c3c",         # red
-            "schedule_wait": "#1abc9c",    # teal
-            "batch_end": "#95a5a6",        # gray
-            "complete": "#2ecc71",         # bright green
+            "batch_start": "#3498db",
+            "spray": "#9b59b6",
+            "pass_complete": "#5dade2",
+            "credential": "#27ae60",
+            "password_change_required": "#d16ee0",
+            "lockout": "#e67e22",
+            "reprioritize": "#f39c12",
+            "throttle": "#e74c3c",
+            "schedule_wait": "#1abc9c",
+            "batch_end": "#95a5a6",
+            "complete": "#2ecc71",
         }
+
+        def parse_timestamp(value: Any) -> Optional[datetime.datetime]:
+            if not value:
+                return None
+            try:
+                return datetime.datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+
+        def duration_text(start_value: Any, end_value: Any) -> str:
+            start = parse_timestamp(start_value)
+            end = parse_timestamp(end_value)
+            if start is None or end is None or end < start:
+                return "—"
+            seconds = (end - start).total_seconds()
+            if seconds < 60:
+                return f"{seconds:.1f}s"
+            minutes, remaining = divmod(seconds, 60)
+            if minutes < 60:
+                return f"{int(minutes)}m {remaining:.0f}s"
+            hours, minutes = divmod(minutes, 60)
+            return f"{int(hours)}h {int(minutes)}m"
+
+        end_candidates = [
+            parse_timestamp(event.get("ts"))
+            for event in events
+        ] + [
+            parse_timestamp(row.get("completed_at"))
+            for row in pair_rows
+        ]
+        end_times = [value for value in end_candidates if value is not None]
+        run_end = max(end_times) if end_times else parse_timestamp(self.start_time)
+        run_duration = duration_text(self.start_time, run_end)
+
+        pass_rows: List[Dict[str, Any]] = []
+        for position, secret in enumerate(self.cfg.passwords, start=1):
+            records = list(self.pair_ledger.get(secret, {}).values())
+            if not records:
+                continue
+            pass_statuses: Dict[str, int] = {}
+            for record in records:
+                status = str(record.get("status", "indeterminate"))
+                pass_statuses[status] = pass_statuses.get(status, 0) + 1
+            source_passes = [
+                int(record["source_pass"])
+                for record in records
+                if isinstance(record.get("source_pass"), int)
+                and not isinstance(record.get("source_pass"), bool)
+            ]
+            source_batches = [
+                int(record["source_batch"])
+                for record in records
+                if isinstance(record.get("source_batch"), int)
+                and not isinstance(record.get("source_batch"), bool)
+            ]
+            engines = sorted({
+                str(record.get("engine", ""))
+                for record in records
+                if record.get("engine")
+            })
+            starts = sorted(
+                str(record.get("started_at"))
+                for record in records
+                if parse_timestamp(record.get("started_at")) is not None
+            )
+            ends = sorted(
+                str(record.get("updated_at"))
+                for record in records
+                if parse_timestamp(record.get("updated_at")) is not None
+            )
+            pass_rows.append({
+                "pass": min(source_passes) if source_passes else position,
+                "batch": min(source_batches) if source_batches else "—",
+                "engine": ", ".join(engines) if engines else "—",
+                "dispatches": sum(
+                    max(0, int(record.get("dispatch_count", 0)))
+                    for record in records
+                ),
+                "pairs": len(records),
+                "valid": sum(
+                    pass_statuses.get(status, 0)
+                    for status in SUCCESS_PAIR_STATUSES
+                ),
+                "failed": pass_statuses.get("auth_failure", 0),
+                "safety": (
+                    pass_statuses.get("lockout", 0)
+                    + pass_statuses.get("ambiguous_lockout", 0)
+                ),
+                "uncertain": (
+                    pass_statuses.get("indeterminate", 0)
+                    + pass_statuses.get("in_flight", 0)
+                ),
+                "simulated": pass_statuses.get("dry_run", 0),
+                "duration": duration_text(
+                    starts[0] if starts else None,
+                    ends[-1] if ends else None,
+                ),
+            })
 
         html_parts = ["<!DOCTYPE html><html><head>"]
         html_parts.append("<meta charset='UTF-8'>")
+        html_parts.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
         html_parts.append(f"<title>{PRODUCT_NAME} Timeline</title>")
         html_parts.append("<style>")
-        html_parts.append("body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 0; padding: 20px; background: #1e1e1e; color: #d4d4d4; }")
-        html_parts.append(".container { max-width: 1200px; margin: 0 auto; }")
-        html_parts.append("h1 { color: #4ec9b0; border-bottom: 2px solid #4ec9b0; padding-bottom: 10px; }")
-        html_parts.append(".event { margin: 10px 0; padding: 12px; border-left: 4px solid #666; background: #2d2d2d; border-radius: 4px; }")
+        html_parts.append(":root { color-scheme: dark; --bg:#171717; --panel:#242424; --panel2:#2d2d2d; --text:#d8d8d8; --muted:#969696; --accent:#4ec9b0; --line:#3b3b3b; }")
+        html_parts.append("* { box-sizing: border-box; }")
+        html_parts.append("body { font-family: Inter, 'Segoe UI', sans-serif; margin:0; padding:24px; background:var(--bg); color:var(--text); }")
+        html_parts.append(".container { max-width:1180px; margin:0 auto; }")
+        html_parts.append("h1 { color:var(--accent); margin:0; font-size:1.8rem; }")
+        html_parts.append("h2 { margin:28px 0 10px; font-size:1.05rem; color:#eee; }")
+        html_parts.append(".meta { color:var(--muted); margin:7px 0 18px; font-size:.9rem; }")
+        html_parts.append(".cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); gap:9px; }")
+        html_parts.append(".card { background:var(--panel); border:1px solid #303030; border-radius:7px; padding:11px 12px; }")
+        html_parts.append(".card .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.04em; }")
+        html_parts.append(".card .value { margin-top:4px; font-size:1.35rem; font-weight:700; }")
+        html_parts.append(".good { color:#55d68b; } .warn { color:#f0b35a; } .bad { color:#ff7373; } .accent { color:var(--accent); }")
+        html_parts.append(".table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:7px; }")
+        html_parts.append("table { width:100%; border-collapse:collapse; background:var(--panel); font-size:.86rem; }")
+        html_parts.append("th,td { padding:9px 10px; text-align:left; border-bottom:1px solid var(--line); white-space:nowrap; }")
+        html_parts.append("th { color:#bcbcbc; background:#202020; font-size:.72rem; text-transform:uppercase; }")
+        html_parts.append("tr:last-child td { border-bottom:0; }")
+        html_parts.append(".badge { display:inline-block; padding:2px 6px; border-radius:4px; font-size:.68rem; font-weight:700; text-transform:uppercase; color:#fff; }")
+        html_parts.append(".events { border:1px solid var(--line); border-radius:7px; overflow:hidden; }")
+        html_parts.append(".event { display:grid; grid-template-columns:155px 120px 1fr; gap:10px; align-items:center; padding:8px 10px; border-bottom:1px solid var(--line); background:var(--panel); border-left:4px solid #666; }")
+        html_parts.append(".event:last-child { border-bottom:0; }")
         for etype, color in colors.items():
             html_parts.append(f".event-{etype} {{ border-left-color: {color}; }}")
-        html_parts.append(".ts { color: #888; font-size: 0.85em; }")
-        html_parts.append(".type { font-weight: bold; text-transform: uppercase; font-size: 0.75em; padding: 2px 6px; border-radius: 3px; margin-right: 8px; }")
-        html_parts.append(".detail { color: #aaa; font-size: 0.9em; margin-left: 8px; }")
-        html_parts.append(".batch-tag { background: #444; padding: 2px 6px; border-radius: 3px; font-size: 0.75em; margin-left: 8px; }")
-        html_parts.append(".summary { background: #252525; padding: 15px; border-radius: 5px; margin: 20px 0; }")
-        html_parts.append(".summary h2 { margin-top: 0; color: #4ec9b0; }")
+        html_parts.append(".ts { color:var(--muted); font-size:.75rem; font-variant-numeric:tabular-nums; }")
+        html_parts.append(".event-detail { color:#bdbdbd; font-size:.82rem; min-width:0; overflow-wrap:anywhere; }")
+        html_parts.append(".batch-tag { color:#aaa; margin-right:8px; }")
+        html_parts.append(".empty { padding:16px; color:var(--muted); background:var(--panel); border-radius:7px; }")
+        html_parts.append("@media(max-width:700px){body{padding:14px}.event{grid-template-columns:1fr;gap:4px}.cards{grid-template-columns:repeat(2,1fr)}}")
         html_parts.append("</style></head><body>")
 
         html_parts.append("<div class='container'>")
-        html_parts.append(f"<h1>{PRODUCT_NAME} Timeline</h1>")
+        html_parts.append(f"<h1>{PRODUCT_NAME} Run Report</h1>")
+        html_parts.append(
+            "<div class='meta'>"
+            f"{html.escape(self.cfg.domain)} → {html.escape(self.cfg.dc_ip)} · "
+            f"Started {html.escape(self.start_time.replace('T', ' '))} · "
+            f"Duration {html.escape(run_duration)} · {len(events)} timeline events"
+            "</div>"
+        )
 
-        # Summary section
-        html_parts.append("<div class='summary'>")
-        html_parts.append("<h2>Summary</h2>")
-        html_parts.append(f"<p>Started: {html.escape(self.start_time)}</p>")
-        html_parts.append(f"<p>Total events: {len(events)}</p>")
-        html_parts.append(f"<p>Credentials found: {self.credential_count}</p>")
-        html_parts.append(f"<p>Lockout signals: {self.lockout_count}</p>")
-        html_parts.append(f"<p>Batches completed: {self.completed_rounds}</p>")
+        uncertain_pairs = (
+            status_counts.get("indeterminate", 0)
+            + status_counts.get("in_flight", 0)
+        )
+        cards = [
+            ("Attempts sent", self.total_dispatches, "accent"),
+            ("Unique pairs", self.credential_pair_count(), ""),
+            ("Valid", self.successful_pair_count(), "good"),
+            ("Failed", status_counts.get("auth_failure", 0), ""),
+            ("Safety signals", self.lockout_count, "warn" if self.lockout_count else ""),
+            ("Uncertain", uncertain_pairs, "bad" if uncertain_pairs else ""),
+            ("Skipped", self.skipped_pair_count(), ""),
+            ("Batches", self.completed_rounds, ""),
+        ]
+        html_parts.append("<div class='cards'>")
+        for label, value, css_class in cards:
+            html_parts.append(
+                "<div class='card'>"
+                f"<div class='label'>{html.escape(str(label))}</div>"
+                f"<div class='value {css_class}'>{html.escape(str(value))}</div>"
+                "</div>"
+            )
         html_parts.append("</div>")
 
-        # Events list
-        html_parts.append("<h2>Event Timeline</h2>")
+        html_parts.append("<h2>Password-pass activity</h2>")
+        if pass_rows:
+            html_parts.append("<div class='table-wrap'><table><thead><tr>")
+            for heading in (
+                "Pass", "Batch", "Tool", "Sent", "Pairs", "Valid",
+                "Failed", "Safety", "Uncertain", "Simulated", "Duration",
+            ):
+                html_parts.append(f"<th>{heading}</th>")
+            html_parts.append("</tr></thead><tbody>")
+            for row in pass_rows:
+                html_parts.append("<tr>")
+                for key in (
+                    "pass", "batch", "engine", "dispatches", "pairs", "valid",
+                    "failed", "safety", "uncertain", "simulated", "duration",
+                ):
+                    css_class = ""
+                    if key == "valid" and row[key]:
+                        css_class = " class='good'"
+                    elif key in {"safety", "uncertain"} and row[key]:
+                        css_class = " class='warn'"
+                    html_parts.append(
+                        f"<td{css_class}>{html.escape(str(row[key]))}</td>"
+                    )
+                html_parts.append("</tr>")
+            html_parts.append("</tbody></table></div>")
+        else:
+            html_parts.append("<div class='empty'>No password-pass activity recorded.</div>")
+
+        html_parts.append("<h2>Credential findings</h2>")
+        if self.credentials:
+            html_parts.append("<div class='table-wrap'><table><thead><tr>")
+            for heading in ("User", "State", "Admin", "Tool", "Pass", "Captured"):
+                html_parts.append(f"<th>{heading}</th>")
+            html_parts.append("</tr></thead><tbody>")
+            for finding in self.credentials:
+                state_label = credential_state_label(
+                    str(finding.get("credential_state", "valid"))
+                )
+                html_parts.append(
+                    "<tr>"
+                    f"<td class='good'>{html.escape(str(finding['user']))}</td>"
+                    f"<td>{html.escape(state_label)}</td>"
+                    f"<td>{'Yes' if finding.get('is_admin') else 'No'}</td>"
+                    f"<td>{html.escape(str(finding.get('engine') or '—'))}</td>"
+                    f"<td>{html.escape(str(finding.get('source_pass') or '—'))}</td>"
+                    f"<td>{html.escape(str(finding.get('captured_at') or '—').replace('T', ' '))}</td>"
+                    "</tr>"
+                )
+            html_parts.append("</tbody></table></div>")
+        else:
+            html_parts.append("<div class='empty'>No valid credentials recorded.</div>")
+
+        html_parts.append("<h2>Event timeline</h2>")
+        html_parts.append("<div class='events'>")
         for ev in events:
             etype = ev.get("type", "unknown")
             color = colors.get(etype, "#666")
             safe_type = html.escape(str(etype), quote=True)
             html_parts.append(f"<div class='event event-{safe_type}'>")
-            html_parts.append(f"<div class='ts'>{html.escape(str(ev['ts']))}</div>")
-            html_parts.append(f"<span class='type' style='background: {color}'>{safe_type}</span>")
+            display_ts = str(ev.get("ts", "")).replace("T", " ").split(".", 1)[0]
+            html_parts.append(f"<div class='ts'>{html.escape(display_ts)}</div>")
+            html_parts.append(f"<div><span class='badge' style='background:{color}'>{safe_type}</span></div>")
+            detail_parts = []
             if ev.get("batch"):
-                html_parts.append(f"<span class='batch-tag'>Batch {html.escape(str(ev['batch']))}</span>")
+                detail_parts.append(
+                    f"<span class='batch-tag'>Batch {html.escape(str(ev['batch']))}</span>"
+                )
             if ev.get("detail"):
-                html_parts.append(f"<span class='detail'>{html.escape(str(ev['detail']))}</span>")
+                detail_parts.append(html.escape(str(ev["detail"])))
+            html_parts.append(
+                f"<div class='event-detail'>{' '.join(detail_parts) or '—'}</div>"
+            )
             html_parts.append("</div>")
+        html_parts.append("</div>")
 
         html_parts.append("</div></body></html>")
         return "\n".join(html_parts)
@@ -5300,6 +5617,37 @@ def run(cfg: Config, console: Console) -> bool:
             if safety_stop or operator_stop:
                 break
 
+            pass_records = list(state.pair_ledger.get(secret, {}).values())
+            pass_statuses: Dict[str, int] = {}
+            for record in pass_records:
+                status = str(record.get("status", "indeterminate"))
+                pass_statuses[status] = pass_statuses.get(status, 0) + 1
+            pass_dispatches = sum(
+                max(0, int(record.get("dispatch_count", 0)))
+                for record in pass_records
+            )
+            pass_valid = sum(
+                pass_statuses.get(status, 0)
+                for status in SUCCESS_PAIR_STATUSES
+            )
+            pass_failed = pass_statuses.get("auth_failure", 0)
+            pass_safety = (
+                pass_statuses.get("lockout", 0)
+                + pass_statuses.get("ambiguous_lockout", 0)
+            )
+            pass_uncertain = (
+                pass_statuses.get("indeterminate", 0)
+                + pass_statuses.get("in_flight", 0)
+            )
+            state.record_timeline_event(
+                "pass_complete",
+                (
+                    f"pass {state.current_pass}: {pass_dispatches} sent, "
+                    f"{pass_valid} valid, {pass_failed} failed, "
+                    f"{pass_safety} safety, {pass_uncertain} uncertain"
+                ),
+                round_idx=round_idx + 1,
+            )
             state.mark_used(secret)
             processed_secrets.append(secret)
 
@@ -5783,8 +6131,8 @@ For authorized penetration testing only.
         metavar="N",
         dest="feed_lines",
         type=int,
-        default=50,
-        help=advanced_help or "Lines retained in the dashboard raw-output panel (default: 50)",
+        default=10,
+        help=advanced_help or "Recent raw-output lines shown in the compact dashboard (default: 10)",
     )
     advanced_run.add_argument("--nxc-path", help=advanced_help or "Use this nxc/netexec executable")
     advanced_run.add_argument("--kerbrute-path", help=advanced_help or "Use this Kerbrute executable")

@@ -832,8 +832,29 @@ class StateAndRunTests(unittest.TestCase):
         with console.capture() as capture:
             console.print(ui._build_summary())
         rendered = capture.get()
-        self.assertIn("1 / 4", rendered)
-        self.assertIn("1 / 2", rendered)
+        self.assertIn("Safety / affected", rendered)
+        self.assertIn("1 · 4 / 1 · 2", rendered)
+
+    def test_live_dashboard_is_content_sized_and_caps_recent_output(self):
+        console = Console(
+            file=io.StringIO(),
+            force_terminal=True,
+            width=100,
+            height=40,
+            color_system=None,
+        )
+        ui = spraygun.RichUI(console, max_feed_lines=10, live_ui=False)
+        ui.start_spray(spraygun.Engine("nxc", "smb"), "First!", 1)
+        ui.raw_feed = [f"raw line {index}" for index in range(15)]
+
+        with console.capture() as capture:
+            console.print(ui._render_spray())
+        rendered = capture.get()
+
+        self.assertIn("raw line 14", rendered)
+        self.assertIn("raw line 5", rendered)
+        self.assertNotIn("raw line 4", rendered)
+        self.assertLess(len(rendered.splitlines()), console.height)
 
     def test_new_demotion_keeps_its_full_configured_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1162,6 +1183,7 @@ class StateAndRunTests(unittest.TestCase):
             self.assertFalse(cfg.live_ui)
             self.assertEqual(cfg.passwords_per_round, 1)
             self.assertEqual(cfg.lockout_burst, 6)
+            self.assertEqual(cfg.feed_lines, 10)
 
     def test_compact_help_uses_operator_language_and_hides_tuning(self):
         compact = spraygun.build_argument_parser("authtempo").format_help()
@@ -1998,15 +2020,79 @@ class AdversarialSafetyTests(unittest.TestCase):
             state.current_round = 7
             state.add_cred("=cmd", "+payload", engine="nxc:ldap")
             state.add_cred("safe", " =payload", engine="nxc:ldap")
-            rows = list(csv.reader(
+            rows = list(csv.DictReader(
                 (Path(tmp) / "results.csv").read_text(encoding="utf-8").splitlines()
             ))
-            self.assertEqual(rows[1][0], "'=cmd")
-            self.assertEqual(rows[1][1], "'+payload")
-            self.assertEqual(rows[1][3], "7")
-            self.assertEqual(rows[1][4], "7")
-            self.assertEqual(rows[1][5], "nxc:ldap")
-            self.assertEqual(rows[2][1], "' =payload")
+            self.assertEqual(rows[0]["user"], "'=cmd")
+            self.assertEqual(rows[0]["password"], "'+payload")
+            self.assertEqual(rows[0]["status"], "success")
+            self.assertEqual(rows[0]["password_pass"], "7")
+            self.assertEqual(rows[0]["batch"], "7")
+            self.assertEqual(rows[0]["engine"], "nxc:ldap")
+            self.assertEqual(rows[1]["password"], "' =payload")
+
+    def test_results_csv_contains_every_pair_outcome(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(
+                tmp,
+                users=["alice", "bob"],
+                passwords=["First!"],
+                export="csv",
+            )
+            state = spraygun.State(tmp, cfg)
+            state.current_round = 1
+            state.current_pass = 1
+            engine = spraygun.Engine("nxc", "smb")
+
+            state.begin_attempt("First!", "alice", engine)
+            state.finish_attempt("First!", "alice", "success")
+            state.add_cred("alice", "First!", engine="nxc:smb")
+            state.begin_attempt("First!", "bob", engine)
+            state.finish_attempt("First!", "bob", "auth_failure")
+            state.save()
+
+            rows = list(csv.DictReader(
+                (Path(tmp) / "results.csv").read_text(encoding="utf-8").splitlines()
+            ))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                {(row["user"], row["status"]) for row in rows},
+                {("alice", "success"), ("bob", "auth_failure")},
+            )
+            alice = next(row for row in rows if row["user"] == "alice")
+            self.assertEqual(alice["credential_state"], "valid")
+            self.assertEqual(alice["password_pass"], "1")
+            self.assertEqual(alice["batch"], "1")
+            self.assertEqual(alice["dispatches"], "1")
+            self.assertEqual(alice["protocol"], "smb")
+
+    def test_timeline_html_summarizes_pair_and_pass_activity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self.make_config(
+                tmp,
+                users=["alice", "bob"],
+                passwords=["First!"],
+            )
+            state = spraygun.State(tmp, cfg)
+            state.current_round = 1
+            state.current_pass = 1
+            engine = spraygun.Engine("nxc", "smb")
+            state.begin_attempt("First!", "alice", engine)
+            state.finish_attempt("First!", "alice", "success")
+            state.add_cred("alice", "First!", engine="nxc:smb")
+            state.begin_attempt("First!", "bob", engine)
+            state.finish_attempt("First!", "bob", "auth_failure")
+            state.completed_rounds = 1
+
+            rendered = state.render_timeline_html()
+
+            self.assertIn("AuthTempo Run Report", rendered)
+            self.assertIn("Attempts sent", rendered)
+            self.assertIn("Unique pairs", rendered)
+            self.assertIn("Password-pass activity", rendered)
+            self.assertIn("Credential findings", rendered)
+            self.assertIn("nxc:smb", rendered)
+            self.assertIn("alice", rendered)
 
     def test_input_reader_preserves_literal_secret_whitespace_and_hash(self):
         with tempfile.TemporaryDirectory() as tmp:

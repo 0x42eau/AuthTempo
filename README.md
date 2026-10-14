@@ -13,7 +13,9 @@ AuthTempo runs Kerbrute and NetExec with pacing, lockout stops, automatic tool f
 ## Get started
 
 ```bash
-python3 -m pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 
 # Preview the whole workflow without sending authentication attempts
 authtempo -u users.txt -p passwords.txt -d sevenkingdoms.local \
@@ -85,7 +87,7 @@ authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 \
 
 ## Terminal and tmux behavior
 
-AuthTempo uses the live dashboard in a normal interactive terminal. Inside tmux it automatically switches to stable line-by-line output, avoiding cursor redraw problems while keeping raw tool output visible. `--dashboard` forces the live view and `--stream` forces line-by-line output; both are listed under `--advanced-help`.
+AuthTempo uses a compact, content-sized dashboard in a normal interactive terminal. It keeps credentials and safety counters at the top and shows only the 10 most recent raw-output lines by default; the complete feed remains in `authtempo.log`. Use `--raw-lines N` to change that window. Inside tmux it automatically switches to stable line-by-line output, avoiding cursor redraw problems while keeping raw tool output visible. `--dashboard` forces the live view and `--stream` forces line-by-line output; all three are listed under `--advanced-help`.
 
 ![AuthTempo tmux-safe streaming output](docs/images/authtempo-tmux-stream.png)
 
@@ -103,8 +105,9 @@ The default output directory is `./authtempo-out` (`./authtempo-dry-run-out` for
 | `authtempo.state.json` | Resume state and reconciled attempt ledger |
 | `authtempo.log` | Audit log and raw tool output |
 | `used-passwords.txt` | Passwords that completed across the eligible user set |
-| `results.json` / `results.csv` | Optional reports |
-| `authtempo-timeline.html` | Optional activity timeline |
+| `results.json` | Optional statistics, findings, and pair-level outcomes |
+| `results.csv` | One row per recorded identity/password pair, including failures and retries |
+| `authtempo-timeline.html` | Optional run summary, per-pass activity, findings, and event timeline |
 
 The output directory and sensitive artifacts are created with private permissions. They can contain plaintext credentials and should be handled as engagement evidence.
 
