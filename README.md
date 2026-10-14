@@ -157,4 +157,4 @@ For exact lockout behavior, recovery rules, input parsing, compatibility names, 
 
 ## License
 
-Same as the original `spraygun.sh` project.
+Same as the original archived [`spraygun.sh`](spraygun-archive/spraygun.sh) project.

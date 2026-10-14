@@ -119,7 +119,7 @@ Existing automation does not need an immediate rewrite. These older spellings re
 | `--no-live` / `--live` | `--stream` / `--dashboard` |
 | `--raw-lines`, `--feed-lines` | `--display-lines` |
 
-The `authcadence`, `authcadence.py`, and `spraygun.py` launchers also remain as warning compatibility entry points.
+The `authcadence` and `authcadence.py` launchers remain as warning compatibility entry points. Historical Spraygun launchers are isolated under `spraygun-archive/` and are not installed with AuthTempo.
 
 ## State and completion
 

@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 
 from rich.console import Console
 
-import spraygun
+import authtempo_core as authtempo
 
 
 class QuietUI:
@@ -59,7 +59,7 @@ def fake_process(lines, return_code=0, running=False):
 
 class SprayWindowTests(unittest.TestCase):
     def test_custom_window_after_close_opens_next_day(self):
-        window = spraygun.SprayWindow("09:00-17:00")
+        window = authtempo.SprayWindow("09:00-17:00")
         now = datetime.datetime(2026, 10, 13, 18, 0)
         self.assertEqual(window.seconds_until_open(now), 15 * 60 * 60)
 
@@ -67,7 +67,7 @@ class SprayWindowTests(unittest.TestCase):
         for value in ("bad", "25:00-26:00", "09:00-09:00"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    spraygun.SprayWindow(value)
+                    authtempo.SprayWindow(value)
 
 
 class EngineTests(unittest.TestCase):
@@ -76,23 +76,23 @@ class EngineTests(unittest.TestCase):
             "\x1b[32m2026/10/13 09:42:53 >  "
             "[+] VALID LOGIN: alice@LAB:Password1!\x1b[0m"
         )
-        line_type, data = spraygun.classify_line(spraygun.Engine("kerbrute"), line)
-        self.assertEqual(line_type, spraygun.LineType.SUCCESS)
+        line_type, data = authtempo.classify_line(authtempo.Engine("kerbrute"), line)
+        self.assertEqual(line_type, authtempo.LineType.SUCCESS)
         self.assertEqual(data, "alice@LAB:Password1!")
 
     def test_nonexistent_accounts_are_distinct_from_bad_passwords(self):
-        nxc_type, nxc_user = spraygun.classify_line(
-            spraygun.Engine("nxc", "smb"),
+        nxc_type, nxc_user = authtempo.classify_line(
+            authtempo.Engine("nxc", "smb"),
             "SMB 127.0.0.1 445 DC [-] LAB\\missing:Bad! STATUS_NO_SUCH_USER",
             expected_secret="Bad!",
         )
-        kerb_type, kerb_user = spraygun.classify_line(
-            spraygun.Engine("kerbrute"),
+        kerb_type, kerb_user = authtempo.classify_line(
+            authtempo.Engine("kerbrute"),
             "2026/10/13 > [!] missing@LAB:Bad! - User does not exist",
             expected_secret="Bad!",
         )
-        self.assertEqual((nxc_type, nxc_user), (spraygun.LineType.NONEXISTENT, "missing"))
-        self.assertEqual((kerb_type, kerb_user), (spraygun.LineType.NONEXISTENT, "missing@LAB"))
+        self.assertEqual((nxc_type, nxc_user), (authtempo.LineType.NONEXISTENT, "missing"))
+        self.assertEqual((kerb_type, kerb_user), (authtempo.LineType.NONEXISTENT, "missing@LAB"))
 
     def test_secret_text_cannot_forge_a_safety_or_admin_marker(self):
         lockout_words = "locked out data 775"
@@ -100,21 +100,21 @@ class EngineTests(unittest.TestCase):
             "LDAP 127.0.0.1 389 DC [-] LAB\\alice:"
             f"{lockout_words} STATUS_LOGON_FAILURE"
         )
-        line_type, user = spraygun.classify_line(
-            spraygun.Engine("nxc", "ldap"),
+        line_type, user = authtempo.classify_line(
+            authtempo.Engine("nxc", "ldap"),
             failure,
             expected_secret=lockout_words,
         )
-        self.assertEqual((line_type, user), (spraygun.LineType.AUTHFAIL, "alice"))
+        self.assertEqual((line_type, user), (authtempo.LineType.AUTHFAIL, "alice"))
 
         admin_words = "Secret (Pwn3d!)"
         success = f"SMB 127.0.0.1 445 DC [+] LAB\\alice:{admin_words}"
-        line_type, data = spraygun.classify_line(
-            spraygun.Engine("nxc", "smb"),
+        line_type, data = authtempo.classify_line(
+            authtempo.Engine("nxc", "smb"),
             success,
             expected_secret=admin_words,
         )
-        self.assertEqual(line_type, spraygun.LineType.SUCCESS)
+        self.assertEqual(line_type, authtempo.LineType.SUCCESS)
         self.assertEqual(data, f"alice:{admin_words}")
 
         revoked_words = "KDC_ERR_CLIENT_REVOKED"
@@ -122,12 +122,12 @@ class EngineTests(unittest.TestCase):
             "2026/10/13 > [+] VALID LOGIN: "
             f"alice@LAB:{revoked_words}"
         )
-        line_type, data = spraygun.classify_line(
-            spraygun.Engine("kerbrute"),
+        line_type, data = authtempo.classify_line(
+            authtempo.Engine("kerbrute"),
             kerbrute_success,
             expected_secret=revoked_words,
         )
-        self.assertEqual(line_type, spraygun.LineType.SUCCESS)
+        self.assertEqual(line_type, authtempo.LineType.SUCCESS)
         self.assertEqual(data, f"alice@LAB:{revoked_words}")
 
         expired_words = "STATUS_PASSWORD_EXPIRED"
@@ -135,12 +135,12 @@ class EngineTests(unittest.TestCase):
             "SMB 127.0.0.1 445 DC [-] LAB\\alice:"
             f"{expired_words} STATUS_LOGON_FAILURE"
         )
-        line_type, user = spraygun.classify_line(
-            spraygun.Engine("nxc", "smb"),
+        line_type, user = authtempo.classify_line(
+            authtempo.Engine("nxc", "smb"),
             nxc_failure,
             expected_secret=expired_words,
         )
-        self.assertEqual((line_type, user), (spraygun.LineType.AUTHFAIL, "alice"))
+        self.assertEqual((line_type, user), (authtempo.LineType.AUTHFAIL, "alice"))
 
     def test_kerbrute_zero_exit_network_error_is_not_clean(self):
         network_line = (
@@ -149,19 +149,19 @@ class EngineTests(unittest.TestCase):
             "Can't talk to KDC. Aborting...\x1b[0m\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, kerbrute_binary="/fake/kerbrute",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.stdout = iter([network_line])
             proc.wait.return_value = 0
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertTrue(result.aborted)
@@ -170,20 +170,20 @@ class EngineTests(unittest.TestCase):
 
     def test_kerbrute_command_always_enables_safe_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, kerbrute_binary="/fake/kerbrute",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = fake_process([
                 "2026/10/13 09:42:53 >  [!] alice@LAB:Password1! - KDC_ERR_PREAUTH_FAILED\n",
                 "2026/10/13 09:42:53 >  Done! Tested 1 logins (0 successes) in 0.010 seconds\n",
             ])
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc) as popen:
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertTrue(result.clean_finish)
@@ -198,12 +198,12 @@ class EngineTests(unittest.TestCase):
             "2026/10/13 09:42:53 >  [!] alice@LAB - USER LOCKED OUT\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice", "bob"], passwords=["Password1!"],
                 log_dir=tmp, kerbrute_binary="/fake/kerbrute",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             locked_proc = fake_process([lockout_line], return_code=1)
             healthy_proc = fake_process([
                 "2026/10/13 09:42:54 >  [!] bob@LAB:Password1! - KDC_ERR_PREAUTH_FAILED\n",
@@ -211,12 +211,12 @@ class EngineTests(unittest.TestCase):
             ])
 
             with patch.object(
-                spraygun.subprocess,
+                authtempo.subprocess,
                 "Popen",
                 side_effect=[locked_proc, healthy_proc],
             ) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertFalse(result.aborted)
@@ -233,24 +233,24 @@ class EngineTests(unittest.TestCase):
             "STATUS_ACCOUNT_LOCKED_OUT\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice", "bob"], passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc", lockout_threshold=1,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             locked_proc = fake_process([lockout_line])
             healthy_proc = fake_process([
                 "SMB 127.0.0.1 445 DC [-] LAB\\bob:Password1! STATUS_LOGON_FAILURE\n"
             ])
 
             with patch.object(
-                spraygun.subprocess,
+                authtempo.subprocess,
                 "Popen",
                 side_effect=[locked_proc, healthy_proc],
             ) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -271,17 +271,17 @@ class EngineTests(unittest.TestCase):
             for user in users
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=users, passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc", lockout_threshold=99,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             processes = [fake_process([line]) for line in lockout_lines]
 
-            with patch.object(spraygun.subprocess, "Popen", side_effect=processes) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+            with patch.object(authtempo.subprocess, "Popen", side_effect=processes) as popen:
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -304,17 +304,17 @@ class EngineTests(unittest.TestCase):
             for user in users[:5]
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=users, passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc", lockout_threshold=99,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             processes = [fake_process([line]) for line in lockout_lines]
 
-            with patch.object(spraygun.subprocess, "Popen", side_effect=processes) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+            with patch.object(authtempo.subprocess, "Popen", side_effect=processes) as popen:
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -330,19 +330,19 @@ class EngineTests(unittest.TestCase):
 
     def test_nonzero_engine_exit_triggers_failover_result(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.stdout = iter(["unclassified tool error\n"])
             proc.wait.return_value = 1
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -355,19 +355,19 @@ class EngineTests(unittest.TestCase):
 
     def test_connection_error_triggers_failover_even_on_zero_exit(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.stdout = iter(["connection refused\n"])
             proc.wait.return_value = 0
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"), cfg, "Password1!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertTrue(result.aborted)
@@ -375,19 +375,19 @@ class EngineTests(unittest.TestCase):
 
     def test_nxc_zero_exit_without_auth_results_triggers_failover(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.stdout = iter([])
             proc.wait.return_value = 0
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"), cfg, "Password1!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertTrue(result.aborted)
@@ -395,19 +395,19 @@ class EngineTests(unittest.TestCase):
 
     def test_smb_command_uses_the_requested_domain(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "EXAMPLE", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"],
                 log_dir=tmp, nxc_binary="/fake/nxc",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.stdout = iter([r"SMB 127.0.0.1 445 DC [-] EXAMPLE\alice:Password1! STATUS_LOGON_FAILURE\n"])
             proc.wait.return_value = 0
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc) as popen:
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -422,19 +422,19 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(command[command.index("--threads") + 1], "1")
 
     def test_smb_preflight_requires_smb_not_only_kerberos(self):
-        cfg = spraygun.Config(
+        cfg = authtempo.Config(
             "users", "passwords", "LAB", "127.0.0.1",
             tool="nxc", protocol="smb",
         )
 
-        with patch.object(spraygun.socket, "create_connection", side_effect=OSError):
-            ok, detail = spraygun.preflight(cfg, QuietUI())
+        with patch.object(authtempo.socket, "create_connection", side_effect=OSError):
+            ok, detail = authtempo.preflight(cfg, QuietUI())
 
         self.assertFalse(ok)
         self.assertIn("[445]", detail)
 
     def test_preflight_domain_check_uses_whole_tokens(self):
-        cfg = spraygun.Config(
+        cfg = authtempo.Config(
             "users",
             "passwords",
             "LAB",
@@ -446,40 +446,40 @@ class EngineTests(unittest.TestCase):
         socket_handle = Mock()
         bad_probe = Mock(returncode=0)
         bad_probe.communicate.return_value = ("domain: LABEL\n", "")
-        with patch.object(spraygun.socket, "create_connection", return_value=socket_handle), \
-                patch.object(spraygun.subprocess, "Popen", return_value=bad_probe):
-            ok, _detail = spraygun.preflight(cfg, QuietUI())
+        with patch.object(authtempo.socket, "create_connection", return_value=socket_handle), \
+                patch.object(authtempo.subprocess, "Popen", return_value=bad_probe):
+            ok, _detail = authtempo.preflight(cfg, QuietUI())
         self.assertFalse(ok)
 
         good_probe = Mock(returncode=0)
         good_probe.communicate.return_value = ("domain: LAB\n", "")
-        with patch.object(spraygun.socket, "create_connection", return_value=socket_handle), \
-                patch.object(spraygun.subprocess, "Popen", return_value=good_probe):
-            ok, _detail = spraygun.preflight(cfg, QuietUI())
+        with patch.object(authtempo.socket, "create_connection", return_value=socket_handle), \
+                patch.object(authtempo.subprocess, "Popen", return_value=good_probe):
+            ok, _detail = authtempo.preflight(cfg, QuietUI())
         self.assertTrue(ok)
 
     def test_rejected_cached_realm_falls_back_to_other_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "bad.example", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"], log_dir=tmp,
                 kerbrute_binary="/fake/kerbrute",
                 realm_candidates=["bad.example", "good.example"],
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.working_realm = "bad.example"
-            wrong = spraygun.RoundResult(aborted=True, abort_reason="wrong-realm")
-            clean = spraygun.RoundResult(
+            wrong = authtempo.RoundResult(aborted=True, abort_reason="wrong-realm")
+            clean = authtempo.RoundResult(
                 clean_finish=True,
                 reconciled_complete=True,
                 dispatches=1,
             )
 
             with patch.object(
-                spraygun, "spray_one_password", side_effect=[wrong, clean]
+                authtempo, "spray_one_password", side_effect=[wrong, clean]
             ) as spray:
-                result = spraygun.spray_kerbrute_with_realm_retry(
-                    spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
+                result = authtempo.spray_kerbrute_with_realm_retry(
+                    authtempo.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
 
             self.assertIs(result, clean)
@@ -488,7 +488,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(state.working_realm, "good.example")
 
     def test_user_enumeration_requires_a_reconciled_summary(self):
-        cfg = spraygun.Config(
+        cfg = authtempo.Config(
             "users",
             "passwords",
             "LAB",
@@ -502,13 +502,13 @@ class EngineTests(unittest.TestCase):
             "2026/10/13 > Done! Tested 1 usernames (1 valid) in 0.1 seconds\n",
         ])
         console = Console(file=io.StringIO(), force_terminal=False)
-        with patch.object(spraygun.subprocess, "Popen", return_value=proc):
+        with patch.object(authtempo.subprocess, "Popen", return_value=proc):
             with self.assertRaisesRegex(RuntimeError, "did not reconcile"):
-                spraygun.enumerate_valid_users(cfg, QuietUI(), console)
+                authtempo.enumerate_valid_users(cfg, QuietUI(), console)
 
     def test_user_enumeration_quarantines_revocation_signals(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -518,7 +518,7 @@ class EngineTests(unittest.TestCase):
                 log_dir=tmp,
                 kerbrute_binary="/fake/kerbrute",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = fake_process([
                 "2026/10/13 > [+] VALID USERNAME WITH ERROR: alice@LAB "
                 "(KDC_ERR_CLIENT_REVOKED)\n",
@@ -526,8 +526,8 @@ class EngineTests(unittest.TestCase):
             ])
             console = Console(file=io.StringIO(), force_terminal=False)
 
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                valid_users = spraygun.enumerate_valid_users(
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                valid_users = authtempo.enumerate_valid_users(
                     cfg,
                     QuietUI(),
                     console,
@@ -558,7 +558,7 @@ class LockoutPolicyTests(unittest.TestCase):
             "history_path": str(history) if history else None,
         }
         values.update(overrides)
-        return spraygun.Config(
+        return authtempo.Config(
             "users",
             "passwords",
             "LAB",
@@ -569,7 +569,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_nonexistent_is_neutral_but_healthy_auth_result_resets_streak(self):
         with tempfile.TemporaryDirectory() as tmp:
             users = ["alice", "bob", "missing", "carol"]
-            state = spraygun.State(tmp, self.make_config(tmp, users))
+            state = authtempo.State(tmp, self.make_config(tmp, users))
 
             state.observe_pair_outcome("alice", "lockout")
             state.observe_pair_outcome("bob", "lockout")
@@ -585,7 +585,7 @@ class LockoutPolicyTests(unittest.TestCase):
             root = Path(tmp)
             history = root / "shared-history.json"
             users = [f"user{i:02d}" for i in range(30)]
-            first = spraygun.State(
+            first = authtempo.State(
                 str(root / "run-one"),
                 self.make_config(root / "run-one", users, history),
             )
@@ -593,7 +593,7 @@ class LockoutPolicyTests(unittest.TestCase):
                 first.add_lockout(user, secret="Bad!")
             first.close()
 
-            second = spraygun.State(
+            second = authtempo.State(
                 str(root / "run-two"),
                 self.make_config(root / "run-two", users, history),
             )
@@ -612,7 +612,7 @@ class LockoutPolicyTests(unittest.TestCase):
             users = [f"user{i}" for i in range(10)]
             for index in range(4):
                 output = root / f"run-{index}"
-                state = spraygun.State(
+                state = authtempo.State(
                     str(output),
                     self.make_config(output, users, history),
                 )
@@ -623,7 +623,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_ldap_recheck_uses_computed_bit_and_preserves_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["reader", "alice"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_cred("reader", "Good!", engine="nxc:ldap")
             state.add_lockout("alice", secret="Bad!", engine="kerbrute")
             state.observe_pair_outcome("alice", "lockout")
@@ -635,8 +635,8 @@ class LockoutPolicyTests(unittest.TestCase):
             """
             completed = subprocess.CompletedProcess([], 0, stdout=output)
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun.subprocess, "run", return_value=completed) as run:
-                cleared, still_locked = spraygun.recheck_active_lockouts(
+            with patch.object(authtempo.subprocess, "run", return_value=completed) as run:
+                cleared, still_locked = authtempo.recheck_active_lockouts(
                     cfg, state, console
                 )
 
@@ -657,7 +657,7 @@ class LockoutPolicyTests(unittest.TestCase):
                 "alice\n",
             )
             self.assertEqual(
-                (Path(tmp) / spraygun.ACTIVE_LOCKOUTS_FILE_NAME).read_text(
+                (Path(tmp) / authtempo.ACTIVE_LOCKOUTS_FILE_NAME).read_text(
                     encoding="utf-8"
                 ),
                 "",
@@ -666,7 +666,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_ldap_recheck_retains_account_when_computed_lockout_bit_is_set(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["reader", "alice"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_cred("reader", "Good!", engine="nxc:ldap")
             state.add_lockout("alice", secret="Bad!")
             completed = subprocess.CompletedProcess(
@@ -674,8 +674,8 @@ class LockoutPolicyTests(unittest.TestCase):
                 0,
                 stdout="msDS-User-Account-Control-Computed 16\n",
             )
-            with patch.object(spraygun.subprocess, "run", return_value=completed):
-                result = spraygun.recheck_active_lockouts(
+            with patch.object(authtempo.subprocess, "run", return_value=completed):
+                result = authtempo.recheck_active_lockouts(
                     cfg,
                     state,
                     Console(file=io.StringIO(), force_terminal=False),
@@ -687,7 +687,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_ldap_recheck_uses_one_bind_for_multiple_quarantined_users(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["reader", "alice", "bob"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_cred("reader", "Good!", engine="nxc:ldap")
             state.add_lockout("alice", secret="Bad!")
             state.add_lockout("bob", secret="Bad!")
@@ -704,11 +704,11 @@ class LockoutPolicyTests(unittest.TestCase):
                 ),
             )
             with patch.object(
-                spraygun.subprocess,
+                authtempo.subprocess,
                 "run",
                 return_value=completed,
             ) as run:
-                result = spraygun.recheck_active_lockouts(
+                result = authtempo.recheck_active_lockouts(
                     cfg,
                     state,
                     Console(file=io.StringIO(), force_terminal=False),
@@ -724,11 +724,11 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_ldap_recheck_without_known_credential_never_dispatches(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["alice"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_lockout("alice", secret="Bad!")
 
-            with patch.object(spraygun.subprocess, "run") as run:
-                result = spraygun.recheck_active_lockouts(
+            with patch.object(authtempo.subprocess, "run") as run:
+                result = authtempo.recheck_active_lockouts(
                     cfg,
                     state,
                     Console(file=io.StringIO(), force_terminal=False),
@@ -741,7 +741,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_failed_ldap_recheck_cannot_clear_quarantine_from_partial_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["reader", "alice"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_cred("reader", "Good!", engine="nxc:ldap")
             state.add_lockout("alice", secret="Bad!")
             completed = subprocess.CompletedProcess(
@@ -753,8 +753,8 @@ class LockoutPolicyTests(unittest.TestCase):
                 ),
             )
 
-            with patch.object(spraygun.subprocess, "run", return_value=completed):
-                result = spraygun.recheck_active_lockouts(
+            with patch.object(authtempo.subprocess, "run", return_value=completed):
+                result = authtempo.recheck_active_lockouts(
                     cfg,
                     state,
                     Console(file=io.StringIO(), force_terminal=False),
@@ -767,17 +767,17 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_campaign_history_failure_saves_local_quarantine_before_pausing(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, ["alice"])
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             with patch.object(
                 state,
                 "_register_campaign_lockout",
                 side_effect=OSError("disk unavailable"),
             ):
-                with self.assertRaises(spraygun.CampaignHistoryUnavailable):
+                with self.assertRaises(authtempo.CampaignHistoryUnavailable):
                     state.add_lockout("alice", secret="Bad!", persist=False)
 
             saved = json.loads(
-                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+                (Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(set(saved["active_lockouts"]), {"alice"})
             self.assertEqual(set(saved["locked_users"]), {"alice"})
@@ -786,7 +786,7 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_resume_preserves_stricter_legacy_lockout_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             legacy_cfg = self.make_config(tmp, ["alice"], lockout_burst=3)
-            first = spraygun.State(tmp, legacy_cfg)
+            first = authtempo.State(tmp, legacy_cfg)
             first.close()
 
             resumed_cfg = self.make_config(
@@ -795,14 +795,14 @@ class LockoutPolicyTests(unittest.TestCase):
                 lockout_burst=4,
                 resume=True,
             )
-            resumed = spraygun.State(tmp, resumed_cfg)
+            resumed = authtempo.State(tmp, resumed_cfg)
             self.assertEqual(resumed.cfg.lockout_burst, 3)
 
     def test_default_display_filters_banner_noise_and_shows_exact_lockout_pair(self):
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)
-        ui = spraygun.RichUI(console, live_ui=False, show_raw=False)
-        ui.start_spray(spraygun.Engine("kerbrute"), "Bad!", 1)
+        ui = authtempo.RichUI(console, live_ui=False, show_raw=False)
+        ui.start_spray(authtempo.Engine("kerbrute"), "Bad!", 1)
         ui.feed_line("kerbrute giant ASCII banner")
         ui.update_lockout("alice", "Bad!", "kerbrute", 1)
 
@@ -814,8 +814,8 @@ class LockoutPolicyTests(unittest.TestCase):
     def test_streaming_lockout_pair_preserves_rich_markup_characters(self):
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)
-        ui = spraygun.RichUI(console, live_ui=False, show_raw=False)
-        ui.start_spray(spraygun.Engine("kerbrute"), "Bad[red]!", 1)
+        ui = authtempo.RichUI(console, live_ui=False, show_raw=False)
+        ui.start_spray(authtempo.Engine("kerbrute"), "Bad[red]!", 1)
         ui.update_lockout("user[blue]", "Bad[red]!", "kerbrute", 1)
 
         rendered = output.getvalue()
@@ -824,19 +824,19 @@ class LockoutPolicyTests(unittest.TestCase):
 
 class StateAndRunTests(unittest.TestCase):
     def test_product_brand_and_artifact_names_are_authtempo(self):
-        self.assertEqual(spraygun.PRODUCT_NAME, "AuthTempo")
-        self.assertEqual(spraygun.PRODUCT_SLUG, "authtempo")
-        self.assertIn("enforced safety limits", spraygun.PRODUCT_TAGLINE)
-        self.assertEqual(spraygun.STATE_FILE_NAME, "authtempo.state.json")
-        self.assertEqual(spraygun.AUDIT_LOG_NAME, "authtempo.log")
+        self.assertEqual(authtempo.PRODUCT_NAME, "AuthTempo")
+        self.assertEqual(authtempo.PRODUCT_SLUG, "authtempo")
+        self.assertIn("enforced safety limits", authtempo.PRODUCT_TAGLINE)
+        self.assertEqual(authtempo.STATE_FILE_NAME, "authtempo.state.json")
+        self.assertEqual(authtempo.AUDIT_LOG_NAME, "authtempo.log")
         self.assertEqual(
-            spraygun.TIMELINE_HTML_NAME,
+            authtempo.TIMELINE_HTML_NAME,
             "authtempo-timeline.html",
         )
 
     def test_identity_enumeration_signal_stops_before_password_dispatch(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -860,21 +860,21 @@ class StateAndRunTests(unittest.TestCase):
 
             console = Console(file=io.StringIO(), force_terminal=False)
             with patch.object(
-                spraygun,
+                authtempo,
                 "enumerate_valid_users",
                 side_effect=enumerate_with_signal,
-            ), patch.object(spraygun, "setup_signal_handler"), patch.object(
-                spraygun,
+            ), patch.object(authtempo, "setup_signal_handler"), patch.object(
+                authtempo,
                 "spray_one_password",
             ) as spray:
-                spraygun.run(cfg, console)
+                authtempo.run(cfg, console)
 
             spray.assert_not_called()
             self.assertIn("no password attempts", console.file.getvalue())
 
     def test_run_locks_output_directory_before_preflight_activity(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -887,32 +887,32 @@ class StateAndRunTests(unittest.TestCase):
 
             def inspect_lock(_cfg, _ui, _state):
                 with self.assertRaisesRegex(RuntimeError, "already using"):
-                    spraygun.State(tmp, cfg)
+                    authtempo.State(tmp, cfg)
                 observed["locked"] = True
                 return False, "intentional test failure"
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "preflight", side_effect=inspect_lock), \
-                    patch.object(spraygun, "setup_signal_handler"):
-                spraygun.run(cfg, console)
+            with patch.object(authtempo, "preflight", side_effect=inspect_lock), \
+                    patch.object(authtempo, "setup_signal_handler"):
+                authtempo.run(cfg, console)
 
             self.assertTrue(observed["locked"])
 
     def test_sigint_terminates_active_spray_before_saving(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["First!"], log_dir=tmp,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = Mock()
             proc.poll.return_value = None
             proc.wait.return_value = 0
             state.active_process = proc
             console = Console(file=io.StringIO(), force_terminal=False)
 
-            with patch.object(spraygun.signal, "signal") as register:
-                spraygun.setup_signal_handler(state, console)
+            with patch.object(authtempo.signal, "signal") as register:
+                authtempo.setup_signal_handler(state, console)
             handler = register.call_args.args[1]
 
             with self.assertRaises(SystemExit) as stopped:
@@ -923,12 +923,12 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_attempts_and_credentials_are_counted_as_unique_pairs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice", "bob"], passwords=["First!", "Second!"],
                 log_dir=tmp,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
 
             state.mark_attempted("First!", "alice")
             state.mark_attempted("First!", "alice")
@@ -947,7 +947,7 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_metrics_separate_dispatches_from_final_pair_outcomes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -957,8 +957,8 @@ class StateAndRunTests(unittest.TestCase):
                 log_dir=tmp,
                 retry_indeterminate=True,
             )
-            state = spraygun.State(tmp, cfg)
-            engine = spraygun.Engine("nxc", "ldap")
+            state = authtempo.State(tmp, cfg)
+            engine = authtempo.Engine("nxc", "ldap")
             state.begin_attempt("First!", "alice", engine)
             state.finish_attempt("First!", "alice", "indeterminate")
             state.begin_attempt("First!", "alice", engine)
@@ -974,7 +974,7 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_dry_run_metrics_label_simulated_pairs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -984,7 +984,7 @@ class StateAndRunTests(unittest.TestCase):
                 log_dir=tmp,
                 dry_run=True,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.mark_attempted("First!", "alice", status="dry_run")
 
             compact = state.get_compact_stats()
@@ -1004,14 +1004,14 @@ class StateAndRunTests(unittest.TestCase):
                 time_between_rounds=0,
                 realm_retry=False,
             )
-            first = spraygun.Config(
+            first = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1", **common
             )
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "setup_signal_handler"):
-                self.assertTrue(spraygun.run(first, console))
+            with patch.object(authtempo, "setup_signal_handler"):
+                self.assertTrue(authtempo.run(first, console))
 
-            resumed = spraygun.Config(
+            resumed = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -1019,11 +1019,11 @@ class StateAndRunTests(unittest.TestCase):
                 resume=True,
                 **common,
             )
-            with patch.object(spraygun, "setup_signal_handler"):
-                self.assertTrue(spraygun.run(resumed, console))
+            with patch.object(authtempo, "setup_signal_handler"):
+                self.assertTrue(authtempo.run(resumed, console))
 
             data = json.loads(
-                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+                (Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(
                 [event["type"] for event in data["timeline_events"]].count(
@@ -1034,19 +1034,19 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_resume_rejects_state_for_a_different_target(self):
         with tempfile.TemporaryDirectory() as tmp:
-            first = spraygun.Config(
+            first = authtempo.Config(
                 "users", "passwords", "LAB", "10.0.0.1",
                 users=["alice"], passwords=["First!"], log_dir=tmp,
             )
-            spraygun.State(tmp, first)
-            second = spraygun.Config(
+            authtempo.State(tmp, first)
+            second = authtempo.Config(
                 "users", "passwords", "LAB", "10.0.0.2",
                 users=["alice"], passwords=["First!"], log_dir=tmp,
                 resume=True,
             )
 
             with self.assertRaisesRegex(RuntimeError, "different target"):
-                spraygun.State(tmp, second)
+                authtempo.State(tmp, second)
 
     def test_live_summary_keeps_credentials_across_failover_and_rounds(self):
         output = io.StringIO()
@@ -1057,12 +1057,12 @@ class StateAndRunTests(unittest.TestCase):
             height=14,
             color_system=None,
         )
-        ui = spraygun.RichUI(console, max_feed_lines=50, live_ui=False)
+        ui = authtempo.RichUI(console, max_feed_lines=50, live_ui=False)
 
-        ui.start_spray(spraygun.Engine("kerbrute"), "First!", 1)
+        ui.start_spray(authtempo.Engine("kerbrute"), "First!", 1)
         ui.update_success("alice", "First!")
         ui.end_spray()
-        ui.start_spray(spraygun.Engine("nxc", "ldap"), "First!", 1)
+        ui.start_spray(authtempo.Engine("nxc", "ldap"), "First!", 1)
 
         with console.capture() as capture:
             console.print(ui._build_summary())
@@ -1072,7 +1072,7 @@ class StateAndRunTests(unittest.TestCase):
         self.assertLessEqual(ui._summary_height(), 7)
 
         ui.end_spray()
-        ui.start_spray(spraygun.Engine("nxc", "ldap"), "Second!", 2)
+        ui.start_spray(authtempo.Engine("nxc", "ldap"), "Second!", 2)
         with console.capture() as capture:
             console.print(ui._build_summary())
         next_round = capture.get()
@@ -1082,12 +1082,12 @@ class StateAndRunTests(unittest.TestCase):
     def test_password_change_credential_is_highlighted_separately(self):
         output = io.StringIO()
         console = Console(file=output, force_terminal=False, color_system=None)
-        ui = spraygun.RichUI(console, live_ui=False)
+        ui = authtempo.RichUI(console, live_ui=False)
         command = (
             "impacket-changepasswd -protocol smb-samr LAB/alice@127.0.0.1"
         )
 
-        ui.start_spray(spraygun.Engine("nxc", "smb"), "First!", 1)
+        ui.start_spray(authtempo.Engine("nxc", "smb"), "First!", 1)
         ui.update_password_change(
             "alice",
             "First!",
@@ -1112,8 +1112,8 @@ class StateAndRunTests(unittest.TestCase):
             color_system=None,
         )
         with patch.dict(os.environ, {"TMUX": "/tmp/tmux/default,1,0", "TERM": "screen-256color"}):
-            automatic = spraygun.RichUI(console, live_ui=True)
-            forced = spraygun.RichUI(console, live_ui=True, force_live=True)
+            automatic = authtempo.RichUI(console, live_ui=True)
+            forced = authtempo.RichUI(console, live_ui=True, force_live=True)
 
         self.assertFalse(automatic.live_enabled)
         self.assertTrue(automatic._stream_fallback)
@@ -1127,9 +1127,9 @@ class StateAndRunTests(unittest.TestCase):
             height=20,
             color_system=None,
         )
-        ui = spraygun.RichUI(console, live_ui=False)
+        ui = authtempo.RichUI(console, live_ui=False)
         ui.load_totals([], set(), {"alice"}, unknown_lockouts=1, signal_events=3)
-        ui.start_spray(spraygun.Engine("nxc", "ldap"), "First!", 1)
+        ui.start_spray(authtempo.Engine("nxc", "ldap"), "First!", 1)
         ui.update_lockout("bob")
         with console.capture() as capture:
             console.print(ui._build_summary())
@@ -1145,13 +1145,13 @@ class StateAndRunTests(unittest.TestCase):
             height=40,
             color_system=None,
         )
-        ui = spraygun.RichUI(
+        ui = authtempo.RichUI(
             console,
             max_feed_lines=10,
             live_ui=False,
             show_raw=True,
         )
-        ui.start_spray(spraygun.Engine("nxc", "smb"), "First!", 1)
+        ui.start_spray(authtempo.Engine("nxc", "smb"), "First!", 1)
         ui.raw_feed = [f"raw line {index}" for index in range(15)]
 
         with console.capture() as capture:
@@ -1165,12 +1165,12 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_new_demotion_keeps_its_full_configured_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"], log_dir=tmp,
                 engine_cooldown_rounds=3, engine_transient_threshold=1,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             active_at_round_start = set()
 
             state.register_engine_failure("kerbrute", "timeout")
@@ -1182,22 +1182,22 @@ class StateAndRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "creds.txt").write_text("old:credential\n", encoding="utf-8")
-            (root / spraygun.PASSWORD_CHANGES_FILE_NAME).write_text(
+            (root / authtempo.PASSWORD_CHANGES_FILE_NAME).write_text(
                 "old command\n",
                 encoding="utf-8",
             )
             (root / "locked-out.txt").write_text("old-user\n", encoding="utf-8")
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 users=["alice"], passwords=["Password1!"], log_dir=tmp,
                 start_fresh=True,
             )
 
-            spraygun.State(tmp, cfg)
+            authtempo.State(tmp, cfg)
 
             self.assertEqual((root / "creds.txt").read_text(encoding="utf-8"), "")
             self.assertEqual(
-                (root / spraygun.PASSWORD_CHANGES_FILE_NAME).read_text(
+                (root / authtempo.PASSWORD_CHANGES_FILE_NAME).read_text(
                     encoding="utf-8"
                 ),
                 "",
@@ -1206,7 +1206,7 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_all_engine_failure_retries_without_marking_secret_used(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 tool="nxc", protocol="smb", users=["alice"],
                 passwords=["Password1!"], log_dir=tmp, dry_run=True,
@@ -1214,28 +1214,28 @@ class StateAndRunTests(unittest.TestCase):
                 passwords_per_round=1, realm_retry=False,
                 engine_transient_threshold=1,
             )
-            failed = spraygun.RoundResult(aborted=True, abort_reason="exit-code-1")
-            succeeded = spraygun.RoundResult(
+            failed = authtempo.RoundResult(aborted=True, abort_reason="exit-code-1")
+            succeeded = authtempo.RoundResult(
                 clean_finish=True,
                 reconciled_complete=True,
             )
             outcomes = [failed, failed, failed, succeeded]
             console = Console(file=io.StringIO(), force_terminal=False)
 
-            with patch.object(spraygun, "spray_one_password", side_effect=outcomes) as spray, \
-                    patch.object(spraygun, "setup_signal_handler"), \
+            with patch.object(authtempo, "spray_one_password", side_effect=outcomes) as spray, \
+                    patch.object(authtempo, "setup_signal_handler"), \
                     patch("builtins.input", return_value=""):
-                spraygun.run(cfg, console)
+                authtempo.run(cfg, console)
 
             self.assertEqual(spray.call_count, 3)
-            data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            data = json.loads((Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(data["used_passwords"], [])
             self.assertEqual(data["remaining_queue"], ["Password1!"])
             self.assertEqual(data["completed_batches"], 0)
 
     def test_tool_pause_output_uses_operator_language(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -1251,12 +1251,12 @@ class StateAndRunTests(unittest.TestCase):
 
             def tool_result(engine, _cfg, secret, _ui, state, _realm=None):
                 if engine.tool == "kerbrute":
-                    return spraygun.RoundResult(
+                    return authtempo.RoundResult(
                         aborted=True,
                         abort_reason="command-not-found",
                     )
                 state.mark_attempted(secret, "alice", status="auth_failure")
-                return spraygun.RoundResult(
+                return authtempo.RoundResult(
                     clean_finish=True,
                     reconciled_complete=True,
                     dispatches=1,
@@ -1265,11 +1265,11 @@ class StateAndRunTests(unittest.TestCase):
             output = io.StringIO()
             console = Console(file=output, force_terminal=False)
             with patch.object(
-                spraygun,
+                authtempo,
                 "spray_one_password",
                 side_effect=tool_result,
-            ), patch.object(spraygun, "setup_signal_handler"):
-                self.assertTrue(spraygun.run(cfg, console))
+            ), patch.object(authtempo, "setup_signal_handler"):
+                self.assertTrue(authtempo.run(cfg, console))
 
             rendered = output.getvalue()
             self.assertIn("tool command was not found; paused for 3", rendered)
@@ -1280,7 +1280,7 @@ class StateAndRunTests(unittest.TestCase):
 
     def test_isolated_lockout_does_not_prompt_or_stop_next_secret(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 tool="nxc", protocol="smb", users=["alice"],
                 passwords=["First!", "Second!"], log_dir=tmp,
@@ -1291,27 +1291,27 @@ class StateAndRunTests(unittest.TestCase):
 
             def lock_first(_engine, _cfg, _secret, _ui, state, _realm=None):
                 state.add_lockout("alice", secret=_secret)
-                return spraygun.RoundResult(
+                return authtempo.RoundResult(
                     lockouts={"alice"},
                     clean_finish=True,
                     reconciled_complete=True,
                 )
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "spray_one_password", side_effect=lock_first) as spray, \
-                    patch.object(spraygun, "setup_signal_handler"), \
-                    patch.object(spraygun, "prompt_continue", return_value=False) as prompt:
-                spraygun.run(cfg, console)
+            with patch.object(authtempo, "spray_one_password", side_effect=lock_first) as spray, \
+                    patch.object(authtempo, "setup_signal_handler"), \
+                    patch.object(authtempo, "prompt_continue", return_value=False) as prompt:
+                authtempo.run(cfg, console)
 
             self.assertEqual(spray.call_count, 2)
             prompt.assert_not_called()
-            data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            data = json.loads((Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(data["used_passwords"], ["First!", "Second!"])
             self.assertEqual(data["completed_batches"], 1)
 
     def test_isolated_lockout_result_completes_without_prompt_or_failover(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 tool="nxc", protocol="smb", users=["alice", "bob"],
                 passwords=["First!"], log_dir=tmp, dry_run=True,
@@ -1323,17 +1323,17 @@ class StateAndRunTests(unittest.TestCase):
             def quarantine_then_finish(_engine, _cfg, _secret, _ui, state, _realm=None):
                 state.add_lockout("alice", secret=_secret)
                 state.mark_attempted(_secret, "bob", status="dry_run")
-                return spraygun.RoundResult(
+                return authtempo.RoundResult(
                     lockouts={"alice"},
                     clean_finish=True,
                     reconciled_complete=True,
                 )
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "spray_one_password", side_effect=quarantine_then_finish) as spray, \
-                    patch.object(spraygun, "setup_signal_handler"), \
-                    patch.object(spraygun, "prompt_continue", return_value=True) as prompt:
-                spraygun.run(cfg, console)
+            with patch.object(authtempo, "spray_one_password", side_effect=quarantine_then_finish) as spray, \
+                    patch.object(authtempo, "setup_signal_handler"), \
+                    patch.object(authtempo, "prompt_continue", return_value=True) as prompt:
+                authtempo.run(cfg, console)
 
             self.assertEqual(spray.call_count, 1)
             self.assertEqual(
@@ -1341,14 +1341,14 @@ class StateAndRunTests(unittest.TestCase):
                 ["nxc:smb"],
             )
             prompt.assert_not_called()
-            data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            data = json.loads((Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(data["used_passwords"], ["First!"])
             self.assertEqual(set(data["active_lockouts"]), {"alice"})
 
     def test_consecutive_lockout_pause_never_uses_an_operator_prompt(self):
         with tempfile.TemporaryDirectory() as tmp:
             users = ["alice", "bob", "carol", "dave"]
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 tool="nxc", protocol="smb", users=users,
                 passwords=["First!"], log_dir=tmp, dry_run=True,
@@ -1359,27 +1359,27 @@ class StateAndRunTests(unittest.TestCase):
             def report_streak(_engine, _cfg, _secret, _ui, state, _realm=None):
                 for user in users:
                     state.add_lockout(user, secret=_secret)
-                return spraygun.RoundResult(
+                return authtempo.RoundResult(
                     lockouts=set(users),
                     aborted=True,
                     abort_reason="consecutive-lockouts",
                 )
 
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "spray_one_password", side_effect=report_streak) as spray, \
-                    patch.object(spraygun, "setup_signal_handler"), \
-                    patch.object(spraygun, "prompt_continue", return_value=True) as prompt:
-                spraygun.run(cfg, console)
+            with patch.object(authtempo, "spray_one_password", side_effect=report_streak) as spray, \
+                    patch.object(authtempo, "setup_signal_handler"), \
+                    patch.object(authtempo, "prompt_continue", return_value=True) as prompt:
+                authtempo.run(cfg, console)
 
             self.assertEqual(spray.call_count, 1)
             prompt.assert_not_called()
-            data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            data = json.loads((Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(set(data["locked_users"]), set(users))
             self.assertEqual(data["used_passwords"], [])
 
     def test_per_pass_ceiling_does_not_combine_signals_across_a_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -1412,7 +1412,7 @@ class StateAndRunTests(unittest.TestCase):
                             candidate,
                             status="auth_failure",
                         )
-                return spraygun.RoundResult(
+                return authtempo.RoundResult(
                     lockouts={user},
                     clean_finish=True,
                     reconciled_complete=True,
@@ -1421,40 +1421,40 @@ class StateAndRunTests(unittest.TestCase):
 
             console = Console(file=io.StringIO(), force_terminal=False)
             with patch.object(
-                spraygun,
+                authtempo,
                 "spray_one_password",
                 side_effect=one_signal_per_pass,
-            ), patch.object(spraygun, "setup_signal_handler"):
-                spraygun.run(cfg, console)
+            ), patch.object(authtempo, "setup_signal_handler"):
+                authtempo.run(cfg, console)
 
             data = json.loads(
-                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+                (Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(data["used_passwords"], ["First!", "Second!"])
             self.assertEqual(data["completed_batches"], 1)
 
     def test_kerbrute_safe_stop_never_fails_over(self):
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
                 tool="kerbrute", users=["alice", "bob"],
                 passwords=["First!"], log_dir=tmp, dry_run=True,
                 no_preflight=True, time_between_rounds=0,
                 passwords_per_round=1, realm_retry=False,
             )
-            stopped = spraygun.RoundResult(
+            stopped = authtempo.RoundResult(
                 lockouts={"alice"},
                 aborted=True,
                 abort_reason="lockout-safety-stop",
             )
             console = Console(file=io.StringIO(), force_terminal=False)
 
-            with patch.object(spraygun, "spray_one_password", return_value=stopped) as spray, \
-                    patch.object(spraygun, "setup_signal_handler"):
-                spraygun.run(cfg, console)
+            with patch.object(authtempo, "spray_one_password", return_value=stopped) as spray, \
+                    patch.object(authtempo, "setup_signal_handler"):
+                authtempo.run(cfg, console)
 
             self.assertEqual(spray.call_count, 1)
-            data = json.loads((Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8"))
+            data = json.loads((Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8"))
             self.assertEqual(data["used_passwords"], [])
             self.assertEqual(data["completed_batches"], 0)
 
@@ -1465,16 +1465,16 @@ class StateAndRunTests(unittest.TestCase):
             users.write_text("alice\n", encoding="utf-8")
             passwords.write_text("Password1!\n", encoding="utf-8")
             argv = [
-                "spraygun.py", "-u", str(users), "-p", str(passwords),
+                "authtempo.py", "-u", str(users), "-p", str(passwords),
                 "-d", "LAB", "-dc-ip", "127.0.0.1", "--dry-run",
                 "--engine-cooldown", "7", "--engine-fail-threshold", "4",
                 "--max-lockouts-per-spray", "6",
                 "--no-realm-retry", "--verbose", "--no-live",
             ]
 
-            with patch.object(sys, "argv", argv), patch.object(spraygun, "run") as run:
+            with patch.object(sys, "argv", argv), patch.object(authtempo, "run") as run:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    spraygun.main()
+                    authtempo.main()
 
             cfg = run.call_args.args[0]
             self.assertEqual(cfg.engine_cooldown_rounds, 7)
@@ -1487,7 +1487,7 @@ class StateAndRunTests(unittest.TestCase):
             self.assertEqual(cfg.feed_lines, 10)
 
     def test_compact_help_uses_operator_language_and_hides_tuning(self):
-        compact = spraygun.build_argument_parser("authtempo").format_help()
+        compact = authtempo.build_argument_parser("authtempo").format_help()
 
         self.assertIn("--limit N", compact)
         self.assertIn("--max-lockouts N", compact)
@@ -1499,7 +1499,7 @@ class StateAndRunTests(unittest.TestCase):
         self.assertNotIn("--tool-retry-after", compact)
 
     def test_advanced_help_explains_tool_recovery_in_plain_language(self):
-        advanced = spraygun.build_argument_parser("authtempo", advanced=True).format_help()
+        advanced = authtempo.build_argument_parser("authtempo", advanced=True).format_help()
 
         self.assertIn("--tool-retry-after GROUPS", advanced)
         self.assertIn("completed password groups", advanced)
@@ -1523,9 +1523,9 @@ class StateAndRunTests(unittest.TestCase):
                 "--report", "all", "--output", str(Path(tmp) / "out"),
             ]
 
-            with patch.object(sys, "argv", argv), patch.object(spraygun, "run") as run:
+            with patch.object(sys, "argv", argv), patch.object(authtempo, "run") as run:
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    spraygun.main()
+                    authtempo.main()
 
             cfg = run.call_args.args[0]
             self.assertEqual(cfg.passwords_per_round, 2)
@@ -1558,14 +1558,14 @@ class StateAndRunTests(unittest.TestCase):
             ]
 
             with patch.object(sys, "argv", argv), patch.object(
-                spraygun,
+                authtempo,
                 "run",
                 return_value=False,
             ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
                 io.StringIO()
             ):
                 with self.assertRaises(SystemExit) as stopped:
-                    spraygun.main()
+                    authtempo.main()
 
             self.assertEqual(stopped.exception.code, 2)
 
@@ -1580,7 +1580,7 @@ class AdversarialSafetyTests(unittest.TestCase):
             "kerbrute_binary": "/fake/kerbrute",
         }
         values.update(overrides)
-        return spraygun.Config(
+        return authtempo.Config(
             "users",
             "passwords",
             "LAB",
@@ -1590,8 +1590,8 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_version_labeled_engine_output_fixtures(self):
         fixture_cases = [
-            ("netexec-1.5.1-observed.golden", spraygun.Engine("nxc", "ldap")),
-            ("kerbrute-1.0.3-observed.golden", spraygun.Engine("kerbrute")),
+            ("netexec-1.5.1-observed.golden", authtempo.Engine("nxc", "ldap")),
+            ("kerbrute-1.0.3-observed.golden", authtempo.Engine("kerbrute")),
         ]
         fixture_dir = Path(__file__).parent / "fixtures"
         for fixture_name, engine in fixture_cases:
@@ -1601,23 +1601,23 @@ class AdversarialSafetyTests(unittest.TestCase):
                     if not source_line or source_line.startswith("#"):
                         continue
                     expected_type, expected_data, output_line = source_line.split("\t", 2)
-                    line_type, data = spraygun.classify_line(engine, output_line)
+                    line_type, data = authtempo.classify_line(engine, output_line)
                     self.assertEqual(line_type.name, expected_type)
                     self.assertEqual(data, expected_data)
 
     def test_unrelated_domain_aliases_are_not_collapsed(self):
         configured = [r"OTHER\alice", "bob@other.example"]
         self.assertEqual(
-            spraygun._normalize_reported_user("alice", configured, "LAB.EXAMPLE"),
+            authtempo._normalize_reported_user("alice", configured, "LAB.EXAMPLE"),
             "alice",
         )
         self.assertEqual(
-            spraygun._normalize_reported_user("bob", configured, "LAB.EXAMPLE"),
+            authtempo._normalize_reported_user("bob", configured, "LAB.EXAMPLE"),
             "bob",
         )
         self.assertNotEqual(
-            spraygun.canonical_identity(r"OTHER\alice", "LAB.EXAMPLE"),
-            spraygun.canonical_identity("alice", "LAB.EXAMPLE"),
+            authtempo.canonical_identity(r"OTHER\alice", "LAB.EXAMPLE"),
+            authtempo.canonical_identity("alice", "LAB.EXAMPLE"),
         )
 
     @unittest.skipUnless(hasattr(os, "killpg") and Path("/proc").is_dir(), "Linux process groups required")
@@ -1643,16 +1643,16 @@ class AdversarialSafetyTests(unittest.TestCase):
         try:
             self.assertIsNotNone(proc.stdout)
             grandchild_pid = int(proc.stdout.readline().strip())
-            spraygun._stop_process(proc)
+            authtempo._stop_process(proc)
             self.assertIsNotNone(proc.poll())
             stat_path = Path(f"/proc/{grandchild_pid}/stat")
-            deadline = spraygun.time.monotonic() + 1
+            deadline = authtempo.time.monotonic() + 1
             state = ""
-            while stat_path.exists() and spraygun.time.monotonic() < deadline:
+            while stat_path.exists() and authtempo.time.monotonic() < deadline:
                 state = stat_path.read_text(encoding="utf-8").split()[2]
                 if state == "Z":
                     break
-                spraygun.time.sleep(0.02)
+                authtempo.time.sleep(0.02)
             self.assertTrue(not stat_path.exists() or state == "Z")
         finally:
             try:
@@ -1664,8 +1664,8 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_nxc_ldap_user_account_locked_is_not_an_auth_failure(self):
         line = "LDAP 127.0.0.1 389 DC [-] LAB\\alice:One! USER_ACCOUNT_LOCKED"
-        line_type, user = spraygun.classify_line(spraygun.Engine("nxc", "ldap"), line)
-        self.assertEqual(line_type, spraygun.LineType.LOCKOUT)
+        line_type, user = authtempo.classify_line(authtempo.Engine("nxc", "ldap"), line)
+        self.assertEqual(line_type, authtempo.LineType.LOCKOUT)
         self.assertEqual(user, "alice")
 
     def test_signal_four_stops_before_a_fifth_identity_is_dispatched(self):
@@ -1682,11 +1682,11 @@ class AdversarialSafetyTests(unittest.TestCase):
                 lockout_threshold=99,
                 lockout_burst=3,
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             processes = [fake_process([line]) for line in lines]
-            with patch.object(spraygun.subprocess, "Popen", side_effect=processes) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "ldap"), cfg, "One!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", side_effect=processes) as popen:
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "ldap"), cfg, "One!", QuietUI(), state,
                 )
 
             self.assertTrue(result.aborted)
@@ -1699,7 +1699,7 @@ class AdversarialSafetyTests(unittest.TestCase):
         users = ["alice", "bob", "carol", "dave", "erin"]
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, users=users, passwords=["One!"], lockout_burst=3)
-            first = spraygun.State(tmp, cfg)
+            first = authtempo.State(tmp, cfg)
             for user in users[:4]:
                 first.add_lockout(user, secret="One!", engine="nxc", protocol="ldap")
             first.close()
@@ -1711,17 +1711,17 @@ class AdversarialSafetyTests(unittest.TestCase):
                 lockout_burst=3,
                 resume=True,
             )
-            resumed = spraygun.State(tmp, resumed_cfg)
+            resumed = authtempo.State(tmp, resumed_cfg)
             erin_failure = fake_process([
                 "LDAP 127.0.0.1 389 DC [-] LAB\\erin:One! STATUS_LOGON_FAILURE\n"
             ])
             with patch.object(
-                spraygun.subprocess,
+                authtempo.subprocess,
                 "Popen",
                 return_value=erin_failure,
             ) as popen:
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "ldap"),
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "ldap"),
                     resumed_cfg,
                     "One!",
                     QuietUI(),
@@ -1741,7 +1741,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "time_between_rounds": 0,
                 "dry_run": True,
             }
-            first = spraygun.State(tmp, self.make_config(tmp, **values))
+            first = authtempo.State(tmp, self.make_config(tmp, **values))
             for secret in values["passwords"][:2]:
                 first.mark_attempted(secret, "alice", status="dry_run")
                 first.mark_used(secret)
@@ -1749,14 +1749,14 @@ class AdversarialSafetyTests(unittest.TestCase):
 
             resumed_cfg = self.make_config(tmp, resume=True, **values)
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "setup_signal_handler"), patch.object(
-                spraygun.time,
+            with patch.object(authtempo, "setup_signal_handler"), patch.object(
+                authtempo.time,
                 "sleep",
             ):
-                spraygun.run(resumed_cfg, console)
+                authtempo.run(resumed_cfg, console)
 
             data = json.loads(
-                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+                (Path(tmp) / authtempo.STATE_FILE_NAME).read_text(encoding="utf-8")
             )
             self.assertEqual(data["completed_batches"], 2)
             self.assertEqual(data["remaining_queue"], [])
@@ -1770,7 +1770,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "time_between_rounds": 35,
                 "dry_run": True,
             }
-            first = spraygun.State(tmp, self.make_config(tmp, **values))
+            first = authtempo.State(tmp, self.make_config(tmp, **values))
             first.mark_attempted("One!", "alice", status="dry_run")
             first.mark_used("One!")
             first.mark_round_complete()
@@ -1779,12 +1779,12 @@ class AdversarialSafetyTests(unittest.TestCase):
             waits = []
             resumed_cfg = self.make_config(tmp, resume=True, **values)
             console = Console(file=io.StringIO(), force_terminal=False)
-            with patch.object(spraygun, "setup_signal_handler"), patch.object(
-                spraygun.RichUI,
+            with patch.object(authtempo, "setup_signal_handler"), patch.object(
+                authtempo.RichUI,
                 "countdown",
                 side_effect=lambda seconds: waits.append(seconds),
-            ), patch.object(spraygun.time, "sleep"):
-                spraygun.run(resumed_cfg, console)
+            ), patch.object(authtempo.time, "sleep"):
+                authtempo.run(resumed_cfg, console)
 
             self.assertEqual(len(waits), 1)
             self.assertGreaterEqual(waits[0], 35 * 60 - 2)
@@ -1796,7 +1796,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 users=["Alice", "bob", "carol"],
                 passwords=["Password1!", "Different!"],
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_lockout("alice", secret="Password1!")
             state.add_cred("BOB", "Different!")
             self.assertEqual(state.eligible_users_for("Password1!"), ["carol"])
@@ -1808,9 +1808,9 @@ class AdversarialSafetyTests(unittest.TestCase):
                 users=["alice"],
                 passwords=["One!", "Two!", "Three!"],
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.add_cred("alice", "One!")
-            state.begin_attempt("Two!", "alice", spraygun.Engine("nxc", "ldap"))
+            state.begin_attempt("Two!", "alice", authtempo.Engine("nxc", "ldap"))
             state.finish_attempt("Two!", "alice", "indeterminate")
             self.assertEqual(
                 state.quarantine_reasons("alice"),
@@ -1827,21 +1827,21 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_kerbrute_failure_and_password_expiry_keep_the_identity(self):
         failure = "2026/10/13 > [!] HOST$@LAB:One! - KDC_ERR_PREAUTH_FAILED"
-        line_type, user = spraygun.classify_line(spraygun.Engine("kerbrute"), failure)
-        self.assertEqual((line_type, user), (spraygun.LineType.AUTHFAIL, "HOST$@LAB"))
+        line_type, user = authtempo.classify_line(authtempo.Engine("kerbrute"), failure)
+        self.assertEqual((line_type, user), (authtempo.LineType.AUTHFAIL, "HOST$@LAB"))
 
         success = (
             "2026/10/13 > [+] VALID LOGIN WITH ERROR: HOST$@LAB:One! "
             "(KDC_ERR_KEY_EXPIRED)"
         )
-        line_type, data = spraygun.classify_line(spraygun.Engine("kerbrute"), success)
-        self.assertEqual(line_type, spraygun.LineType.PASSWORD_EXPIRED)
+        line_type, data = authtempo.classify_line(authtempo.Engine("kerbrute"), success)
+        self.assertEqual(line_type, authtempo.LineType.PASSWORD_EXPIRED)
         self.assertEqual(data, "HOST$@LAB:One!")
 
     def test_nxc_password_change_states_are_valid_credential_results(self):
         cases = (
-            ("STATUS_PASSWORD_EXPIRED", spraygun.LineType.PASSWORD_EXPIRED),
-            ("STATUS_PASSWORD_MUST_CHANGE", spraygun.LineType.PASSWORD_MUST_CHANGE),
+            ("STATUS_PASSWORD_EXPIRED", authtempo.LineType.PASSWORD_EXPIRED),
+            ("STATUS_PASSWORD_MUST_CHANGE", authtempo.LineType.PASSWORD_MUST_CHANGE),
         )
         for protocol in ("smb", "ldap"):
             for status, expected_type in cases:
@@ -1850,8 +1850,8 @@ class AdversarialSafetyTests(unittest.TestCase):
                         f"{protocol.upper()} 127.0.0.1 445 DC [-] "
                         f"LAB\\alice:One! {status}"
                     )
-                    line_type, data = spraygun.classify_line(
-                        spraygun.Engine("nxc", protocol),
+                    line_type, data = authtempo.classify_line(
+                        authtempo.Engine("nxc", protocol),
                         line,
                         expected_secret="One!",
                     )
@@ -1864,7 +1864,7 @@ class AdversarialSafetyTests(unittest.TestCase):
             "LAB\\alice:Password1! STATUS_PASSWORD_EXPIRED\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = spraygun.Config(
+            cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -1874,14 +1874,14 @@ class AdversarialSafetyTests(unittest.TestCase):
                 log_dir=tmp,
                 nxc_binary="/fake/nxc",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             with patch.object(
-                spraygun.subprocess,
+                authtempo.subprocess,
                 "Popen",
                 return_value=fake_process([line]),
             ):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "smb"),
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "smb"),
                     cfg,
                     "Password1!",
                     QuietUI(),
@@ -1902,7 +1902,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "password_expired",
             )
             action_text = (
-                Path(tmp) / spraygun.PASSWORD_CHANGES_FILE_NAME
+                Path(tmp) / authtempo.PASSWORD_CHANGES_FILE_NAME
             ).read_text(encoding="utf-8")
             self.assertIn("Credential: alice:Password1!", action_text)
             command = next(
@@ -1927,7 +1927,7 @@ class AdversarialSafetyTests(unittest.TestCase):
             )
             state.close()
 
-            resumed_cfg = spraygun.Config(
+            resumed_cfg = authtempo.Config(
                 "users",
                 "passwords",
                 "LAB",
@@ -1938,7 +1938,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 nxc_binary="/fake/nxc",
                 resume=True,
             )
-            resumed = spraygun.State(tmp, resumed_cfg)
+            resumed = authtempo.State(tmp, resumed_cfg)
             self.assertEqual(
                 resumed.credentials[0]["credential_state"],
                 "password_expired",
@@ -1946,7 +1946,7 @@ class AdversarialSafetyTests(unittest.TestCase):
             resumed.close()
 
     def test_hash_password_change_command_supplies_the_recorded_hash(self):
-        command = spraygun.build_password_change_command(
+        command = authtempo.build_password_change_command(
             "LAB",
             "LAB\\Alice",
             "127.0.0.1",
@@ -1961,15 +1961,15 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_nxc_machine_account_success_is_parsed(self):
         line = "SMB 127.0.0.1 445 DC [+] LAB\\HOST$:One!"
-        line_type, data = spraygun.classify_line(spraygun.Engine("nxc", "smb"), line)
-        self.assertEqual(line_type, spraygun.LineType.SUCCESS)
+        line_type, data = authtempo.classify_line(authtempo.Engine("nxc", "smb"), line)
+        self.assertEqual(line_type, authtempo.LineType.SUCCESS)
         self.assertEqual(data, "HOST$:One!")
 
     def test_resume_requires_an_existing_valid_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, resume=True)
             with self.assertRaisesRegex(RuntimeError, "state file is missing"):
-                spraygun.State(tmp, cfg)
+                authtempo.State(tmp, cfg)
 
     def test_resume_detects_former_authcadence_state_without_migrating_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1979,28 +1979,28 @@ class AdversarialSafetyTests(unittest.TestCase):
             )
             cfg = self.make_config(tmp, resume=True)
             with self.assertRaisesRegex(RuntimeError, "legacy state"):
-                spraygun.State(tmp, cfg)
+                authtempo.State(tmp, cfg)
 
     def test_resume_refuses_corrupt_and_incomplete_state(self):
         for payload in ("{", "{}"):
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as tmp:
-                (Path(tmp) / spraygun.STATE_FILE_NAME).write_text(payload, encoding="utf-8")
+                (Path(tmp) / authtempo.STATE_FILE_NAME).write_text(payload, encoding="utf-8")
                 cfg = self.make_config(tmp, resume=True)
                 with self.assertRaises(RuntimeError):
-                    spraygun.State(tmp, cfg)
+                    authtempo.State(tmp, cfg)
 
     def test_resume_refuses_an_inconsistent_secret_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state = spraygun.State(tmp, self.make_config(tmp))
+            state = authtempo.State(tmp, self.make_config(tmp))
             state.close()
-            state_path = Path(tmp) / spraygun.STATE_FILE_NAME
+            state_path = Path(tmp) / authtempo.STATE_FILE_NAME
             data = json.loads(state_path.read_text(encoding="utf-8"))
             data["remaining_queue"] = []
             state_path.write_text(json.dumps(data), encoding="utf-8")
             os.chmod(state_path, 0o600)
 
             with self.assertRaisesRegex(RuntimeError, "secret queue"):
-                spraygun.State(tmp, self.make_config(tmp, resume=True))
+                authtempo.State(tmp, self.make_config(tmp, resume=True))
 
     def test_attempt_metrics_are_rebuilt_from_the_pair_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2008,13 +2008,13 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "users": ["alice", "bob", "carol"],
                 "passwords": ["Password1!"],
             }
-            state = spraygun.State(tmp, self.make_config(tmp, **values))
+            state = authtempo.State(tmp, self.make_config(tmp, **values))
             for user, status in (("alice", "auth_failure"), ("bob", "indeterminate")):
                 self.assertTrue(
                     state.begin_attempt(
                         "Password1!",
                         user,
-                        spraygun.Engine("nxc", "ldap"),
+                        authtempo.Engine("nxc", "ldap"),
                     )
                 )
                 state.finish_attempt("Password1!", user, status)
@@ -2026,14 +2026,14 @@ class AdversarialSafetyTests(unittest.TestCase):
             state.mark_used("Password1!")
             state.close()
 
-            state_path = Path(tmp) / spraygun.STATE_FILE_NAME
+            state_path = Path(tmp) / authtempo.STATE_FILE_NAME
             data = json.loads(state_path.read_text(encoding="utf-8"))
             data["total_attempts"] = 999
             data["attempts_by_password"] = {"Password1!": 999}
             state_path.write_text(json.dumps(data), encoding="utf-8")
             os.chmod(state_path, 0o600)
 
-            resumed = spraygun.State(
+            resumed = authtempo.State(
                 tmp,
                 self.make_config(tmp, resume=True, **values),
             )
@@ -2045,11 +2045,11 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_resume_rejects_changed_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             first_cfg = self.make_config(tmp)
-            first = spraygun.State(tmp, first_cfg)
+            first = authtempo.State(tmp, first_cfg)
             first.close()
             second_cfg = self.make_config(tmp, users=["alice", "bob"], resume=True)
             with self.assertRaisesRegex(RuntimeError, "does not match"):
-                spraygun.State(tmp, second_cfg)
+                authtempo.State(tmp, second_cfg)
 
     def test_resume_restores_filtered_identities_from_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2057,13 +2057,13 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "users": ["alice", "bob"],
                 "filter_disabled": True,
             }
-            first = spraygun.State(tmp, self.make_config(tmp, **values))
+            first = authtempo.State(tmp, self.make_config(tmp, **values))
             first.set_effective_users(["alice"])
             first.close()
 
             self.assertFalse((Path(tmp) / "active-users.txt").exists())
             resumed_cfg = self.make_config(tmp, resume=True, **values)
-            resumed = spraygun.State(tmp, resumed_cfg)
+            resumed = authtempo.State(tmp, resumed_cfg)
             self.assertTrue(resumed.identity_filter_complete)
             self.assertEqual(resumed_cfg.users, ["alice"])
             resumed.close()
@@ -2074,10 +2074,10 @@ class AdversarialSafetyTests(unittest.TestCase):
                 "users": ["alice", "bob"],
                 "filter_disabled": True,
             }
-            first = spraygun.State(tmp, self.make_config(tmp, **values))
+            first = authtempo.State(tmp, self.make_config(tmp, **values))
             first.close()
 
-            resumed = spraygun.State(
+            resumed = authtempo.State(
                 tmp,
                 self.make_config(tmp, resume=True, **values),
             )
@@ -2087,13 +2087,13 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_resume_rejects_changed_spray_timing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            first = spraygun.State(
+            first = authtempo.State(
                 tmp,
                 self.make_config(tmp, time_between_rounds=35),
             )
             first.close()
             with self.assertRaisesRegex(RuntimeError, "does not match"):
-                spraygun.State(
+                authtempo.State(
                     tmp,
                     self.make_config(
                         tmp,
@@ -2104,13 +2104,13 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_resume_rejects_changed_engine_safety_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
-            first = spraygun.State(
+            first = authtempo.State(
                 tmp,
                 self.make_config(tmp, engine_cooldown_rounds=3),
             )
             first.close()
             with self.assertRaisesRegex(RuntimeError, "does not match"):
-                spraygun.State(
+                authtempo.State(
                     tmp,
                     self.make_config(
                         tmp,
@@ -2122,19 +2122,19 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_resume_rejects_inconsistent_engine_cooldown_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             values = {"engine_transient_threshold": 1}
-            state = spraygun.State(tmp, self.make_config(tmp, **values))
+            state = authtempo.State(tmp, self.make_config(tmp, **values))
             state.register_engine_failure("kerbrute", "timeout")
             state.save()
             state.close()
 
-            state_path = Path(tmp) / spraygun.STATE_FILE_NAME
+            state_path = Path(tmp) / authtempo.STATE_FILE_NAME
             data = json.loads(state_path.read_text(encoding="utf-8"))
             data["engine_health"]["kerbrute"]["demoted"] = False
             state_path.write_text(json.dumps(data), encoding="utf-8")
             os.chmod(state_path, 0o600)
 
             with self.assertRaisesRegex(RuntimeError, "engine-health"):
-                spraygun.State(
+                authtempo.State(
                     tmp,
                     self.make_config(tmp, resume=True, **values),
                 )
@@ -2142,12 +2142,12 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_in_flight_pair_becomes_indeterminate_and_is_not_retried(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
-            first = spraygun.State(tmp, cfg)
-            first.begin_attempt("Password1!", "alice", spraygun.Engine("nxc", "ldap"))
+            first = authtempo.State(tmp, cfg)
+            first.begin_attempt("Password1!", "alice", authtempo.Engine("nxc", "ldap"))
             first.close()
 
             resumed_cfg = self.make_config(tmp, resume=True)
-            resumed = spraygun.State(tmp, resumed_cfg)
+            resumed = authtempo.State(tmp, resumed_cfg)
             self.assertEqual(resumed.pair_status("Password1!", "alice"), "indeterminate")
             self.assertEqual(resumed.eligible_users_for("Password1!"), [])
 
@@ -2155,18 +2155,18 @@ class AdversarialSafetyTests(unittest.TestCase):
         for status in ("success", "lockout", "ambiguous_lockout"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
                 cfg = self.make_config(tmp)
-                first = spraygun.State(tmp, cfg)
+                first = authtempo.State(tmp, cfg)
                 first.begin_attempt(
                     "Password1!",
                     "alice",
-                    spraygun.Engine("nxc", "ldap"),
+                    authtempo.Engine("nxc", "ldap"),
                 )
                 # Simulate a crash from the former two-write path: the terminal
                 # pair reached disk but its aggregate finding/signal did not.
                 first.finish_attempt("Password1!", "alice", status)
                 first.close()
 
-                resumed = spraygun.State(tmp, self.make_config(tmp, resume=True))
+                resumed = authtempo.State(tmp, self.make_config(tmp, resume=True))
                 if status == "success":
                     self.assertEqual(
                         resumed.credential_pairs(),
@@ -2195,8 +2195,8 @@ class AdversarialSafetyTests(unittest.TestCase):
                 passwords=["First!", "Second!"],
                 retry_indeterminate=True,
             )
-            state = spraygun.State(tmp, cfg)
-            engine = spraygun.Engine("nxc", "ldap")
+            state = authtempo.State(tmp, cfg)
+            engine = authtempo.Engine("nxc", "ldap")
             state.begin_attempt("First!", "alice", engine)
             state.finish_attempt("First!", "alice", "indeterminate")
             self.assertIn("indeterminate", state.quarantine_reasons("alice"))
@@ -2220,10 +2220,10 @@ class AdversarialSafetyTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, passwords=["passwords.txt"])
-            state = spraygun.State(tmp, cfg)
-            with patch.object(spraygun.subprocess, "Popen", side_effect=launch):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "ldap"),
+            state = authtempo.State(tmp, cfg)
+            with patch.object(authtempo.subprocess, "Popen", side_effect=launch):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "ldap"),
                     cfg,
                     "passwords.txt",
                     QuietUI(),
@@ -2238,18 +2238,18 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_output_directory_lock_prevents_concurrent_state_writers(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
-            first = spraygun.State(tmp, cfg)
+            first = authtempo.State(tmp, cfg)
             try:
                 with self.assertRaisesRegex(RuntimeError, "already using"):
-                    spraygun.State(tmp, cfg)
+                    authtempo.State(tmp, cfg)
             finally:
                 first.close()
 
     def test_demoted_engine_is_absent_during_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp, engine_transient_threshold=1)
-            state = spraygun.State(tmp, cfg)
-            chain = [spraygun.Engine("kerbrute"), spraygun.Engine("nxc", "ldap")]
+            state = authtempo.State(tmp, cfg)
+            chain = [authtempo.Engine("kerbrute"), authtempo.Engine("nxc", "ldap")]
             state.register_engine_failure("kerbrute", "timeout")
             self.assertEqual(
                 [str(engine) for engine in state.compute_effective_chain(chain)],
@@ -2265,13 +2265,13 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_missing_kerbrute_summary_is_not_reconciled(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = fake_process([
                 "2026/10/13 > [!] alice@LAB:Password1! - KDC_ERR_PREAUTH_FAILED\n"
             ])
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc):
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("kerbrute"), cfg, "Password1!", QuietUI(), state,
                 )
             self.assertTrue(result.aborted)
             self.assertEqual(result.abort_reason, "missing-summary")
@@ -2280,12 +2280,12 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_runtime_artifacts_are_private(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
-            spraygun.State(tmp, cfg)
+            authtempo.State(tmp, cfg)
             for name in (
-                spraygun.STATE_FILE_NAME,
-                spraygun.AUDIT_LOG_NAME,
+                authtempo.STATE_FILE_NAME,
+                authtempo.AUDIT_LOG_NAME,
                 "creds.txt",
-                spraygun.PASSWORD_CHANGES_FILE_NAME,
+                authtempo.PASSWORD_CHANGES_FILE_NAME,
                 "locked-out.txt",
                 "used-passwords.txt",
             ):
@@ -2295,16 +2295,16 @@ class AdversarialSafetyTests(unittest.TestCase):
     def test_engine_idle_timeout_marks_only_pair_indeterminate(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = self.make_config(tmp)
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             proc = fake_process([], running=True)
-            with patch.object(spraygun.subprocess, "Popen", return_value=proc), \
+            with patch.object(authtempo.subprocess, "Popen", return_value=proc), \
                     patch.object(
-                        spraygun,
+                        authtempo,
                         "_iter_process_output",
-                        side_effect=spraygun.EngineOutputTimeout("idle-timeout"),
+                        side_effect=authtempo.EngineOutputTimeout("idle-timeout"),
                     ):
-                result = spraygun.spray_one_password(
-                    spraygun.Engine("nxc", "ldap"), cfg, "Password1!", QuietUI(), state,
+                result = authtempo.spray_one_password(
+                    authtempo.Engine("nxc", "ldap"), cfg, "Password1!", QuietUI(), state,
                 )
             self.assertTrue(result.aborted)
             self.assertEqual(result.abort_reason, "idle-timeout")
@@ -2313,10 +2313,10 @@ class AdversarialSafetyTests(unittest.TestCase):
 
     def test_fresh_run_requires_explicit_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:
-            first = spraygun.State(tmp, self.make_config(tmp))
+            first = authtempo.State(tmp, self.make_config(tmp))
             first.close()
             with self.assertRaisesRegex(RuntimeError, "--start-fresh"):
-                spraygun.State(tmp, self.make_config(tmp))
+                authtempo.State(tmp, self.make_config(tmp))
 
     def test_csv_escapes_spreadsheet_formulas_and_keeps_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2326,7 +2326,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 passwords=["+payload", " =payload"],
                 export="csv",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.current_round = 7
             state.add_cred("=cmd", "+payload", engine="nxc:ldap")
             state.add_cred("safe", " =payload", engine="nxc:ldap")
@@ -2349,10 +2349,10 @@ class AdversarialSafetyTests(unittest.TestCase):
                 passwords=["First!"],
                 export="csv",
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.current_round = 1
             state.current_pass = 1
-            engine = spraygun.Engine("nxc", "smb")
+            engine = authtempo.Engine("nxc", "smb")
 
             state.begin_attempt("First!", "alice", engine)
             state.finish_attempt("First!", "alice", "success")
@@ -2383,10 +2383,10 @@ class AdversarialSafetyTests(unittest.TestCase):
                 users=["alice", "bob"],
                 passwords=["First!"],
             )
-            state = spraygun.State(tmp, cfg)
+            state = authtempo.State(tmp, cfg)
             state.current_round = 1
             state.current_pass = 1
-            engine = spraygun.Engine("nxc", "smb")
+            engine = authtempo.Engine("nxc", "smb")
             state.begin_attempt("First!", "alice", engine)
             state.finish_attempt("First!", "alice", "success")
             state.add_cred("alice", "First!", engine="nxc:smb")
@@ -2412,14 +2412,14 @@ class AdversarialSafetyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                spraygun.read_input_lines(str(path), identities=False),
+                authtempo.read_input_lines(str(path), identities=False),
                 ["  spaced secret  ", "#literal", " #leading-space-hash"],
             )
 
     def test_programmatic_inputs_cannot_expand_one_dispatch_into_multiple_lines(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "line/control"):
-                spraygun.State(
+                authtempo.State(
                     tmp,
                     self.make_config(tmp, passwords=["One!\nTwo!"]),
                 )

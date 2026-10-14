@@ -15,7 +15,7 @@ authtempo = "authtempo:main"
 authcadence = "authtempo:main"
 
 [tool.setuptools]
-py-modules = ["authtempo", "authcadence", "spraygun", "password_mutator"]
+py-modules = ["authtempo", "authtempo_core", "authcadence", "password_mutator"]
 
 [tool.ruff]
 line-length = 120
