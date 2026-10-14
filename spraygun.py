@@ -65,6 +65,7 @@ PRODUCT_TAGLINE = "controlled authentication testing with enforced safety limits
 STATE_FILE_NAME = f"{PRODUCT_SLUG}.state.json"
 AUDIT_LOG_NAME = f"{PRODUCT_SLUG}.log"
 TIMELINE_HTML_NAME = f"{PRODUCT_SLUG}-timeline.html"
+PASSWORD_CHANGES_FILE_NAME = "password-change-required.txt"
 
 # =============================================================================
 # Dataclasses
@@ -134,6 +135,7 @@ class RoundResult:
     """Results from spraying one password/hash with one engine."""
     successes: List[Tuple[str, str]] = field(default_factory=list)  # (user, secret)
     admin_users: List[Tuple[str, str]] = field(default_factory=list)  # (user, secret) - admin/pwn3d
+    password_change_required: List[Tuple[str, str, str]] = field(default_factory=list)
     lockouts: Set[str] = field(default_factory=set)
     unknown_lockouts: int = 0
     conn_fails: int = 0
@@ -166,6 +168,8 @@ class RoundResult:
 class LineType(enum.Enum):
     SUCCESS = "SUCCESS"
     ADMIN = "ADMIN"  # Admin/high-privilege user (pwn3d!)
+    PASSWORD_EXPIRED = "PASSWORD_EXPIRED"
+    PASSWORD_MUST_CHANGE = "PASSWORD_MUST_CHANGE"
     LOCKOUT = "LOCKOUT"
     AMBIGUOUS_LOCKOUT = "AMBIGUOUS_LOCKOUT"
     CONN_ERROR = "CONN_ERROR"
@@ -251,13 +255,21 @@ KERBRUTE_AUTHFAIL_PATTERNS = [
     r"KDC_ERR_C_PRINCIPAL_UNKNOWN",
 ]
 
+PASSWORD_EXPIRED_PATTERNS = [
+    r"\bSTATUS_PASSWORD_EXPIRED\b",
+    r"\bKDC_ERR_KEY_EXPIRED\b",
+]
+PASSWORD_MUST_CHANGE_PATTERNS = [
+    r"\bSTATUS_PASSWORD_MUST_CHANGE\b",
+]
+
 NXC_FATAL_ERROR_PATTERNS = [
     r"Exception while calling proto_flow",
     r"Traceback \(most recent call last\)",
     r"Unhandled exception",
 ]
 
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 7
 QUARANTINE_PRIORITY = {
     "confirmed_lockout": 0,
     "ambiguous_lockout_signal": 1,
@@ -265,10 +277,19 @@ QUARANTINE_PRIORITY = {
     "indeterminate": 3,
     "unknown": 99,
 }
-TERMINAL_PAIR_STATUSES = {
-    "auth_failure",
+PASSWORD_CHANGE_PAIR_STATUSES = {
+    "password_expired",
+    "password_must_change",
+}
+SUCCESS_PAIR_STATUSES = {
     "success",
     "admin_success",
+    *PASSWORD_CHANGE_PAIR_STATUSES,
+}
+CREDENTIAL_STATES = {"valid", *PASSWORD_CHANGE_PAIR_STATUSES}
+TERMINAL_PAIR_STATUSES = {
+    "auth_failure",
+    *SUCCESS_PAIR_STATUSES,
     "lockout",
     "ambiguous_lockout",
     "indeterminate",
@@ -304,6 +325,66 @@ def canonical_identity(user: str, domain: str = "") -> str:
             value = short
 
     return value.casefold()
+
+
+def unqualified_identity(user: str, domain: str = "") -> str:
+    """Return an AD username without a configured-domain qualifier."""
+    value = str(user).strip()
+    configured_domain = domain.casefold().rstrip(".")
+    configured_short = configured_domain.split(".", 1)[0] if configured_domain else ""
+    if "\\" in value:
+        qualifier, short = value.rsplit("\\", 1)
+        if not configured_domain or qualifier.casefold() in {
+            configured_domain,
+            configured_short,
+        }:
+            return short
+    if "@" in value:
+        short, qualifier = value.rsplit("@", 1)
+        if not configured_domain or qualifier.casefold().rstrip(".") in {
+            configured_domain,
+            configured_short,
+        }:
+            return short
+    return value
+
+
+def build_password_change_command(
+    domain: str,
+    user: str,
+    dc_ip: str,
+    *,
+    secret: str = "",
+    pth_mode: bool = False,
+) -> str:
+    """Build the installed Impacket self-service password-change command."""
+    target = f"{domain}/{unqualified_identity(user, domain)}@{dc_ip}"
+    command = ["impacket-changepasswd", "-protocol", "smb-samr"]
+    if pth_mode:
+        command.extend(["-hashes", secret])
+    command.append(target)
+    return shlex.join(command)
+
+
+def credential_state_label(state: str) -> str:
+    """Return an operator-facing description for a credential state."""
+    return {
+        "valid": "ready to use",
+        "password_expired": "password expired",
+        "password_must_change": "password must be changed",
+    }.get(state, state.replace("_", " "))
+
+
+def humanize_tool_issue(reason: str) -> str:
+    """Translate internal engine failure codes for operator output."""
+    return {
+        "command-not-found": "tool command was not found",
+        "binary-not-found": "tool binary was not found",
+        "idle-timeout": "tool stopped producing output",
+        "total-timeout": "tool exceeded its time limit",
+        "connection-errors": "network connection failed",
+        "unreconciled-output": "tool output could not be verified",
+    }.get(reason, reason.replace("-", " ") or "unknown issue")
 
 
 def _identity_aliases(user: str, domain: str) -> Set[str]:
@@ -421,12 +502,14 @@ class RichUI:
         self.round_successes: List[Tuple[str, str]] = []
         self._round_success_set: Set[Tuple[str, str]] = set()
         self.round_admins: Set[Tuple[str, str]] = set()
+        self.round_password_changes: Dict[Tuple[str, str], str] = {}
         self.round_lockouts: Set[str] = set()
         self.round_unknown_lockouts = 0
         self.round_signal_events = 0
         self.run_successes: List[Tuple[str, str]] = []
         self._run_success_set: Set[Tuple[str, str]] = set()
         self.run_admins: Set[Tuple[str, str]] = set()
+        self.run_password_changes: Dict[Tuple[str, str], str] = {}
         self.run_lockouts: Set[str] = set()
         self.run_unknown_lockouts = 0
         self.run_signal_events = 0
@@ -454,11 +537,17 @@ class RichUI:
         locked_users: Set[str],
         unknown_lockouts: int = 0,
         signal_events: Optional[int] = None,
+        credential_states: Optional[Dict[Tuple[str, str], str]] = None,
     ) -> None:
         """Seed run-wide UI totals from persisted state (including resumes)."""
         self.run_successes = list(dict.fromkeys(credentials))
         self._run_success_set = set(self.run_successes)
         self.run_admins = set(admin_credentials)
+        self.run_password_changes = {
+            pair: state
+            for pair, state in (credential_states or {}).items()
+            if state in PASSWORD_CHANGE_PAIR_STATUSES
+        }
         self.run_lockouts = set(locked_users)
         self.run_unknown_lockouts = unknown_lockouts
         self.run_signal_events = (
@@ -478,6 +567,7 @@ class RichUI:
             self.round_successes = []
             self._round_success_set = set()
             self.round_admins = set()
+            self.round_password_changes = {}
             self.round_lockouts = set()
             self.round_unknown_lockouts = 0
             self.round_signal_events = 0
@@ -502,7 +592,7 @@ class RichUI:
                 self._live_warning_shown = True
                 self.console.print(
                     "[*] tmux detected: using stable streaming display. "
-                    "Use --live to force the cursor-based dashboard.",
+                    "Use --dashboard to force the cursor-based dashboard.",
                     style="cyan",
                 )
             self.console.print(
@@ -580,6 +670,34 @@ class RichUI:
             )
         self._update_display()
 
+    def update_password_change(
+        self,
+        user: str,
+        secret: str,
+        credential_state: str,
+        command: str,
+    ) -> None:
+        """Register and prominently display a valid credential needing a change."""
+        is_new = (user, secret) not in self._run_success_set
+        self._record_success(user, secret, is_admin=False)
+        pair = (user, secret)
+        self.round_password_changes[pair] = credential_state
+        self.run_password_changes[pair] = credential_state
+        if self._stream_fallback and is_new:
+            self.console.print(
+                f"[!] VALID CREDENTIAL — {credential_state_label(credential_state).upper()}",
+                style="magenta bold",
+            )
+            self.console.print(
+                f"    {escape(str(user))}:{escape(str(secret))}",
+                style="magenta bold",
+            )
+            self.console.print(
+                f"    Change it: {escape(command)}",
+                style="magenta",
+            )
+        self._update_display()
+
     def _record_success(self, user: str, secret: str, is_admin: bool) -> None:
         pair = (user, secret)
         if pair not in self.phase_data["success_set"]:
@@ -648,7 +766,7 @@ class RichUI:
             self._live_warning_shown = True
             self.console.print(
                 f"[!] Live display unavailable ({escape(type(exc).__name__)}); "
-                "streaming raw output instead. Use --no-live to select this mode explicitly.",
+                "streaming raw output instead. Use --stream to select this mode explicitly.",
                 style="yellow",
             )
 
@@ -695,6 +813,8 @@ class RichUI:
             pair = (user, found_secret)
             if pair in self.run_admins:
                 marker = "[red bold]★ ADMIN[/red bold]"
+            elif pair in self.run_password_changes:
+                marker = "[magenta bold]↻ CHANGE REQUIRED[/magenta bold]"
             else:
                 marker = "[green]✓[/green]"
             grid.add_row(
@@ -750,6 +870,15 @@ class RichUI:
             # Check for admin/pwn3d indicators first (highest priority)
             if any(kw in line for kw in ["(Pwn3d!)", "[ADMIN]", "Domain Admin", "Administrator"]):
                 colored.append(f"[red bold]{safe_line}[/red bold]")
+            elif any(
+                marker in line.upper()
+                for marker in (
+                    "STATUS_PASSWORD_EXPIRED",
+                    "STATUS_PASSWORD_MUST_CHANGE",
+                    "KDC_ERR_KEY_EXPIRED",
+                )
+            ):
+                colored.append(f"[magenta bold]{safe_line}[/magenta bold]")
             elif "[+]" in line or "VALID LOGIN" in line:
                 colored.append(f"[green]{safe_line}[/green]")
             elif any(kw in line.upper() for kw in ["LOCKED", "LOCKOUT", "REVOKED"]):
@@ -856,6 +985,7 @@ class State:
         self.state_file = self.log_dir / STATE_FILE_NAME
         self.overall_log = self.log_dir / AUDIT_LOG_NAME
         self.creds_file = self.log_dir / "creds.txt"
+        self.password_changes_file = self.log_dir / PASSWORD_CHANGES_FILE_NAME
         self.lockouts_file = self.log_dir / "locked-out.txt"
         self.used_file = self.log_dir / "used-passwords.txt"
 
@@ -1007,6 +1137,7 @@ class State:
             "spraygun.state.json",
             "spraygun-spray.log",
             "creds.txt",
+            PASSWORD_CHANGES_FILE_NAME,
             "locked-out.txt",
             "used-passwords.txt",
             "active-users.txt",
@@ -1020,7 +1151,7 @@ class State:
             names = ", ".join(sorted(path.name for path in existing))
             raise RuntimeError(
                 f"output directory already contains run artifacts ({names}); "
-                "use --resume, --start-fresh, or a different --log-dir"
+                "use --resume, --start-fresh, or a different --output directory"
             )
         if self.cfg.start_fresh:
             for path in existing:
@@ -1209,7 +1340,7 @@ class State:
             raise RuntimeError(
                 "resume state belongs to a different target or credential mode: "
                 f"saved={saved_target}, current={current_target}. "
-                "Use a different --log-dir or --start-fresh."
+                "Use a different --output directory or --start-fresh."
             )
 
         saved_inputs = data.get("input_identity")
@@ -1431,6 +1562,11 @@ class State:
                 raise RuntimeError("resume state credential record lacks user or secret")
             if not isinstance(record.get("is_admin"), bool):
                 raise RuntimeError("resume state credential record has an invalid admin flag")
+            credential_state = record.get("credential_state")
+            if credential_state not in CREDENTIAL_STATES:
+                raise RuntimeError("resume state credential record has an invalid state")
+            if record["is_admin"] and credential_state != "valid":
+                raise RuntimeError("resume state admin credential has an invalid state")
             if canonical_identity(user, self.cfg.domain) not in configured_user_keys:
                 raise RuntimeError("resume state credential record contains an unknown identity")
             if secret not in configured_secrets:
@@ -1441,9 +1577,11 @@ class State:
             ledger_record = self.pair_ledger.get(secret, {}).get(pair[0])
             if ledger_record is not None:
                 ledger_status = ledger_record.get("status")
-                expected_status = (
-                    "admin_success" if record["is_admin"] else "success"
-                )
+                expected_status = credential_state
+                if credential_state == "valid":
+                    expected_status = (
+                        "admin_success" if record["is_admin"] else "success"
+                    )
                 if ledger_status != expected_status:
                     raise RuntimeError(
                         "resume state credential finding conflicts with the pair ledger"
@@ -1464,6 +1602,7 @@ class State:
                 "user": user,
                 "secret": secret,
                 "is_admin": record["is_admin"],
+                "credential_state": credential_state,
                 "captured_at": captured_at,
                 "source_round": record.get("source_round"),
                 "source_pass": record.get("source_pass", record.get("source_round")),
@@ -1563,11 +1702,17 @@ class State:
             for record in records.values():
                 user = str(record["user"])
                 status = str(record["status"])
-                if status in {"success", "admin_success"}:
+                if status in SUCCESS_PAIR_STATUSES:
+                    credential_state = (
+                        status
+                        if status in PASSWORD_CHANGE_PAIR_STATUSES
+                        else "valid"
+                    )
                     added = self.add_cred(
                         user,
                         secret,
                         is_admin=status == "admin_success",
+                        credential_state=credential_state,
                         source_round=record.get("source_batch"),
                         engine=str(record.get("engine", "")),
                         persist=False,
@@ -1831,6 +1976,19 @@ class State:
         creds_lines = [f"{item['user']}:{item['secret']}" for item in self.credentials]
         self._atomic_write_text(self.creds_file, "\n".join(creds_lines) + ("\n" if creds_lines else ""))
 
+        password_change_sections: List[str] = []
+        for finding in self.password_change_findings():
+            password_change_sections.extend([
+                f"Status: {credential_state_label(str(finding['credential_state']))}",
+                f"Credential: {finding['user']}:{finding['secret']}",
+                f"Command: {self.password_change_command(finding)}",
+                "",
+            ])
+        self._atomic_write_text(
+            self.password_changes_file,
+            "\n".join(password_change_sections),
+        )
+
         locked_lines = sorted(self.locked_users)
         self._atomic_write_text(self.lockouts_file, "\n".join(locked_lines) + ("\n" if locked_lines else ""))
 
@@ -1900,6 +2058,24 @@ class State:
     def credential_count(self) -> int:
         """Number of unique working user/secret pairs."""
         return len(self.credentials)
+
+    def password_change_findings(self) -> List[Dict[str, Any]]:
+        """Return valid credentials that require an operator password change."""
+        return [
+            finding
+            for finding in self.credentials
+            if finding.get("credential_state") in PASSWORD_CHANGE_PAIR_STATUSES
+        ]
+
+    def password_change_command(self, finding: Dict[str, Any]) -> str:
+        """Return a prompt-safe Impacket command for one restricted credential."""
+        return build_password_change_command(
+            self.cfg.domain,
+            str(finding["user"]),
+            self.cfg.dc_ip,
+            secret=str(finding["secret"]),
+            pth_mode=self.cfg.pth_mode,
+        )
 
     @property
     def lockout_count(self) -> int:
@@ -2006,8 +2182,13 @@ class State:
         source_round: Optional[int] = None,
         engine: str = "",
         persist: bool = True,
+        credential_state: str = "valid",
     ) -> bool:
         """Record a unique working credential pair. Return True when newly added."""
+        if credential_state not in CREDENTIAL_STATES:
+            raise ValueError("credential finding has an invalid state")
+        if is_admin and credential_state != "valid":
+            raise ValueError("an admin finding cannot also require a password change")
         if secret not in self.cfg.passwords:
             raise ValueError("credential finding references an unconfigured secret")
         configured_keys = {
@@ -2024,10 +2205,18 @@ class State:
         pair = (canonical_identity(user, self.cfg.domain), secret)
         existing = self._credential_index.get(pair)
         if existing:
+            changed = False
             if is_admin and not existing.get("is_admin"):
                 existing["is_admin"] = True
-                if persist:
-                    self.save()
+                changed = True
+            if (
+                credential_state in PASSWORD_CHANGE_PAIR_STATUSES
+                and existing.get("credential_state") != credential_state
+            ):
+                existing["credential_state"] = credential_state
+                changed = True
+            if changed and persist:
+                self.save()
             return False
 
         captured_at = datetime.datetime.now().isoformat()
@@ -2035,6 +2224,7 @@ class State:
             "user": user,
             "secret": secret,
             "is_admin": is_admin,
+            "credential_state": credential_state,
             "captured_at": captured_at,
             "source_round": source_round if source_round is not None else self.current_round,
             "source_pass": (
@@ -2055,9 +2245,18 @@ class State:
         self.success_by_pattern[pattern] = self.success_by_pattern.get(pattern, 0) + 1
 
         # Feature E: Record timeline event before save
-        self.record_timeline_event("credential", f"{user} (pattern: {pattern})")
+        if credential_state in PASSWORD_CHANGE_PAIR_STATUSES:
+            self.record_timeline_event(
+                "password_change_required",
+                f"{user} ({credential_state_label(credential_state)})",
+            )
+        else:
+            self.record_timeline_event("credential", f"{user} (pattern: {pattern})")
 
-        self._log_line(f"{captured_at} CREDENTIAL {user}:{secret} admin={is_admin} pattern={pattern}")
+        self._log_line(
+            f"{captured_at} CREDENTIAL {user}:{secret} admin={is_admin} "
+            f"state={credential_state} pattern={pattern}"
+        )
         if persist:
             self.save()
         return True
@@ -2399,6 +2598,39 @@ class State:
                 counts[status] = counts.get(status, 0) + 1
         return counts
 
+    def credential_pair_count(self) -> int:
+        """Return unique identity/secret pairs represented in the ledger."""
+        return sum(len(records) for records in self.pair_ledger.values())
+
+    def successful_pair_count(self) -> int:
+        """Return final pair outcomes that proved a valid credential."""
+        counts = self.pair_status_counts()
+        return sum(counts.get(status, 0) for status in SUCCESS_PAIR_STATUSES)
+
+    def password_change_pair_count(self) -> int:
+        """Return valid pairs whose account requires a password change."""
+        counts = self.pair_status_counts()
+        return sum(
+            counts.get(status, 0)
+            for status in PASSWORD_CHANGE_PAIR_STATUSES
+        )
+
+    def real_pair_outcome_count(self) -> int:
+        """Return non-simulated pair outcomes used as the success-rate base."""
+        counts = self.pair_status_counts()
+        return sum(
+            count
+            for status, count in counts.items()
+            if status not in {"dry_run", "legacy_attempted"}
+        )
+
+    def pair_success_rate(self) -> Optional[float]:
+        """Return final pair success percentage, excluding simulated pairs."""
+        denominator = self.real_pair_outcome_count()
+        if denominator == 0:
+            return None
+        return (self.successful_pair_count() / denominator) * 100
+
     def skipped_pair_count(self) -> int:
         """Count undispatched pairs omitted from passes already completed."""
         skipped = 0
@@ -2521,19 +2753,32 @@ class State:
         elapsed = datetime.datetime.now() - start_dt
         elapsed_str = str(elapsed).split(".")[0]  # Remove microseconds
 
-        # Success rate
-        success_rate = 0.0
-        if self.total_attempts > 0:
-            success_rate = (self.credential_count / self.total_attempts) * 100
+        pair_count = self.credential_pair_count()
+        successful_pairs = self.successful_pair_count()
+        password_changes = self.password_change_pair_count()
+        success_rate = self.pair_success_rate()
 
         table.add_row("Started", self.start_time)
         table.add_row("Elapsed time", elapsed_str)
-        table.add_row("Total attempts", str(self.total_attempts))
-        table.add_row("Credentials found", str(self.credential_count))
+        table.add_row("Authentication attempts sent", str(self.total_dispatches))
+        table.add_row("Unique credential pairs", str(pair_count))
+        table.add_row("Valid credentials", str(successful_pairs))
+        table.add_row("Need password change", str(password_changes))
         table.add_row("Authentication failures", str(status_counts.get("auth_failure", 0)))
-        table.add_row("Indeterminate pairs", str(status_counts.get("indeterminate", 0)))
+        table.add_row(
+            "Safety-result pairs",
+            str(
+                status_counts.get("lockout", 0)
+                + status_counts.get("ambiguous_lockout", 0)
+            ),
+        )
+        table.add_row("Uncertain pairs", str(status_counts.get("indeterminate", 0)))
+        table.add_row("Simulated pairs", str(status_counts.get("dry_run", 0)))
         table.add_row("Skipped pairs", str(self.skipped_pair_count()))
-        table.add_row("Success rate", f"{success_rate:.2f}%")
+        table.add_row(
+            "Pair success rate",
+            f"{success_rate:.2f}%" if success_rate is not None else "N/A",
+        )
         lockout_value = str(self.lockout_count)
         if self.unknown_lockout_events:
             lockout_value += f" ({self.unknown_lockout_events} unknown-user signal(s))"
@@ -2581,24 +2826,25 @@ class State:
         """Return compact one-line stats string for a batch summary."""
         self.reconcile_ledger_metrics()
         status_counts = self.pair_status_counts()
-        success_rate = 0.0
-        if self.total_attempts > 0:
-            success_rate = (self.credential_count / self.total_attempts) * 100
-
-        top_pattern = "N/A"
-        if self.success_by_pattern:
-            top_pattern = max(self.success_by_pattern.items(), key=lambda x: x[1])[0]
-
-        # Credential reuse count
-        reused_count = len(self.detect_cred_reuse())
-        reuse_str = f" | Reuse: {reused_count}" if reused_count > 0 else ""
-
-        return (
-            f"Attempts: {self.total_attempts} | Success: {self.credential_count} "
-            f"({success_rate:.1f}%) | Failures: {status_counts.get('auth_failure', 0)} | "
-            f"Indeterminate: {status_counts.get('indeterminate', 0)} | "
-            f"Skipped: {self.skipped_pair_count()} | Top pattern: {top_pattern}{reuse_str}"
-        )
+        parts = [
+            f"Attempts sent: {self.total_dispatches}",
+            f"Unique pairs: {self.credential_pair_count()}",
+            f"Valid: {self.successful_pair_count()}",
+        ]
+        password_changes = self.password_change_pair_count()
+        if password_changes:
+            parts.append(f"Change needed: {password_changes}")
+        parts.extend([
+            f"Failed: {status_counts.get('auth_failure', 0)}",
+            "Safety: "
+            f"{status_counts.get('lockout', 0) + status_counts.get('ambiguous_lockout', 0)}",
+            f"Uncertain: {status_counts.get('indeterminate', 0)}",
+        ])
+        simulated = status_counts.get("dry_run", 0)
+        if simulated:
+            parts.append(f"Simulated: {simulated}")
+        parts.append(f"Skipped: {self.skipped_pair_count()}")
+        return " | ".join(parts)
 
     # =============================================================================
     # Feature 5: JSON/CSV export
@@ -2615,6 +2861,15 @@ class State:
         """Export results to results.json."""
         self.reconcile_ledger_metrics()
         status_counts = self.pair_status_counts()
+        success_rate = self.pair_success_rate()
+        exported_credentials: List[Dict[str, Any]] = []
+        for finding in self.credentials:
+            exported = dict(finding)
+            if finding.get("credential_state") in PASSWORD_CHANGE_PAIR_STATUSES:
+                exported["password_change_command"] = self.password_change_command(
+                    finding
+                )
+            exported_credentials.append(exported)
         results = {
             "started": self.start_time,
             "config": {
@@ -2626,10 +2881,16 @@ class State:
             },
             "stats": {
                 "total_attempts": self.total_attempts,
+                "authentication_dispatches": self.total_dispatches,
+                "unique_credential_pairs": self.credential_pair_count(),
                 "credentials_found": self.credential_count,
+                "successful_pairs": self.successful_pair_count(),
+                "password_change_required": self.password_change_pair_count(),
                 "authentication_failures": status_counts.get("auth_failure", 0),
                 "indeterminate_pairs": status_counts.get("indeterminate", 0),
+                "simulated_pairs": status_counts.get("dry_run", 0),
                 "skipped_pairs": self.skipped_pair_count(),
+                "pair_success_rate_percent": success_rate,
                 "pair_statuses": status_counts,
                 "lockout_signals": self.lockout_count,
                 "affected_signal_identities": self.signal_identity_count(),
@@ -2640,11 +2901,11 @@ class State:
                 "success_by_pattern": self.success_by_pattern,
             },
             "found_creds": self.found_creds,
-            "credentials": self.credentials,
+            "credentials": exported_credentials,
             "cred_reuse": [{"password": pw, "users": users} for pw, users in self.detect_cred_reuse()],
             "admin_users": self.admin_users,
             "locked_users": list(self.locked_users),
-            "attempted_pairs": sum(len(records) for records in self.pair_ledger.values()),
+            "attempted_pairs": self.credential_pair_count(),
         }
 
         json_path = self.log_dir / "results.json"
@@ -2673,6 +2934,8 @@ class State:
             "source_batch",
             "engine",
             "captured_at",
+            "credential_state",
+            "password_change_command",
         ])
 
         for item in self.credentials:
@@ -2685,6 +2948,12 @@ class State:
                 item.get("source_batch") or item.get("source_round") or "",
                 safe_cell(item.get("engine", "")),
                 item.get("captured_at", ""),
+                item.get("credential_state", "valid"),
+                safe_cell(
+                    self.password_change_command(item)
+                    if item.get("credential_state") in PASSWORD_CHANGE_PAIR_STATUSES
+                    else ""
+                ),
             ])
 
         csv_path = self.log_dir / "results.csv"
@@ -2790,7 +3059,11 @@ class State:
         )
         # Record demotion event (will flush on next save)
         # Note: we don't have round_idx here; callers should record timeline if needed
-        detail = f"{engine_key}: {abort_reason or h.get('last_reason', '')}, cooldown {h['cooldown_remaining']}r"
+        issue = humanize_tool_issue(abort_reason or str(h.get("last_reason", "")))
+        detail = (
+            f"{engine_key}: paused after {issue}; retry after "
+            f"{h['cooldown_remaining']} password group(s)"
+        )
         self.record_timeline_event("engine_demote", detail)
 
     def register_engine_success(self, engine_key: str) -> None:
@@ -2805,7 +3078,7 @@ class State:
 
         # Record restoration event if this engine was demoted
         if was_demoted:
-            detail = f"{engine_key}: back online after {demote_count} demotion(s)"
+            detail = f"{engine_key}: working again after {demote_count} pause(s)"
             self.record_timeline_event("engine_restore", detail)
 
     def tick_cooldowns(self, engine_keys: Optional[Set[str]] = None) -> None:
@@ -2852,6 +3125,7 @@ class State:
             "batch_start": "#3498db",      # blue
             "spray": "#9b59b6",            # purple
             "credential": "#27ae60",       # green
+            "password_change_required": "#d16ee0",  # magenta
             "lockout": "#e67e22",          # orange
             "reprioritize": "#f39c12",     # yellow
             "throttle": "#e74c3c",         # red
@@ -2913,6 +3187,20 @@ class State:
 # Engine invocation and classification
 # =============================================================================
 
+def password_change_line_type(status_text: str) -> Optional[LineType]:
+    """Return the password-change credential state carried by tool output."""
+    if any(
+        re.search(pattern, status_text, re.IGNORECASE)
+        for pattern in PASSWORD_EXPIRED_PATTERNS
+    ):
+        return LineType.PASSWORD_EXPIRED
+    if any(
+        re.search(pattern, status_text, re.IGNORECASE)
+        for pattern in PASSWORD_MUST_CHANGE_PATTERNS
+    ):
+        return LineType.PASSWORD_MUST_CHANGE
+    return None
+
 def classify_line(
     engine: Engine,
     line: str,
@@ -2958,6 +3246,21 @@ def classify_line(
         for pat in NXC_FATAL_ERROR_PATTERNS:
             if re.search(pat, status_text, re.IGNORECASE):
                 return (LineType.ERROR, parsed_line)
+
+        password_change_type = password_change_line_type(status_text)
+        if password_change_type is not None and identity_match:
+            user = identity_match.group("user")
+            reported_secret = (
+                expected_secret
+                if expected_secret is not None
+                else re.sub(
+                    r"\s+(?:STATUS_PASSWORD_EXPIRED|STATUS_PASSWORD_MUST_CHANGE)\b.*$",
+                    "",
+                    identity_match.group("secret"),
+                    flags=re.IGNORECASE,
+                )
+            )
+            return (password_change_type, f"{user}:{reported_secret}")
 
         for pat in NXC_SUCCESS_PATTERNS:
             if re.search(pat, parsed_line) and identity_match:
@@ -3024,7 +3327,11 @@ def classify_line(
                     user, secret = m.groups()
                     if "VALID LOGIN WITH ERROR" in parsed_line.upper():
                         secret = re.sub(r"\s+\([^\n]*\)\s*$", "", secret)
-                    return (LineType.SUCCESS, f"{user}:{secret}")
+                    password_change_type = password_change_line_type(status_text)
+                    return (
+                        password_change_type or LineType.SUCCESS,
+                        f"{user}:{secret}",
+                    )
 
         # In verbose mode every ordinary failure uses this principal-prefixed form.
         if reported_principal:
@@ -3161,6 +3468,9 @@ def _merge_round_result(target: RoundResult, source: RoundResult) -> None:
     for pair in source.admin_users:
         if pair not in target.admin_users:
             target.admin_users.append(pair)
+    for finding in source.password_change_required:
+        if finding not in target.password_change_required:
+            target.password_change_required.append(finding)
     target.lockouts.update(source.lockouts)
     target.ambiguous_lockouts.update(source.ambiguous_lockouts)
     target.unknown_lockouts += source.unknown_lockouts
@@ -3626,6 +3936,70 @@ def _spray_one_password_impl(
                     )
                     state.save()
 
+            elif line_type in {
+                LineType.PASSWORD_EXPIRED,
+                LineType.PASSWORD_MUST_CHANGE,
+            } and data:
+                saw_auth_result = True
+                if ":" not in data:
+                    ui.console.print(
+                        f"[!] Unparseable password-change credential line (skipped): {line}",
+                        style="yellow",
+                    )
+                else:
+                    reported_user, _reported_secret = data.split(":", 1)
+                    user = _normalize_reported_user(
+                        reported_user,
+                        cfg.users,
+                        cfg.domain,
+                    )
+                    if expected_key and canonical_identity(user, cfg.domain) != expected_key:
+                        result.aborted = True
+                        result.abort_reason = "identity-mismatch"
+                        result.errors.append(f"expected {expected_user}, parsed {user}")
+                        _stop_process(proc)
+                        break
+                    credential_state = (
+                        "password_expired"
+                        if line_type == LineType.PASSWORD_EXPIRED
+                        else "password_must_change"
+                    )
+                    pair = (user, secret)
+                    restricted = (user, secret, credential_state)
+                    if pair not in result.successes:
+                        result.successes.append(pair)
+                    if restricted not in result.password_change_required:
+                        result.password_change_required.append(restricted)
+                    result.terminal_users.add(user)
+                    command = build_password_change_command(
+                        cfg.domain,
+                        user,
+                        cfg.dc_ip,
+                        secret=secret,
+                        pth_mode=cfg.pth_mode,
+                    )
+                    ui.update_password_change(
+                        user,
+                        secret,
+                        credential_state,
+                        command,
+                    )
+                    state.finish_attempt(
+                        secret,
+                        user,
+                        credential_state,
+                        detail=credential_state_label(credential_state),
+                        persist=False,
+                    )
+                    state.add_cred(
+                        user,
+                        secret,
+                        credential_state=credential_state,
+                        engine=str(engine),
+                        persist=False,
+                    )
+                    state.save()
+
             elif line_type == LineType.LOCKOUT:
                 saw_auth_result = True
                 signal_key = ANSI_ESCAPE_RE.sub("", line).strip().casefold()
@@ -3841,7 +4215,7 @@ def preflight(
     Returns (ok, detail_message).
     """
     if cfg.no_preflight or cfg.dry_run:
-        return True, "Preflight skipped (--no-preflight or --dry-run)"
+        return True, "Target check skipped (--skip-target-check or --dry-run)"
 
     ui.console.print("[*] Preflight check...", style="cyan")
 
@@ -3957,7 +4331,7 @@ def enumerate_valid_users(
     fail closed rather than silently restoring the full list.
     """
     if not cfg.kerbrute_binary:
-        raise RuntimeError("Kerbrute is required for --exclude-unknown-users")
+        raise RuntimeError("Kerbrute is required for --validate-users")
 
     console.print("[*] Enumerating valid users with kerbrute userenum...", style="cyan")
 
@@ -4489,7 +4863,7 @@ def run(cfg: Config, console: Console) -> bool:
         raise
     if not ok:
         console.print(f"[!] Preflight failed: {detail}", style="red")
-        console.print("[!] Aborting. Fix the issue or use --no-preflight to bypass (not recommended).", style="yellow")
+        console.print("[!] Aborting. Fix the issue or use --skip-target-check to bypass (not recommended).", style="yellow")
         console.print(
             "[*] Run state was retained; fix preflight and use --resume.",
             style="yellow",
@@ -4546,6 +4920,12 @@ def run(cfg: Config, console: Console) -> bool:
         state.known_signal_users(),
         state.unknown_lockout_events,
         state.lockout_count,
+        {
+            (str(finding["user"]), str(finding["secret"])): str(
+                finding.get("credential_state", "valid")
+            )
+            for finding in state.credentials
+        },
     )
 
     if enumeration_safety_stop:
@@ -4673,28 +5053,42 @@ def run(cfg: Config, console: Console) -> bool:
         # Compute effective chain for this round (engine health aware)
         effective_chain = state.compute_effective_chain(chain)
 
-        # Check for probe rounds (demoted engines whose cooldown expired)
+        # Check for tools whose retry delay has elapsed.
         for eng in chain:
             h = state.engine_health.get(str(eng))
             if h and h["demoted"] and h["cooldown_remaining"] == 0:
-                # This engine is entering probe round
-                console.print(f"[*] PROBE: re-testing {eng} after cooldown", style="cyan")
-                detail = f"{eng}: re-probe after {state.cooldown_rounds} rounds"
+                console.print(
+                    f"[*] Rechecking {eng} now that its retry delay has elapsed",
+                    style="cyan",
+                )
+                detail = (
+                    f"{eng}: rechecking after {state.cooldown_rounds} "
+                    "password group(s)"
+                )
                 state.record_timeline_event("probe", detail, round_idx=round_idx + 1)
 
-        # Show effective chain if any engine is demoted (or in verbose mode)
+        # Show available and paused tools when useful.
         if cfg.verbose or any(state.engine_health.get(str(e), {}).get("demoted", False) for e in chain):
-            healthy = [str(e) for e in effective_chain if not state.engine_health.get(str(e), {}).get("demoted", False)]
-            demoted = [str(e) for e in chain if state.engine_health.get(str(e), {}).get("demoted", False)]
+            available = [str(e) for e in effective_chain]
+            paused = [
+                str(e)
+                for e in chain
+                if state.engine_health.get(str(e), {}).get("demoted", False)
+                and state.engine_health.get(str(e), {}).get("cooldown_remaining", 0) > 0
+            ]
             parts = []
-            if healthy:
-                parts.append(" → ".join(healthy))
-            if demoted:
-                cooldowns = [f"{e} ({state.engine_health.get(str(e), {}).get('cooldown_remaining', 0)}r)" for e in demoted]
-                demoted_str = " & ".join(cooldowns) + " demoted"
-                parts.append(f"({demoted_str})")
+            if available:
+                parts.append(f"available: {' → '.join(available)}")
+            if paused:
+                retry_details = [
+                    f"{engine} (retry in "
+                    f"{state.engine_health.get(engine, {}).get('cooldown_remaining', 0)} "
+                    "group(s))"
+                    for engine in paused
+                ]
+                parts.append(f"paused: {', '.join(retry_details)}")
             if parts:
-                console.print(f"[*] Effective engines: {' → '.join(parts) if len(parts) > 1 else parts[0]}", style="cyan")
+                console.print(f"[*] Tool status — {'; '.join(parts)}", style="cyan")
 
         # Feature E: Record round start timeline event
         state.record_timeline_event("batch_start", "", round_idx=round_idx + 1)
@@ -4747,22 +5141,22 @@ def run(cfg: Config, console: Console) -> bool:
                         explicit_probes_tried.add(str(probe))
                         effective_chain = [probe]
                         console.print(
-                            f"[!] Explicit cooldown probe: {probe}",
+                            f"[!] Rechecking paused tool at operator request: {probe}",
                             style="yellow",
                         )
                         state.record_timeline_event(
                             "explicit_probe",
-                            f"{probe}: operator requested --probe-demoted",
+                            f"{probe}: operator requested --retry-paused-tools",
                             round_idx=round_idx + 1,
                         )
                     else:
                         operator_stop = True
-                        stop_reason = "all engines are in cooldown"
+                        stop_reason = "all tools are temporarily paused"
                         state.save()
                         console.print(
-                            "[!] All engines are currently demoted and in cooldown; "
-                            "stopping without bypassing cooldown. After troubleshooting, "
-                            "resume with --probe-demoted to request one probe per engine.",
+                            "[!] All tools are temporarily paused; stopping instead of "
+                            "bypassing the retry delay. After troubleshooting, resume with "
+                            "--retry-paused-tools to try each tool once.",
                             style="red",
                         )
                         break
@@ -4865,14 +5259,16 @@ def run(cfg: Config, console: Console) -> bool:
                         health = state.engine_health.get(str(engine), {})
                         if health.get("demoted"):
                             console.print(
-                                f"[-] {engine} failed ({result.abort_reason}); demoted for "
-                                f"{health.get('cooldown_remaining', 0)} batch(es)",
+                                f"[-] {engine}: {humanize_tool_issue(result.abort_reason)}; "
+                                "paused for "
+                                f"{health.get('cooldown_remaining', 0)} password group(s)",
                                 style="yellow",
                             )
                         else:
                             console.print(
-                                f"[-] {engine} failed ({result.abort_reason}); failure "
-                                f"{health.get('consecutive_failures', 0)}/{state.transient_threshold}",
+                                f"[-] {engine}: {humanize_tool_issue(result.abort_reason)} "
+                                f"({health.get('consecutive_failures', 0)} of "
+                                f"{state.transient_threshold} before pausing)",
                                 style="yellow",
                             )
                         continue
@@ -5011,19 +5407,22 @@ def run(cfg: Config, console: Console) -> bool:
         if round_conn_fails_this_round > 0:
             console.print(f"    - Connection errors: {round_conn_fails_this_round} (informational - some engines may have issues but at least one succeeded)", style="cyan")
 
-        # Show engine health if any engine is demoted
+        # Show tool availability if any tool is temporarily paused.
         if any(state.engine_health.get(str(e), {}).get("demoted", False) for e in chain):
-            console.print("    - Engine health:")
+            console.print("    - Tool status:")
             for eng in chain:
                 h = state.engine_health.get(str(eng), {})
                 if not h:
-                    status = "healthy"
+                    status = "available"
                     detail = ""
                 elif h["demoted"]:
-                    status = "DEMOTED"
-                    detail = f"cooldown {h['cooldown_remaining']}r, last: {h.get('last_reason', 'N/A')}"
+                    status = "paused"
+                    detail = (
+                        f"retry after {h['cooldown_remaining']} password group(s); "
+                        f"last issue: {humanize_tool_issue(str(h.get('last_reason', '')))}"
+                    )
                 else:
-                    status = "healthy"
+                    status = "available"
                     detail = ""
                 console.print(f"      {eng}: {status}" + (f" ({detail})" if detail else ""), style="yellow" if h.get("demoted") else "green")
 
@@ -5047,7 +5446,11 @@ def run(cfg: Config, console: Console) -> bool:
         # (No longer pause - just informational + let failover/demotion handle it)
         critical_errors = [e for e in round_errors_this_round if any(kw in e.lower() for kw in ["wrong realm", "cannot find kdc", "no kdc", "unknown realm"])]
         if critical_errors:
-            console.print(f"[*] {len(critical_errors)} realm/domain error(s) this batch — handled via realm-retry + engine demotion (not pausing)", style="cyan")
+            console.print(
+                f"[*] {len(critical_errors)} realm/domain error(s) this batch — "
+                "handled through automatic domain retry and tool failover",
+                style="cyan",
+            )
             state.record_timeline_event("realm_error", f"{len(critical_errors)} realm/domain errors", round_idx=round_idx + 1)
 
         # Feature D: Update throttle based on this round's conn fails
@@ -5078,11 +5481,20 @@ def run(cfg: Config, console: Console) -> bool:
         state.record_timeline_event("stopped", stop_reason)
     else:
         console.print("\n[+] Spray complete.", style="green")
-        state.record_timeline_event("complete", "spray finished")
+        if not any(
+            event.get("type") == "complete"
+            for event in state.timeline_events
+        ):
+            state.record_timeline_event("complete", "spray finished")
     console.print(f"[+] Found credentials: {state.credential_count}", style="green")
-    if state.credentials:
+    ready_findings = [
+        finding
+        for finding in state.credentials
+        if finding.get("credential_state", "valid") == "valid"
+    ]
+    if ready_findings:
         console.print("[+] Credential findings:", style="green bold")
-        for finding in state.credentials:
+        for finding in ready_findings:
             marker = "★ ADMIN" if finding.get("is_admin") else "✓"
             source = finding.get("engine") or "unknown engine"
             source_pass = (
@@ -5095,6 +5507,27 @@ def run(cfg: Config, console: Console) -> bool:
                 f"{escape(str(finding['secret']))} "
                 f"[dim]({escape(str(source))}, pass {escape(str(source_pass))})[/dim]",
                 style="red bold" if finding.get("is_admin") else "green",
+            )
+    password_change_findings = state.password_change_findings()
+    if password_change_findings:
+        console.print(
+            "[!] Valid credentials requiring a password change:",
+            style="magenta bold",
+        )
+        for finding in password_change_findings:
+            source = finding.get("engine") or "unknown engine"
+            state_label = credential_state_label(
+                str(finding["credential_state"])
+            )
+            console.print(
+                f"    ↻ {escape(str(finding['user']))}:"
+                f"{escape(str(finding['secret']))} — {escape(state_label)} "
+                f"[dim]({escape(str(source))})[/dim]",
+                style="magenta bold",
+            )
+            console.print(
+                f"      Change it: {escape(state.password_change_command(finding))}",
+                style="magenta",
             )
     console.print(f"[+] Total safety signals: {state.lockout_count}", style="yellow")
     state.save()
@@ -5126,6 +5559,11 @@ def run(cfg: Config, console: Console) -> bool:
         console.print(f"[+] CSV results exported to: {state.log_dir}/results.csv", style="green")
 
     console.print(f"[+] Credentials saved to: {state.creds_file}", style="cyan")
+    if password_change_findings:
+        console.print(
+            f"[+] Password-change commands saved to: {state.password_changes_file}",
+            style="magenta",
+        )
     console.print(f"[+] Lockouts saved to: {state.lockouts_file}", style="cyan")
     console.print(f"[+] Overall log: {state.overall_log}", style="cyan")
     completed = not state.remaining_queue and not stop_reason
@@ -5174,6 +5612,221 @@ def read_input_lines(path: str, *, identities: bool, domain: str = "") -> List[s
             values.append(value)
     return values
 
+class _AdvancedHelpAction(argparse.Action):
+    """Show the expanded parser without requiring target arguments."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        build_argument_parser(parser.prog, advanced=True).print_help()
+        parser.exit()
+
+
+def build_argument_parser(invoked_program: str, advanced: bool = False) -> argparse.ArgumentParser:
+    """Build the compact operator CLI or the complete advanced reference."""
+    advanced_help = None if advanced else argparse.SUPPRESS
+    if advanced:
+        description = (
+            f"{PRODUCT_NAME} — complete option reference for authorized assessments. "
+            "The defaults are intentionally conservative; most runs do not need these controls."
+        )
+        epilog = """
+Older option names remain accepted for script compatibility but are intentionally
+omitted here. Run authtempo --help for the short, everyday interface.
+        """
+    else:
+        description = (
+            f"{PRODUCT_NAME} — safety-first password auditing for authorized environments. "
+            "Safe defaults work without tuning."
+        )
+        epilog = """
+Examples:
+  authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10
+  authtempo -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
+
+Use --advanced-help for schedules, recovery tuning, display, and troubleshooting.
+For authorized penetration testing only.
+        """
+
+    parser = argparse.ArgumentParser(
+        prog=invoked_program,
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog,
+    )
+
+    required = parser.add_argument_group("required inputs")
+    required.add_argument("-u", "--users", metavar="FILE", dest="u", help="Usernames, one per line", required=True)
+    required.add_argument("-p", "--passwords", metavar="FILE", dest="p", help="Passwords, one per line", required=True)
+    required.add_argument("-d", "--domain", metavar="DOMAIN", dest="d", help="Active Directory domain", required=True)
+    required.add_argument("-dc-ip", "--dc", metavar="IP", dest="dc_ip", help="Domain controller IP address", required=True)
+
+    everyday = parser.add_argument_group("everyday controls")
+    everyday.add_argument("--tool", choices=["kerbrute", "nxc"], default="kerbrute", help="Tool to try first; failover is automatic (default: kerbrute)")
+    everyday.add_argument("--protocol", choices=["smb", "ldap"], default="ldap", help="NetExec protocol (default: ldap; ignored by Kerbrute)")
+    everyday.add_argument("-t", "--wait", metavar="MINUTES", type=int, default=35, dest="t", help="Wait between password groups (default: 35 minutes)")
+    everyday.add_argument("--limit", metavar="N", type=int, default=1, dest="passwords_per_round", help="Passwords tested across the user list before each wait (default: 1)")
+    everyday.add_argument(
+        "--max-lockouts",
+        dest="lockout_burst",
+        metavar="N",
+        type=int,
+        default=3,
+        help="Hard-stop when one password produces more than N lockout signals (default: 3)",
+    )
+    everyday.add_argument("--validate-users", dest="filter_disabled", action="store_true", help="Check which usernames exist before testing passwords")
+    everyday.add_argument("--pth", action="store_true", help="Treat the password file as NTLM hashes (uses NetExec)")
+
+    run_control = parser.add_argument_group("run control")
+    state_mode = run_control.add_mutually_exclusive_group()
+    state_mode.add_argument("--resume", action="store_true", help="Continue a compatible interrupted run")
+    state_mode.add_argument("--start-fresh", action="store_true", help="Replace AuthTempo files in the output directory and start over")
+    run_control.add_argument("--dry-run", action="store_true", help="Simulate tool output; sends no authentication attempts")
+    run_control.add_argument("-o", "--output", metavar="DIR", dest="log_dir", default=None, help="State, logs, and findings directory")
+
+    reports = parser.add_argument_group("reports")
+    reports.add_argument("--report", choices=["json", "csv", "all"], dest="export", default="none", help="Write JSON, CSV, or both result reports")
+    reports.add_argument("--timeline", action="store_true", help=f"Write the {TIMELINE_HTML_NAME} activity view")
+
+    parser.add_argument("--advanced-help", action=_AdvancedHelpAction, help="Show scheduling, recovery, display, and troubleshooting options")
+
+    safety = parser.add_argument_group("advanced safety and recovery")
+    safety.add_argument(
+        "--review-after-lockouts",
+        metavar="N",
+        dest="lockout_threshold",
+        type=int,
+        default=2,
+        help=advanced_help or "Pause for operator review after N total lockout signals (default: 2)",
+    )
+    safety.add_argument(
+        "--tool-retry-after",
+        metavar="GROUPS",
+        dest="engine_cooldown",
+        type=int,
+        default=3,
+        help=advanced_help or "Retry a paused tool after N completed password groups (default: 3)",
+    )
+    safety.add_argument(
+        "--tool-error-limit",
+        metavar="N",
+        dest="engine_fail_threshold",
+        type=int,
+        default=2,
+        help=advanced_help or "Pause a tool after N consecutive temporary errors (default: 2)",
+    )
+    safety.add_argument(
+        "--retry-paused-tools",
+        dest="probe_demoted",
+        action="store_true",
+        help=advanced_help or "If every tool is paused, try each one once instead of stopping",
+    )
+    safety.add_argument(
+        "--tool-timeout",
+        metavar="SECONDS",
+        dest="engine_timeout",
+        type=int,
+        default=300,
+        help=advanced_help or "Stop one tool invocation after this total time (default: 300 seconds)",
+    )
+    safety.add_argument(
+        "--tool-silence-timeout",
+        metavar="SECONDS",
+        dest="engine_idle_timeout",
+        type=int,
+        default=60,
+        help=advanced_help or "Stop one tool invocation after no output for this long (default: 60 seconds)",
+    )
+    safety.add_argument(
+        "--exact-domain-only",
+        dest="no_realm_retry",
+        action="store_true",
+        help=advanced_help or "Do not try a second Kerberos domain spelling after a pre-auth realm error",
+    )
+    safety.add_argument(
+        "--keep-testing-found",
+        dest="include_compromised",
+        action="store_true",
+        help=advanced_help or "UNSAFE: keep testing a user after valid credentials are found",
+    )
+    safety.add_argument(
+        "--retry-uncertain",
+        dest="retry_indeterminate",
+        action="store_true",
+        help=advanced_help or "UNSAFE: retry attempts whose prior result could not be confirmed",
+    )
+
+    advanced_run = parser.add_argument_group("advanced run and display")
+    advanced_run.add_argument(
+        "--schedule",
+        metavar="WINDOW",
+        help=advanced_help or "Run only during business-hours, off-hours, or HH:MM-HH:MM",
+    )
+    display_mode = advanced_run.add_mutually_exclusive_group()
+    display_mode.add_argument(
+        "--stream",
+        dest="no_live",
+        action="store_true",
+        default=False,
+        help=advanced_help or "Use stable line-by-line output (selected automatically inside tmux)",
+    )
+    display_mode.add_argument(
+        "--dashboard",
+        dest="live",
+        action="store_true",
+        default=False,
+        help=advanced_help or "Force the cursor-based dashboard, including inside tmux",
+    )
+    advanced_run.add_argument(
+        "--raw-lines",
+        metavar="N",
+        dest="feed_lines",
+        type=int,
+        default=50,
+        help=advanced_help or "Lines retained in the dashboard raw-output panel (default: 50)",
+    )
+    advanced_run.add_argument("--nxc-path", help=advanced_help or "Use this nxc/netexec executable")
+    advanced_run.add_argument("--kerbrute-path", help=advanced_help or "Use this Kerbrute executable")
+    advanced_run.add_argument(
+        "--skip-target-check",
+        dest="no_preflight",
+        action="store_true",
+        help=advanced_help or "Skip the domain-controller reachability/domain check (not recommended)",
+    )
+    advanced_run.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help=advanced_help or "Show masked commands, every domain retry, and every failover hop",
+    )
+
+    # Compatibility spellings stay parseable without crowding either help view.
+    aliases = parser.add_argument_group("compatibility aliases")
+    aliases.add_argument("--engine", dest="tool", choices=["kerbrute", "nxc"], default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--passes-per-batch", dest="passwords_per_round", metavar="N", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--pause-after-lockout-signals", "--lockout-threshold", dest="lockout_threshold", metavar="N", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--max-lockout-signals-per-pass", "--max-lockouts-per-spray", "--lockout-burst", dest="lockout_burst", metavar="N", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--conn-fail-limit", type=int, default=10, help=argparse.SUPPRESS)
+    aliases.add_argument("--log-dir", dest="log_dir", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--exclude-unknown-users", "--filter-disabled", dest="filter_disabled", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--export", choices=["none", "json", "csv", "all"], dest="export", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--feed-lines", dest="feed_lines", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    display_mode.add_argument("--no-live", dest="no_live", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    display_mode.add_argument("--live", dest="live", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--engine-skip-batches", "--engine-skip-passes", "--engine-cooldown", metavar="N", dest="engine_cooldown", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--engine-fail-threshold", metavar="N", dest="engine_fail_threshold", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--no-realm-retry", dest="no_realm_retry", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--include-compromised", dest="include_compromised", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--retry-indeterminate", dest="retry_indeterminate", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--engine-timeout", metavar="SECONDS", dest="engine_timeout", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--engine-idle-timeout", metavar="SECONDS", dest="engine_idle_timeout", type=int, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--probe-demoted", dest="probe_demoted", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    aliases.add_argument("--no-preflight", dest="no_preflight", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    return parser
+
+
 def main():
     console = Console()
     invoked_program = Path(sys.argv[0]).name or "authtempo.py"
@@ -5192,96 +5845,7 @@ def main():
             style="yellow",
         )
 
-    parser = argparse.ArgumentParser(
-        prog=invoked_program,
-        description=f"{PRODUCT_NAME} — {PRODUCT_TAGLINE} (authorized assessments only)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Plaintext password spray, kerbrute default
-  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 -t 35 --passes-per-batch 1
-
-  # nxc SMB mode with custom timing
-  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --engine nxc --protocol smb -t 30
-
-  # Pass-the-hash mode (NTLM hashes)
-  python3 authtempo.py -u users.txt -p hashes.txt -d LAB -dc-ip 10.10.10.10 --pth --engine nxc --protocol smb
-
-  # Dry-run to verify UI/failover without a target
-  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --dry-run
-
-  # Resume from a canceled run
-  python3 authtempo.py -u users.txt -p passwords.txt -d LAB -dc-ip 10.10.10.10 --resume
-
-For authorized penetration testing only.
-        """
-    )
-
-    parser.add_argument("-u", metavar="USERS", help="Userlist file (one per line)", required=True)
-    parser.add_argument("-p", metavar="SECRETS", help="Password/hash file (one per line)", required=True)
-    parser.add_argument("-d", metavar="DOMAIN", help="Domain", required=True)
-    parser.add_argument("-dc-ip", metavar="IP", help="Domain Controller IP", required=True)
-
-    parser.add_argument("--engine", "--tool", dest="tool", choices=["kerbrute", "nxc"], default="kerbrute", help="Spray engine (default: kerbrute)")
-    parser.add_argument("--protocol", choices=["smb", "ldap"], default="ldap", help="Protocol for nxc (default: ldap; ignored for kerbrute)")
-
-    parser.add_argument("-t", metavar="MINUTES", type=int, default=35, help="Minutes between batches (default: 35)")
-    parser.add_argument("--passes-per-batch", "--limit", metavar="N", type=int, default=1, dest="passwords_per_round", help="Secrets per batch before the configured delay (default: 1)")
-
-    parser.add_argument("--pth", action="store_true", help="Pass-the-hash mode: -p file contains NTLM hashes, forces nxc, excludes kerbrute")
-
-    parser.add_argument("--pause-after-lockout-signals", "--lockout-threshold", metavar="N", dest="lockout_threshold", type=int, default=2, help="Cumulative safety signals before interactive review (default: 2)")
-    parser.add_argument(
-        "--max-lockout-signals-per-pass",
-        "--max-lockouts-per-spray",
-        "--lockout-burst",
-        dest="lockout_burst",
-        metavar="N",
-        type=int,
-        default=3,
-        help=(
-            "Maximum lockout signals allowed in one secret/pass; the next "
-            "signal hard-stops the run (default: 3)"
-        ),
-    )
-    parser.add_argument("--conn-fail-limit", type=int, default=10, help="Deprecated compatibility option (connection failures now trigger failover and throttling)")
-
-    parser.add_argument("--nxc-path", help="Override path to nxc/netexec binary")
-    parser.add_argument("--kerbrute-path", help="Override path to kerbrute binary")
-
-    state_mode = parser.add_mutually_exclusive_group()
-    state_mode.add_argument("--resume", action="store_true", help="Resume only from valid compatible saved state")
-    state_mode.add_argument("--start-fresh", action="store_true", help="Explicitly replace generated artifacts in the selected output directory")
-    parser.add_argument("--dry-run", action="store_true", help="Emit fake tool output; no real sprays (for testing)")
-    parser.add_argument("--no-preflight", action="store_true", help="Skip DC/domain preflight check")
-    parser.add_argument("--log-dir", default=None, help="Output/state directory (default: ./authtempo-out; dry runs use ./authtempo-dry-run-out)")
-
-    # New operator fundamentals
-    parser.add_argument("--exclude-unknown-users", "--filter-disabled", dest="filter_disabled", action="store_true", help="Pre-spray Kerbrute enumeration to exclude non-existent accounts")
-    parser.add_argument("--export", choices=["none", "json", "csv", "all"], default="none", help="Export results format (default: none)")
-    parser.add_argument("--schedule", help="Spray window: business-hours, off-hours, or HH:MM-HH:MM (default: unrestricted)")
-    parser.add_argument(
-        "--timeline",
-        action="store_true",
-        help=f"Generate {TIMELINE_HTML_NAME} visualization",
-    )
-    parser.add_argument("--feed-lines", type=int, default=50, help="Number of lines in raw feed panel (default: 50)")
-    display_mode = parser.add_mutually_exclusive_group()
-    display_mode.add_argument("--no-live", action="store_true", help="Stream raw output without cursor-based rendering")
-    display_mode.add_argument("--live", action="store_true", help="Force the cursor-based dashboard, including inside tmux")
-    parser.add_argument("--engine-skip-batches", "--engine-skip-passes", "--engine-cooldown", metavar="N", dest="engine_cooldown", type=int, default=3, help="Batches to skip a demoted engine before re-probe (default: 3)")
-    parser.add_argument("--engine-fail-threshold", metavar="N", type=int, default=2, help="Consecutive transient failures before demoting an engine (default: 2)")
-    parser.add_argument("--no-realm-retry", action="store_true", help="Disable kerbrute realm-variant auto-retry")
-    parser.add_argument("--include-compromised", action="store_true", help="UNSAFE: continue testing identities with a valid credential")
-    parser.add_argument("--retry-indeterminate", action="store_true", help="UNSAFE: retry pairs left in an indeterminate state")
-    parser.add_argument("--engine-timeout", metavar="SECONDS", type=int, default=300, help="Maximum seconds for one strict per-identity engine invocation (default: 300)")
-    parser.add_argument("--engine-idle-timeout", metavar="SECONDS", type=int, default=60, help="Maximum seconds without engine output (default: 60)")
-    parser.add_argument(
-        "--probe-demoted",
-        action="store_true",
-        help="Explicitly probe each demoted engine once if every engine is still in cooldown",
-    )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Maximum verbosity: full (masked) commands, every realm attempt, every failover hop")
+    parser = build_argument_parser(invoked_program)
 
     args = parser.parse_args()
 
@@ -5290,17 +5854,17 @@ For authorized penetration testing only.
     numeric_constraints = [
         (args.t >= 0, "-t must be at least 0"),
         (args.passwords_per_round >= 1, "--limit must be at least 1"),
-        (args.lockout_threshold >= 1, "--lockout-threshold must be at least 1"),
+        (args.lockout_threshold >= 1, "--review-after-lockouts must be at least 1"),
         (
             args.lockout_burst >= 0,
-            "--max-lockout-signals-per-pass must be at least 0",
+            "--max-lockouts must be at least 0",
         ),
         (args.conn_fail_limit >= 1, "--conn-fail-limit must be at least 1"),
-        (args.feed_lines >= 1, "--feed-lines must be at least 1"),
-        (args.engine_cooldown >= 1, "--engine-cooldown must be at least 1"),
-        (args.engine_fail_threshold >= 1, "--engine-fail-threshold must be at least 1"),
-        (args.engine_timeout >= 1, "--engine-timeout must be at least 1"),
-        (args.engine_idle_timeout >= 1, "--engine-idle-timeout must be at least 1"),
+        (args.feed_lines >= 1, "--raw-lines must be at least 1"),
+        (args.engine_cooldown >= 1, "--tool-retry-after must be at least 1"),
+        (args.engine_fail_threshold >= 1, "--tool-error-limit must be at least 1"),
+        (args.engine_timeout >= 1, "--tool-timeout must be at least 1"),
+        (args.engine_idle_timeout >= 1, "--tool-silence-timeout must be at least 1"),
     ]
     for valid, message in numeric_constraints:
         if not valid:

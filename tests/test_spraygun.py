@@ -33,6 +33,9 @@ class QuietUI:
     def update_admin(self, *_args):
         pass
 
+    def update_password_change(self, *_args):
+        pass
+
     def update_lockout(self, *_args):
         pass
 
@@ -112,6 +115,18 @@ class EngineTests(unittest.TestCase):
         )
         self.assertEqual(line_type, spraygun.LineType.SUCCESS)
         self.assertEqual(data, f"alice@LAB:{revoked_words}")
+
+        expired_words = "STATUS_PASSWORD_EXPIRED"
+        nxc_failure = (
+            "SMB 127.0.0.1 445 DC [-] LAB\\alice:"
+            f"{expired_words} STATUS_LOGON_FAILURE"
+        )
+        line_type, user = spraygun.classify_line(
+            spraygun.Engine("nxc", "smb"),
+            nxc_failure,
+            expected_secret=expired_words,
+        )
+        self.assertEqual((line_type, user), (spraygun.LineType.AUTHFAIL, "alice"))
 
     def test_kerbrute_zero_exit_network_error_is_not_clean(self):
         network_line = (
@@ -628,6 +643,93 @@ class StateAndRunTests(unittest.TestCase):
                 ["alice:First!", "alice:Second!"],
             )
 
+    def test_metrics_separate_dispatches_from_final_pair_outcomes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                users=["alice"],
+                passwords=["First!"],
+                log_dir=tmp,
+                retry_indeterminate=True,
+            )
+            state = spraygun.State(tmp, cfg)
+            engine = spraygun.Engine("nxc", "ldap")
+            state.begin_attempt("First!", "alice", engine)
+            state.finish_attempt("First!", "alice", "indeterminate")
+            state.begin_attempt("First!", "alice", engine)
+            state.finish_attempt("First!", "alice", "success")
+            state.add_cred("alice", "First!", engine="nxc:ldap")
+
+            compact = state.get_compact_stats()
+            self.assertIn("Attempts sent: 2", compact)
+            self.assertIn("Unique pairs: 1", compact)
+            self.assertIn("Valid: 1", compact)
+            self.assertIn("Uncertain: 0", compact)
+            self.assertEqual(state.pair_success_rate(), 100.0)
+
+    def test_dry_run_metrics_label_simulated_pairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                users=["alice"],
+                passwords=["First!"],
+                log_dir=tmp,
+                dry_run=True,
+            )
+            state = spraygun.State(tmp, cfg)
+            state.mark_attempted("First!", "alice", status="dry_run")
+
+            compact = state.get_compact_stats()
+            self.assertIn("Attempts sent: 1", compact)
+            self.assertIn("Unique pairs: 1", compact)
+            self.assertIn("Simulated: 1", compact)
+            self.assertIsNone(state.pair_success_rate())
+
+    def test_completed_resume_does_not_duplicate_completion_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            common = dict(
+                users=["alice"],
+                passwords=["First!"],
+                log_dir=tmp,
+                dry_run=True,
+                no_preflight=True,
+                time_between_rounds=0,
+                realm_retry=False,
+            )
+            first = spraygun.Config(
+                "users", "passwords", "LAB", "127.0.0.1", **common
+            )
+            console = Console(file=io.StringIO(), force_terminal=False)
+            with patch.object(spraygun, "setup_signal_handler"):
+                self.assertTrue(spraygun.run(first, console))
+
+            resumed = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                resume=True,
+                **common,
+            )
+            with patch.object(spraygun, "setup_signal_handler"):
+                self.assertTrue(spraygun.run(resumed, console))
+
+            data = json.loads(
+                (Path(tmp) / spraygun.STATE_FILE_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [event["type"] for event in data["timeline_events"]].count(
+                    "complete"
+                ),
+                1,
+            )
+
     def test_resume_rejects_state_for_a_different_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = spraygun.Config(
@@ -674,6 +776,30 @@ class StateAndRunTests(unittest.TestCase):
         next_round = capture.get()
         self.assertIn("alice:First!", next_round)
         self.assertIn("0 / 1", next_round)
+
+    def test_password_change_credential_is_highlighted_separately(self):
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        ui = spraygun.RichUI(console, live_ui=False)
+        command = (
+            "impacket-changepasswd -protocol smb-samr LAB/alice@127.0.0.1"
+        )
+
+        ui.start_spray(spraygun.Engine("nxc", "smb"), "First!", 1)
+        ui.update_password_change(
+            "alice",
+            "First!",
+            "password_expired",
+            command,
+        )
+
+        rendered_stream = output.getvalue()
+        self.assertIn("VALID CREDENTIAL", rendered_stream)
+        self.assertIn("PASSWORD EXPIRED", rendered_stream)
+        self.assertIn(command, rendered_stream)
+        with console.capture() as capture:
+            console.print(ui._build_summary())
+        self.assertIn("CHANGE REQUIRED", capture.get())
 
     def test_tmux_uses_streaming_mode_unless_live_is_forced(self):
         console = Console(
@@ -728,6 +854,10 @@ class StateAndRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "creds.txt").write_text("old:credential\n", encoding="utf-8")
+            (root / spraygun.PASSWORD_CHANGES_FILE_NAME).write_text(
+                "old command\n",
+                encoding="utf-8",
+            )
             (root / "locked-out.txt").write_text("old-user\n", encoding="utf-8")
             cfg = spraygun.Config(
                 "users", "passwords", "LAB", "127.0.0.1",
@@ -738,6 +868,12 @@ class StateAndRunTests(unittest.TestCase):
             spraygun.State(tmp, cfg)
 
             self.assertEqual((root / "creds.txt").read_text(encoding="utf-8"), "")
+            self.assertEqual(
+                (root / spraygun.PASSWORD_CHANGES_FILE_NAME).read_text(
+                    encoding="utf-8"
+                ),
+                "",
+            )
             self.assertEqual((root / "locked-out.txt").read_text(encoding="utf-8"), "")
 
     def test_all_engine_failure_retries_without_marking_secret_used(self):
@@ -768,6 +904,51 @@ class StateAndRunTests(unittest.TestCase):
             self.assertEqual(data["used_passwords"], [])
             self.assertEqual(data["remaining_queue"], ["Password1!"])
             self.assertEqual(data["completed_batches"], 0)
+
+    def test_tool_pause_output_uses_operator_language(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                users=["alice"],
+                passwords=["Password1!"],
+                log_dir=tmp,
+                dry_run=True,
+                no_preflight=True,
+                time_between_rounds=0,
+                realm_retry=False,
+            )
+
+            def tool_result(engine, _cfg, secret, _ui, state, _realm=None):
+                if engine.tool == "kerbrute":
+                    return spraygun.RoundResult(
+                        aborted=True,
+                        abort_reason="command-not-found",
+                    )
+                state.mark_attempted(secret, "alice", status="auth_failure")
+                return spraygun.RoundResult(
+                    clean_finish=True,
+                    reconciled_complete=True,
+                    dispatches=1,
+                )
+
+            output = io.StringIO()
+            console = Console(file=output, force_terminal=False)
+            with patch.object(
+                spraygun,
+                "spray_one_password",
+                side_effect=tool_result,
+            ), patch.object(spraygun, "setup_signal_handler"):
+                self.assertTrue(spraygun.run(cfg, console))
+
+            rendered = output.getvalue()
+            self.assertIn("tool command was not found; paused for 3", rendered)
+            self.assertIn("Tool status:", rendered)
+            self.assertIn("retry after 3 password group(s)", rendered)
+            self.assertNotIn("DEMOTED", rendered)
+            self.assertNotIn("cooldown 3r", rendered)
 
     def test_cumulative_lockout_prompt_stops_before_next_secret(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -981,6 +1162,58 @@ class StateAndRunTests(unittest.TestCase):
             self.assertFalse(cfg.live_ui)
             self.assertEqual(cfg.passwords_per_round, 1)
             self.assertEqual(cfg.lockout_burst, 6)
+
+    def test_compact_help_uses_operator_language_and_hides_tuning(self):
+        compact = spraygun.build_argument_parser("authtempo").format_help()
+
+        self.assertIn("--limit N", compact)
+        self.assertIn("--max-lockouts N", compact)
+        self.assertIn("--validate-users", compact)
+        self.assertIn("--advanced-help", compact)
+        self.assertNotIn("--passes-per-batch", compact)
+        self.assertNotIn("--engine-skip-batches", compact)
+        self.assertNotIn("--engine-fail-threshold", compact)
+        self.assertNotIn("--tool-retry-after", compact)
+
+    def test_advanced_help_explains_tool_recovery_in_plain_language(self):
+        advanced = spraygun.build_argument_parser("authtempo", advanced=True).format_help()
+
+        self.assertIn("--tool-retry-after GROUPS", advanced)
+        self.assertIn("completed password groups", advanced)
+        self.assertIn("--tool-error-limit N", advanced)
+        self.assertIn("Pause a tool after N consecutive temporary errors", advanced)
+        self.assertNotIn("--engine-skip-batches", advanced)
+        self.assertNotIn("--engine-fail-threshold", advanced)
+
+    def test_human_facing_options_reach_the_existing_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            users = Path(tmp) / "users.txt"
+            passwords = Path(tmp) / "passwords.txt"
+            users.write_text("alice\n", encoding="utf-8")
+            passwords.write_text("Password1!\n", encoding="utf-8")
+            argv = [
+                "authtempo.py", "-u", str(users), "-p", str(passwords),
+                "-d", "LAB", "-dc-ip", "127.0.0.1", "--dry-run",
+                "--limit", "2", "--wait", "10", "--max-lockouts", "3",
+                "--review-after-lockouts", "4", "--tool-retry-after", "5",
+                "--tool-error-limit", "6", "--stream",
+                "--report", "all", "--output", str(Path(tmp) / "out"),
+            ]
+
+            with patch.object(sys, "argv", argv), patch.object(spraygun, "run") as run:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    spraygun.main()
+
+            cfg = run.call_args.args[0]
+            self.assertEqual(cfg.passwords_per_round, 2)
+            self.assertEqual(cfg.time_between_rounds, 10)
+            self.assertEqual(cfg.lockout_burst, 3)
+            self.assertEqual(cfg.lockout_threshold, 4)
+            self.assertEqual(cfg.engine_cooldown_rounds, 5)
+            self.assertEqual(cfg.engine_transient_threshold, 6)
+            self.assertFalse(cfg.live_ui)
+            self.assertEqual(cfg.export, "all")
+            self.assertEqual(cfg.log_dir, str(Path(tmp) / "out"))
 
     def test_cli_returns_nonzero_when_a_run_stops_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1260,7 +1493,7 @@ class AdversarialSafetyTests(unittest.TestCase):
             state.add_lockout("alice", certainty="ambiguous", secret="Three!")
             self.assertEqual(state.eligible_users_for("Three!"), [])
 
-    def test_kerbrute_failure_and_success_with_error_keep_the_identity(self):
+    def test_kerbrute_failure_and_password_expiry_keep_the_identity(self):
         failure = "2026/10/13 > [!] HOST$@LAB:One! - KDC_ERR_PREAUTH_FAILED"
         line_type, user = spraygun.classify_line(spraygun.Engine("kerbrute"), failure)
         self.assertEqual((line_type, user), (spraygun.LineType.AUTHFAIL, "HOST$@LAB"))
@@ -1270,8 +1503,129 @@ class AdversarialSafetyTests(unittest.TestCase):
             "(KDC_ERR_KEY_EXPIRED)"
         )
         line_type, data = spraygun.classify_line(spraygun.Engine("kerbrute"), success)
-        self.assertEqual(line_type, spraygun.LineType.SUCCESS)
+        self.assertEqual(line_type, spraygun.LineType.PASSWORD_EXPIRED)
         self.assertEqual(data, "HOST$@LAB:One!")
+
+    def test_nxc_password_change_states_are_valid_credential_results(self):
+        cases = (
+            ("STATUS_PASSWORD_EXPIRED", spraygun.LineType.PASSWORD_EXPIRED),
+            ("STATUS_PASSWORD_MUST_CHANGE", spraygun.LineType.PASSWORD_MUST_CHANGE),
+        )
+        for protocol in ("smb", "ldap"):
+            for status, expected_type in cases:
+                with self.subTest(protocol=protocol, status=status):
+                    line = (
+                        f"{protocol.upper()} 127.0.0.1 445 DC [-] "
+                        f"LAB\\alice:One! {status}"
+                    )
+                    line_type, data = spraygun.classify_line(
+                        spraygun.Engine("nxc", protocol),
+                        line,
+                        expected_secret="One!",
+                    )
+                    self.assertEqual(line_type, expected_type)
+                    self.assertEqual(data, "alice:One!")
+
+    def test_password_expired_finding_writes_actionable_impacket_command(self):
+        line = (
+            "SMB 127.0.0.1 445 DC [-] "
+            "LAB\\alice:Password1! STATUS_PASSWORD_EXPIRED\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                users=["alice"],
+                passwords=["Password1!"],
+                log_dir=tmp,
+                nxc_binary="/fake/nxc",
+            )
+            state = spraygun.State(tmp, cfg)
+            with patch.object(
+                spraygun.subprocess,
+                "Popen",
+                return_value=fake_process([line]),
+            ):
+                result = spraygun.spray_one_password(
+                    spraygun.Engine("nxc", "smb"),
+                    cfg,
+                    "Password1!",
+                    QuietUI(),
+                    state,
+                )
+
+            self.assertTrue(result.clean_finish)
+            self.assertEqual(
+                result.password_change_required,
+                [("alice", "Password1!", "password_expired")],
+            )
+            self.assertEqual(
+                state.pair_status("Password1!", "alice"),
+                "password_expired",
+            )
+            self.assertEqual(
+                state.credentials[0]["credential_state"],
+                "password_expired",
+            )
+            action_text = (
+                Path(tmp) / spraygun.PASSWORD_CHANGES_FILE_NAME
+            ).read_text(encoding="utf-8")
+            self.assertIn("Credential: alice:Password1!", action_text)
+            command = next(
+                line.removeprefix("Command: ")
+                for line in action_text.splitlines()
+                if line.startswith("Command: ")
+            )
+            self.assertEqual(
+                command,
+                "impacket-changepasswd -protocol smb-samr LAB/alice@127.0.0.1",
+            )
+            self.assertNotIn("Password1!", command)
+            state.export_results("json")
+            exported = json.loads(
+                (Path(tmp) / "results.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(exported["stats"]["password_change_required"], 1)
+            self.assertEqual(exported["stats"]["successful_pairs"], 1)
+            self.assertEqual(
+                exported["credentials"][0]["password_change_command"],
+                command,
+            )
+            state.close()
+
+            resumed_cfg = spraygun.Config(
+                "users",
+                "passwords",
+                "LAB",
+                "127.0.0.1",
+                users=["alice"],
+                passwords=["Password1!"],
+                log_dir=tmp,
+                nxc_binary="/fake/nxc",
+                resume=True,
+            )
+            resumed = spraygun.State(tmp, resumed_cfg)
+            self.assertEqual(
+                resumed.credentials[0]["credential_state"],
+                "password_expired",
+            )
+            resumed.close()
+
+    def test_hash_password_change_command_supplies_the_recorded_hash(self):
+        command = spraygun.build_password_change_command(
+            "LAB",
+            "LAB\\Alice",
+            "127.0.0.1",
+            secret="0123456789abcdef",
+            pth_mode=True,
+        )
+        self.assertEqual(
+            command,
+            "impacket-changepasswd -protocol smb-samr -hashes "
+            "0123456789abcdef LAB/Alice@127.0.0.1",
+        )
 
     def test_nxc_machine_account_success_is_parsed(self):
         line = "SMB 127.0.0.1 445 DC [+] LAB\\HOST$:One!"
@@ -1599,6 +1953,7 @@ class AdversarialSafetyTests(unittest.TestCase):
                 spraygun.STATE_FILE_NAME,
                 spraygun.AUDIT_LOG_NAME,
                 "creds.txt",
+                spraygun.PASSWORD_CHANGES_FILE_NAME,
                 "locked-out.txt",
                 "used-passwords.txt",
             ):
